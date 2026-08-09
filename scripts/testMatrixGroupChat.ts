@@ -24,19 +24,52 @@ function functionSlice(source: string, name: string, nextName: string): string {
 assert.match(types, /interface MatrixCreateGroupChatRequest[\s\S]*name: string;[\s\S]*userIds: string\[\];/u);
 assert.match(types, /MatrixGroupChatInvitationStatus = "invited" \| "joined" \| "rejected" \| "ambiguous"/u);
 assert.match(types, /MatrixReconcileGroupChatCreateResult[\s\S]*status: "none"[\s\S]*status: "pending"[\s\S]*status: "resolved"/u);
+assert.match(types, /MatrixReconcileGroupChatInviteResult[\s\S]*status: "pending"; roomId: string; userId: string[\s\S]*status: "resolved"/u);
+assert.match(types, /MatrixGroupChatInviteCandidateSearchResult[\s\S]*participantCount: number;[\s\S]*maxParticipants: 10;[\s\S]*full: boolean;/u);
+assert.match(types, /MatrixInviteUserToGroupChatResult[\s\S]*delivery: "accepted" \| "existing";[\s\S]*observedMembership\?: "invite" \| "join";/u);
 assert.match(types, /interface MatrixRoomDTO[\s\S]*groupChat\?: true;[\s\S]*creatorId\?: string;/u);
 assert.match(protocol, /type: "searchGroupChatCandidates"/u);
 assert.match(protocol, /type: "createGroupChat"; request: MatrixCreateGroupChatRequest; creationMarker: string/u);
 assert.match(protocol, /type: "reconcileGroupChatCreate";[\s\S]*creationMarker: string;[\s\S]*userIds: string\[\]/u);
+assert.match(protocol, /type: "searchGroupChatInviteCandidates"/u);
+assert.match(protocol, /type: "inviteUserToGroupChat"/u);
+assert.match(protocol, /type: "reconcileGroupChatInvite"/u);
+assert.match(protocol, /type: "joinedRoomIds"/u);
 
 const backendSearch = functionSlice(backend, "async function searchGroupChatCandidates", "async function inviteUserToSpace");
-assert.match(backendSearch, /searchUserDirectory\(\{ term: request\.query, limit: request\.limit \}\)/u);
-assert.match(backendSearch, /emptyUserDirectoryQueryUnsupported/u);
-assert.match(backendSearch, /localServerUserId\(raw\.user_id\)/u);
-assert.match(backendSearch, /userId === activeCredentials\.userId/u);
-assert.match(backendSearch, /unique\.has\(userId\)/u);
-assert.match(backendSearch, /rememberGroupChatDirectoryCandidate\(userId\)/u);
-assert.match(backendSearch, /complete: false/u);
+assert.match(backend, /searchUserDirectory\(\{[\s\S]*term: exactUserId \?\? request\.query,[\s\S]*limit: request\.limit[\s\S]*\}\)/u);
+assert.match(backend, /emptyUserDirectoryQueryUnsupported/u);
+assert.match(backend, /localServerUserId\(raw\.user_id\)/u);
+assert.match(backend, /userId === activeCredentials\.userId/u);
+assert.match(backend, /unique\.has\(userId\)/u);
+assert.match(backend, /rememberGroupChatDirectoryCandidate\(userId\)/u);
+assert.match(backend, /complete: false/u);
+assert.match(backendSearch, /MATRIX_GROUP_CHAT_FULL/u);
+assert.match(backendSearch, /delivery: "accepted"[\s\S]*observedMembership/u);
+assert.match(backendSearch, /exactGroupChatMembershipSnapshot/u);
+assert.match(backendSearch, /exactGroupChatInvitePermission/u);
+assert.ok(backendSearch.indexOf("exactGroupChatMembershipSnapshot(room)")
+    < backendSearch.indexOf("exactGroupChatInvitePermission(room)"),
+"the exact current privacy/PL snapshot must be the last authorization read before invite dispatch");
+assert.ok(backendSearch.indexOf("exactGroupChatInvitePermission(room)") < backendSearch.indexOf("mutationDispatched()"));
+assert.match(backendSearch, /reconcileGroupChatInvite[\s\S]*exactSpaceInviteMembership\(request\.roomId, request\.userId\)/u);
+assert.doesNotMatch(
+    backendSearch.slice(backendSearch.indexOf("async function reconcileGroupChatInvite")),
+    /joinedInvitableGroupChat|groupChatPrivacyContract/,
+    "read-only invite reconciliation must survive a later leave or mutable privacy change"
+);
+
+const exactLookup = functionSlice(backend, "function exactLocalProfileUserId", "function consumeGroupChatExactLookup");
+assert.match(exactLookup, /BARE_MATRIX_LOCALPART_PATTERN\.test\(localpart\)/u);
+assert.match(exactLookup, /serverName === activeServerName\(\)/u);
+assert.match(exactLookup, /TextEncoder\(\)\.encode\(query\)\.byteLength <= 255/u);
+const candidateSearch = functionSlice(backend, "async function groupChatCandidateSearch", "async function searchGroupChatCandidates");
+assert.ok(candidateSearch.indexOf("exactLocalProfileUserId(request.query)")
+    < candidateSearch.indexOf("matrixClient.searchUserDirectory"),
+"exact local identity must be canonicalized before any directory/profile network request");
+assert.match(candidateSearch, /matrixClient\.getProfileInfo\(exactUserId\)/u);
+assert.match(candidateSearch, /MATRIX_GROUP_CHAT_EXACT_LOOKUP_RATE_LIMITED|consumeGroupChatExactLookup/u);
+assert.match(candidateSearch, /not_found_or_unavailable/u);
 
 const backendCreate = functionSlice(backend, "async function createGroupChat", "async function reconcileGroupChatCreate");
 assert.match(backendCreate, /requireCurrentGroupChatDirectoryCandidates\(request\.userIds\)/u);
@@ -60,6 +93,8 @@ assert.doesNotMatch(backendCreate, /is_direct|EventType\.Direct|addDirectRoom|Sp
 assert.match(backendCreate, /inviteGroupChatUsers\(roomId, request\.userIds\)/u);
 assert.match(backendCreate, /MATRIX_CREATE_GROUP_CHAT_REJECTED/u);
 assert.match(backendCreate, /MATRIX_CREATE_GROUP_CHAT_AMBIGUOUS/u);
+assert.match(backend, /const MIN_GROUP_CHAT_INVITEES = 0;/u);
+assert.match(backend, /const MAX_GROUP_CHAT_INVITEES = 9;/u);
 
 const creationPowerLevels = functionSlice(
     backend,
@@ -94,7 +129,7 @@ assert.match(powerLevelContract, /roomVersion === "12"[\s\S]*Object\.hasOwn\(use
 assert.match(powerLevelContract, /Object\.keys\(events\)\.length !== 1/u);
 assert.match(powerLevelContract, /EventType\.RoomTombstone[\s\S]*tombstone\.value === 150/u);
 
-const identity = functionSlice(backend, "function groupChatRoomIdentity", "function groupChatRoomContract");
+const identity = functionSlice(backend, "function groupChatRoomIdentity", "function groupChatPrivacyContract");
 assert.match(identity, /room\.isSpaceRoom\(\)/u);
 assert.match(identity, /exactGroupChatCreationContent\(creation, roomVersion\)/u);
 assert.match(identity, /Object\.hasOwn\(creation, GROUP_CHAT_CREATION_CONTENT_KEY\)/u);
@@ -104,14 +139,14 @@ assert.match(identity, /groupChatStateMarker\(room, creatorId\)/u,
 assert.doesNotMatch(identity, /RoomEncryption|RoomJoinRules|RoomPowerLevels/u,
     "permanent group identity must not depend on mutable privacy or power-level state");
 
-const strictContract = functionSlice(backend, "function groupChatRoomContract", "function attestedGroupChatRoom");
+const strictContract = functionSlice(backend, "function groupChatPrivacyContract", "function groupChatRoomContract");
 assert.match(strictContract, /groupChatRoomIdentity\(room\)/u);
 assert.match(strictContract, /m\.megolm\.v1\.aes-sha2/u);
 assert.match(strictContract, /JoinRule\.Invite/u);
 assert.match(strictContract, /HistoryVisibility\.Joined/u);
 assert.match(strictContract, /GuestAccess\.Forbidden/u);
 assert.match(strictContract, /groupChatStateMarker\(room, identity\.creatorId\) !== identity\.creationMarker/u);
-assert.match(strictContract, /exactGroupChatPowerLevels/u);
+assert.match(backend, /function groupChatRoomContract[\s\S]*exactGroupChatPowerLevels/u);
 
 const attestation = functionSlice(backend, "function attestedGroupChatRoom", "function projectableSpaceChildren");
 assert.match(attestation, /room\.getMyMembership\(\) !== "join"/u);
@@ -128,7 +163,7 @@ assert.match(rawAttestation, /exactGroupChatPowerLevelContent/u);
 assert.match(rawAttestation, /ownMembership\?\.content\.membership === "join"/u);
 
 assert.match(backend, /function roomKind[\s\S]*groupChatRoomIdentity\(room\)[\s\S]*function roomDirectUserId[\s\S]*groupChatRoomIdentity\(room\)/u);
-assert.match(backend, /const groupChat = groupChatRoomIdentity\(room\) != null;[\s\S]*if \(groupChat\) result\.groupChat = true;/u);
+assert.match(backend, /const groupChat = groupChatRoomIdentity\(room\) != null;[\s\S]*if \(groupChat\) \{[\s\S]*result\.groupChat = true;/u);
 assert.match(backend, /function projectableSpaceChildren[\s\S]*!groupChatRoomIdentity\(childRoom\)/u);
 assert.match(backend, /async function openDirectMessage[\s\S]*\|\| groupChatRoomIdentity\(room\)\) continue;/u);
 
@@ -172,15 +207,94 @@ assert.match(native, /case "createGroupChat"[\s\S]*MATRIX_CREATE_GROUP_CHAT_AMBI
 assert.match(native, /commandType === "createGroupChat"[\s\S]*GROUP_CHAT_CREATE_TIMEOUT_MS/u);
 assert.match(native, /commandType === "createSpaceChild" \|\| commandType === "createGroupChat"/u);
 
+const nativeGroupInvite = functionSlice(native, "async function inviteUserToGroupChat", "async function reconcileGroupChatInvite");
+assert.match(nativeGroupInvite, /expectedUserId: string/u);
+assert.match(nativeGroupInvite, /withExpectedMatrixAccount\(expectedUserId/u);
+assert.ok(nativeGroupInvite.indexOf("createPendingGroupChatInvite(binding, validatedRequest)")
+    < nativeGroupInvite.indexOf('type: "inviteUserToGroupChat"'),
+"the durable per-room invite receipt must be committed before worker dispatch");
+assert.match(native, /MATRIX_GROUP_CHAT_INVITE_RECONCILE_REQUIRED/u);
+assert.match(nativeGroupInvite, /persistResolvedGroupChatInvite/u);
+assert.match(nativeGroupInvite, /MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS/u);
+const nativeInviteReconcile = functionSlice(
+    native,
+    "async function reconcileGroupChatInvite",
+    "async function acknowledgeGroupChatInvite"
+);
+assert.match(nativeInviteReconcile, /roomId: string,[\s\S]*expectedUserId: string/u,
+    "reopen recovery must locate the target from a room-scoped native receipt");
+assert.match(nativeInviteReconcile, /pending\.resolved/u);
+assert.match(nativeInviteReconcile, /status: "none"/u);
+assert.match(nativeInviteReconcile, /persistResolvedGroupChatInvite/u);
+assert.match(native, /status: "pending", roomId: pending\.roomId, userId: pending\.userId/u);
+const nativeInviteAck = functionSlice(
+    native,
+    "async function acknowledgeGroupChatInvite",
+    "async function overrideGroupChatInviteAmbiguity"
+);
+assert.match(nativeInviteAck, /pending\.userId !== validatedRequest\.userId/u);
+assert.match(nativeInviteAck, /if \(!pending\.resolved\)[\s\S]*MATRIX_GROUP_CHAT_INVITE_ACK_NOT_READY/u);
+assert.match(nativeInviteAck, /clearPendingGroupChatInvite\(binding, pending\)/u);
+const nativeInviteOverride = functionSlice(
+    native,
+    "async function overrideGroupChatInviteAmbiguity",
+    "async function inviteUserToSpace"
+);
+assert.match(nativeInviteOverride, /type: "reconcileGroupChatInvite"/u);
+assert.match(nativeInviteOverride, /MATRIX_GROUP_CHAT_INVITE_OVERRIDE_NOT_ALLOWED/u);
+assert.ok(nativeInviteOverride.indexOf('type: "reconcileGroupChatInvite"')
+    < nativeInviteOverride.indexOf("clearPendingGroupChatInvite(binding, pending)"),
+"explicit ambiguity override must perform one fresh read and must never send an invite");
+assert.doesNotMatch(nativeInviteOverride, /type: "inviteUserToGroupChat"/u);
+assert.match(native, /schema: 3,[\s\S]*invites: \[\.\.\.ambiguousGroupChatInvites\.values\(\)\]/u);
+assert.match(native, /raw\.schema !== 2 && raw\.schema !== 3/u,
+    "deployed schema-2 group-create receipts must migrate without corruption");
+assert.match(native, /encrypted\.byteLength > MAX_GROUP_CHAT_STATE_FILE_BYTES/u,
+    "the writer and loader must share a durable encrypted-file size bound");
+assert.match(native, /pending\.commandType === "inviteUserToGroupChat" && pending\.mutationDispatched[\s\S]*MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS/u);
+assert.match(native, /commandType === "inviteUserToGroupChat"/u);
+assert.match(backend, /async function exactJoinedRoomIds[\s\S]*matrixClient!\.getJoinedRooms\(\)[\s\S]*duplicate joined-room state[\s\S]*roomIds\.sort\(\)/u);
+const receiptPrune = functionSlice(
+    native,
+    "async function pruneUnjoinedGroupChatInviteReceipts",
+    "async function captureGroupChatInviteReceipts"
+);
+assert.match(receiptPrune, /for \(const \[key, pending\] of captured\)/u);
+assert.match(receiptPrune, /ambiguousGroupChatInvites\.get\(key\) !== pending/u);
+assert.match(receiptPrune, /groupChatInviteOperationsInFlight\.has\(key\)/u);
+assert.match(receiptPrune, /await saveGroupChatCreateState\(\)/u);
+assert.match(receiptPrune, /catch \(error\)[\s\S]*ambiguousGroupChatInvites\.set\(key, pending\)/u,
+    "failed exact-membership pruning must restore every durable receipt");
+assert.match(native, /async function bestEffortPruneUnjoinedGroupChatInviteReceipts[\s\S]*captureGroupChatInviteReceipts\(binding\)[\s\S]*type: "joinedRoomIds"[\s\S]*beginAccountBoundOperation\(binding\)[\s\S]*pruneUnjoinedGroupChatInviteReceipts\(binding, captured,[\s\S]*transient \/joined_rooms failure must retain every ambiguity receipt/u);
+assert.match(native, /function scheduleUnjoinedGroupChatInviteReceiptPrune[\s\S]*setTimeout\(\(\) => \{[\s\S]*void bestEffortPruneUnjoinedGroupChatInviteReceipts\(binding, expectedWorker\)[\s\S]*async function startInternal/u);
+assert.match(native, /groupChatInvitePruneScheduledWorkers\.has\(expectedWorker\)[\s\S]*groupChatInvitePruneScheduledWorkers\.add\(expectedWorker\)/u,
+    "receipt housekeeping must be single-flight once per exact worker");
+assert.match(native, /async function startInternal[\s\S]*activeWorkerBinding = binding;[\s\S]*scheduleUnjoinedGroupChatInviteReceiptPrune\(binding\);[\s\S]*return finalized/u);
+assert.doesNotMatch(native, /await bestEffortPruneUnjoinedGroupChatInviteReceipts/u);
+assert.equal(native.match(/scheduleUnjoinedGroupChatInviteReceiptPrune\(binding\);/gu)?.length, 1,
+    "ordinary snapshot refreshes must not poll /joined_rooms for receipt pruning");
+const nativeLeave = functionSlice(native, "async function leaveRoom", "function validateCreateSpaceRequest");
+assert.ok(nativeLeave.indexOf("validateRoomActionResult(result, targetRoomId)")
+    < nativeLeave.indexOf("clearPendingGroupChatInvite(binding, pending)"),
+"normal leave may clear a receipt only after an authoritative success result");
+assert.match(nativeLeave, /groupChatInviteOperationsInFlight/u,
+    "leave and invite/reconcile must serialize on the same room receipt key");
+
 assert.match(secureProtocol, /searchGroupChatCandidates:[\s\S]*MatrixGroupChatCandidateSearchResult/u);
 assert.match(secureProtocol, /interface MatrixShellRoom[\s\S]*groupChat\?: true;/u);
 assert.match(secureProtocol, /createGroupChat:[\s\S]*MatrixCreateGroupChatResult/u);
 assert.match(secureProtocol, /reconcileGroupChatCreate:[\s\S]*MatrixReconcileGroupChatCreateResult/u);
 assert.match(secureProtocol, /acknowledgeGroupChatCreate:[\s\S]*roomId: string[\s\S]*output: void/u);
+assert.match(secureProtocol, /searchGroupChatInviteCandidates:[\s\S]*MatrixGroupChatInviteCandidateSearchResult/u);
+assert.match(secureProtocol, /inviteUserToGroupChat:[\s\S]*MatrixInviteUserToGroupChatResult/u);
+assert.match(secureProtocol, /reconcileGroupChatInvite:[\s\S]*roomId: string[\s\S]*MatrixReconcileGroupChatInviteResult/u);
+assert.match(secureProtocol, /acknowledgeGroupChatInvite:[\s\S]*MatrixInviteUserToGroupChatRequest[\s\S]*output: void/u);
+assert.match(secureProtocol, /overrideGroupChatInviteAmbiguity:[\s\S]*MatrixInviteUserToGroupChatRequest[\s\S]*output: void/u);
 assert.match(native, /case "createGroupChat": return await runPrivateCreateMutation/u);
 assert.match(native, /case "reconcileGroupChatCreate"[\s\S]*result\.status === "resolved"[\s\S]*bestEffortMutationRefresh/u);
 assert.match(native, /case "acknowledgeGroupChatCreate"[\s\S]*secureViewExpectedUserId\(state\)/u);
 assert.match(native, /function projectShellRoom[\s\S]*room\.groupChat === true \? \{ groupChat: true as const \}/u);
+assert.match(native, /function projectShellRoom[\s\S]*room\.invitePermission \? \{ invitePermission: \{ \.\.\.room\.invitePermission \} \}/u);
 
 const cleanup = functionSlice(native, "async function clearNativeAccountStorage", "function publish");
 assert.match(cleanup, /resolve\(DATA_DIR\)/u);
@@ -188,6 +302,7 @@ assert.match(cleanup, /target !== expected \|\| target === dataRoot/u);
 assert.match(cleanup, /rm\(target, \{ recursive: true, force: true/u);
 assert.match(cleanup, /ambiguousSpaceChildCreates\.clear\(\)/u);
 assert.match(cleanup, /ambiguousGroupChatCreates\.clear\(\)/u);
+assert.match(cleanup, /ambiguousGroupChatInvites\.clear\(\)/u);
 assert.match(native, /async function logout[\s\S]*clearWorkerStorage\(\)[\s\S]*clearNativeAccountStorage\(\)/u);
 assert.match(native, /async function start[\s\S]*if \(!account\)[\s\S]*clearNativeAccountStorage\(\)/u);
 

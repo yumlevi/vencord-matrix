@@ -26,6 +26,7 @@ import {
 import {
     clearMatrixRoutePreference,
     getLatestSnapshot,
+    getMatrixGroupInviteContextForRoom,
     Native,
     openMatrixDirect,
     openMatrixRoom,
@@ -38,6 +39,7 @@ import {
 } from "./bridge";
 import { matrixErrorCode } from "./errorCode";
 import { openMatrixGroupChatCreate } from "./groupCreate";
+import { openMatrixGroupInviteForRoom } from "./groupInvite";
 import {
     suggestedChannelConsentRows,
     suggestedChannelJoinSummary,
@@ -1852,6 +1854,11 @@ export function MatrixSettings() {
                     This removes the Matrix {roomKind(room) === "space" ? "space" : "chat"} from this account.
                     You may need another invitation to return.
                 </Paragraph>
+                {room.groupChat === true && (
+                    <Paragraph>
+                        Leaving does not cancel an Add People invitation that may already have landed or been declined. Any unfinished local Add People warning or recovery receipt for this group will be discarded.
+                    </Paragraph>
+                )}
             </ConfirmModal>
         ));
     }
@@ -2426,19 +2433,35 @@ export function MatrixSettings() {
                         />
                     </div>
                     <div className="vc-matrix-card-list">
-                        {visibleChats.map(room => (
-                            <div className="vc-matrix-room-card" key={room.roomId}>
-                                <RoomIdentity room={room} />
-                                <div className="vc-matrix-row-actions">
-                                    <Button disabled={busy} variant="secondary" onClick={() => openMatrixRoom(room.roomId)}>
-                                        Open
-                                    </Button>
-                                    <Button disabled={busy} variant="dangerSecondary" onClick={() => confirmLeave(room)}>
-                                        Leave
-                                    </Button>
+                        {visibleChats.map(room => {
+                            const groupInvite = room.groupChat === true
+                                ? getMatrixGroupInviteContextForRoom(room.roomId)
+                                : undefined;
+                            return (
+                                <div className="vc-matrix-room-card" key={room.roomId}>
+                                    <RoomIdentity room={room} />
+                                    <div className="vc-matrix-row-actions">
+                                        <Button disabled={busy} variant="secondary" onClick={() => openMatrixRoom(room.roomId)}>
+                                            Open
+                                        </Button>
+                                        {room.groupChat === true && (
+                                            <Button
+                                                disabled={busy || !groupInvite}
+                                                variant="secondary"
+                                                onClick={() => openMatrixGroupInviteForRoom(room.roomId)}
+                                            >
+                                                {groupInvite?.full
+                                                    ? "Group full"
+                                                    : groupInvite?.canInvite ? "Add People" : "Add People unavailable"}
+                                            </Button>
+                                        )}
+                                        <Button disabled={busy} variant="dangerSecondary" onClick={() => confirmLeave(room)}>
+                                            Leave
+                                        </Button>
+                                    </div>
                                 </div>
-                            </div>
-                        ))}
+                            );
+                        })}
                         {!visibleChats.length && (
                             <Paragraph>{joinedChats.length ? "No chats match that search." : "No joined chats."}</Paragraph>
                         )}
@@ -2450,7 +2473,8 @@ export function MatrixSettings() {
                         <div>
                             <Heading tag="h3">Create a group chat</Heading>
                             <Paragraph>
-                                Search your account provider for two to nine people, then review the exact invitation list.
+                                Create a private group now. Optionally search for up to nine people to invite before creation,
+                                or add people later from the group chat.
                             </Paragraph>
                         </div>
                         <Button

@@ -186,7 +186,7 @@ export interface MatrixRoomDTO {
     canManageSpaceChildren?: boolean;
     /** Exact power-level comparison underlying canManageSpaceChildren. */
     spaceChildPermission?: MatrixPowerLevelPermissionDTO;
-    /** Exact power-level comparison for inviting a member to this Space. */
+    /** Exact power-level comparison for inviting a member to this joined Space or tagged group. */
     invitePermission?: MatrixPowerLevelPermissionDTO;
     /** Whether the current account may change every state event used by Space access settings. */
     canConfigureSpaceAccess?: boolean;
@@ -389,6 +389,8 @@ export interface MatrixGroupChatCandidateSearchRequest {
     query: string;
     /** Defaults to 25 and is capped at 100. */
     limit?: number;
+    /** Explicit-submit exact local MXID/bare-localpart profile lookup; locally rate limited. */
+    exact?: boolean;
 }
 
 export interface MatrixGroupChatCandidateDTO {
@@ -399,8 +401,8 @@ export interface MatrixGroupChatCandidateDTO {
 
 export interface MatrixGroupChatCandidateSearchResult {
     query: string;
-    /** Results are a same-provider filter over the homeserver's standard user directory. */
-    scope: "homeserver_user_directory";
+    /** Exact-profile scope is used only for an explicit, same-provider lookup. */
+    scope: "homeserver_user_directory" | "homeserver_user_directory_plus_exact_local_profile";
     candidates: MatrixGroupChatCandidateDTO[];
     /** True when either the homeserver or the local response bound truncated results. */
     limited: boolean;
@@ -410,12 +412,14 @@ export interface MatrixGroupChatCandidateSearchResult {
     complete: false;
     /** Empty search was rejected; issue a non-empty query before searching again. */
     queryRequired: boolean;
+    /** Exact lookup never distinguishes a missing account from unavailable/private profile lookup. */
+    exactLookup: "not_requested" | "resolved" | "not_found_or_unavailable";
 }
 
 /** Create an ordinary encrypted room projected as a Discord group DM. */
 export interface MatrixCreateGroupChatRequest {
     name: string;
-    /** Two to nine unique same-provider users; the creator is the tenth possible member. */
+    /** Zero to nine unique same-provider users; the creator is the tenth possible member. */
     userIds: string[];
 }
 
@@ -437,6 +441,45 @@ export type MatrixReconcileGroupChatCreateResult =
     | { status: "none"; }
     | { status: "pending"; }
     | { status: "resolved"; result: MatrixCreateGroupChatResult; };
+
+export type MatrixGroupChatCandidateMembership = "none" | "leave" | "knock" | "invite" | "join" | "ban";
+
+export interface MatrixGroupChatInviteCandidateSearchRequest extends MatrixGroupChatCandidateSearchRequest {
+    roomId: string;
+}
+
+export interface MatrixGroupChatInviteCandidateDTO extends MatrixGroupChatCandidateDTO {
+    membership: MatrixGroupChatCandidateMembership;
+}
+
+export interface MatrixGroupChatInviteCandidateSearchResult
+    extends Omit<MatrixGroupChatCandidateSearchResult, "candidates"> {
+    roomId: string;
+    candidates: MatrixGroupChatInviteCandidateDTO[];
+    /** Authoritative current join+invite count, including the active account. */
+    participantCount: number;
+    maxParticipants: 10;
+    full: boolean;
+}
+
+export interface MatrixInviteUserToGroupChatRequest {
+    roomId: string;
+    userId: string;
+}
+
+export interface MatrixInviteUserToGroupChatResult extends MatrixInviteUserToGroupChatRequest {
+    /** Whether this call was accepted or authoritative preflight found an existing membership. */
+    delivery: "accepted" | "existing";
+    /** Exact membership when observed; it may be absent after an accepted invite was immediately declined. */
+    observedMembership?: "invite" | "join";
+    /** False only with delivery=existing and an observed existing invite/join. */
+    changed: boolean;
+}
+
+export type MatrixReconcileGroupChatInviteResult =
+    | { status: "none"; }
+    | { status: "pending"; roomId: string; userId: string; }
+    | { status: "resolved"; result: MatrixInviteUserToGroupChatResult; };
 
 export interface MatrixInviteUserToSpaceRequest {
     spaceId: string;

@@ -462,7 +462,8 @@ function rawMatrixUser(member: MatrixMemberDto) {
     const selfMatrixId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
     if (selfMatrixId && member.userId === selfMatrixId) return rawCurrentUser();
 
-    const displayName = member.displayName?.trim() || member.userId;
+    const visibleUserId = member.userId.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "");
+    const displayName = cleanDisplayText(member.displayName, visibleUserId || "Matrix account", 100);
     const id = protectSyntheticId(stableSyntheticId("user", member.userId));
     matrixUserIdsBySyntheticId.set(id, member.userId);
     return {
@@ -958,7 +959,7 @@ function reachableSpaces(rootId: string, graph: MatrixSpaceGraph) {
 
 function cleanDisplayText(value: string | undefined, fallback: string, maximum: number) {
     const clean = value
-        ?.replace(/[\u0000-\u001f\u007f]/gu, " ")
+        ?.replace(/[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, " ")
         .replace(/\s+/gu, " ")
         .trim()
         .slice(0, maximum)
@@ -1759,9 +1760,9 @@ function fallbackGroupChatOwner(room: MatrixRoomDto) {
     protectSyntheticId(id);
     return {
         id,
-        username: "group_bridge_placeholder",
-        global_name: "Group bridge placeholder",
-        display_name: "Group bridge placeholder",
+        username: "group_bridge_authority",
+        global_name: "Group bridge authority",
+        display_name: "Group bridge authority",
         discriminator: "0",
         avatar: null,
         bot: true,
@@ -1771,30 +1772,36 @@ function fallbackGroupChatOwner(room: MatrixRoomDto) {
     };
 }
 
-function groupChatOwner(room: MatrixRoomDto) {
+function groupChatOwner(room: MatrixRoomDto, selfMatrixId: string | undefined) {
     const creator = room.creatorId
         ? room.members?.find(member => member.userId === room.creatorId)
         : undefined;
-    return creator && creator.membership !== "leave"
-        ? rawMatrixUser(creator)
-        : fallbackGroupChatOwner(room);
+    return selfMatrixId && creator && (creator.membership === "join" || creator.membership === "invite")
+        && !(room.groupChat === true && creator.userId === selfMatrixId)
+        ? { owner: rawMatrixUser(creator), placeholder: false }
+        : { owner: fallbackGroupChatOwner(room), placeholder: true };
 }
 
 function privateChannel(room: MatrixRoomDto, snapshot: MatrixSnapshotDto, channelId: string) {
     const selfMatrixId = accountUserId(snapshot);
     const messages = roomMessages(room);
     const latest = projectedTimelineMessages(messages).at(-1);
-    const directMember = room.groupChat !== true && room.directUserId && room.directUserId !== selfMatrixId
+    const directMember = selfMatrixId && room.groupChat !== true && room.directUserId && room.directUserId !== selfMatrixId
         ? findMember(room, room.directUserId)
         : undefined;
     const recipients = directMember
         ? [rawMatrixUser(directMember)]
         : (room.members ?? [])
-            .filter(member => member.membership !== "leave" && member.userId !== selfMatrixId)
+            .filter(member => (member.membership === "join" || member.membership === "invite")
+                && Boolean(selfMatrixId) && member.userId !== selfMatrixId)
             .map(rawMatrixUser);
 
-    const owner = directMember ? undefined : groupChatOwner(room);
-    if (owner && owner.id !== rawCurrentUser().id && !recipients.some(recipient => recipient.id === owner.id)) {
+    const ownerProjection = directMember ? undefined : groupChatOwner(room, selfMatrixId);
+    let owner = ownerProjection?.owner;
+    if (ownerProjection?.placeholder && recipients.length) owner = undefined;
+    if (owner && owner.id !== rawCurrentUser().id
+        && !recipients.some(recipient => recipient.id === owner.id)
+        && (!ownerProjection?.placeholder || !recipients.length)) {
         // Discord expects a non-self group owner to be a known recipient. The
         // protected bot placeholder is explicit infrastructure when the
         // authoritative creator is absent or no longer joined.
@@ -1802,11 +1809,13 @@ function privateChannel(room: MatrixRoomDto, snapshot: MatrixSnapshotDto, channe
     }
 
     if (!recipients.length) {
-        recipients.push(rawMatrixUser({
-            userId: "@matrix:local",
-            displayName: "Matrix",
-            membership: "join",
-        }));
+        recipients.push(room.groupChat === true
+            ? owner ?? fallbackGroupChatOwner(room)
+            : rawMatrixUser({
+                userId: "@matrix:local",
+                displayName: "Matrix",
+                membership: "join",
+            }));
     }
 
     return createChannelRecordFromServer({
@@ -3442,6 +3451,20 @@ export interface MatrixGroupChatCreateContext {
     providerLabel: string;
 }
 
+export interface MatrixGroupInviteContext {
+    channelId: string;
+    roomId: string;
+    label: string;
+    expectedAccountId: string;
+    generation: number;
+    providerLabel: string;
+    canInvite: boolean;
+    permission: MatrixPowerLevelPermissionDTO;
+    participantCount: number;
+    maxParticipants: 10;
+    full: boolean;
+}
+
 export interface MatrixGroupChatCandidate {
     userId: string;
     displayName: string;
@@ -3451,13 +3474,42 @@ export interface MatrixGroupChatCandidate {
 
 export interface MatrixGroupChatCandidateList {
     query: string;
-    scope: "homeserver_user_directory";
+    scope: "homeserver_user_directory" | "homeserver_user_directory_plus_exact_local_profile";
     candidates: MatrixGroupChatCandidate[];
     limited: boolean;
     directoryLimited: boolean;
     complete: false;
     queryRequired: boolean;
+    exactLookup: "not_requested" | "resolved" | "not_found_or_unavailable";
 }
+
+export type MatrixGroupInviteCandidateMembership = "none" | "leave" | "knock" | "invite" | "join" | "ban";
+
+export interface MatrixGroupInviteCandidate extends MatrixGroupChatCandidate {
+    membership: MatrixGroupInviteCandidateMembership;
+}
+
+export interface MatrixGroupInviteCandidateList
+    extends Omit<MatrixGroupChatCandidateList, "candidates"> {
+    roomId: string;
+    candidates: MatrixGroupInviteCandidate[];
+    participantCount: number;
+    maxParticipants: 10;
+    full: boolean;
+}
+
+export interface MatrixGroupInviteResult {
+    roomId: string;
+    userId: string;
+    delivery: "accepted" | "existing";
+    observedMembership?: "invite" | "join";
+    changed: boolean;
+}
+
+export type MatrixGroupInviteReconcileResult =
+    | { status: "none"; }
+    | { status: "pending"; roomId: string; userId: string; }
+    | { status: "resolved"; result: MatrixGroupInviteResult; };
 
 export type MatrixGroupChatCreateResult = MatrixCreateGroupChatResult;
 
@@ -3943,6 +3995,67 @@ export function getCurrentMatrixGroupChatCreateContext(expected: MatrixGroupChat
     return sameGroupChatCreateBinding(expected, current) ? current : undefined;
 }
 
+function sameGroupInviteBinding(
+    left: MatrixGroupInviteContext,
+    right: MatrixGroupInviteContext | undefined
+) {
+    return Boolean(right)
+        && left.channelId === right!.channelId
+        && left.roomId === right!.roomId
+        && left.expectedAccountId === right!.expectedAccountId
+        && left.generation === right!.generation;
+}
+
+export function getMatrixGroupInviteContext(channelId: string): MatrixGroupInviteContext | undefined {
+    if (!bridgeActive || !injectedChannelIds.has(channelId)) return undefined;
+    const injected = roomsByChannel.get(channelId);
+    const channel = ChannelStore.getChannel(channelId);
+    const expectedAccountId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
+    if (!injected || injected.guildId || !expectedAccountId
+        || injected.room.groupChat !== true
+        || !isJoinedRoom(injected.room)
+        || channel?.type !== ChannelType.GROUP_DM) return undefined;
+    const permission = projectedPowerLevelPermission(
+        injected.room.invitePermission,
+        injected.room.invitePermission?.allowed === true
+    );
+    const participantIds = new Set(
+        (injected.room.members ?? [])
+            .filter(member => member.membership === "join" || member.membership === "invite")
+            .map(member => member.userId)
+    );
+    participantIds.add(expectedAccountId);
+    const participantCount = participantIds.size;
+    return {
+        channelId,
+        roomId: injected.room.roomId,
+        label: cleanDisplayText(
+            injected.room.name?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+            "Group chat",
+            100
+        ),
+        expectedAccountId,
+        generation: pollGeneration,
+        providerLabel: matrixProviderLabel(expectedAccountId),
+        canInvite: permission.allowed,
+        permission,
+        participantCount,
+        maxParticipants: 10,
+        full: participantCount >= 10,
+    };
+}
+
+export function getMatrixGroupInviteContextForRoom(roomId: string): MatrixGroupInviteContext | undefined {
+    const injected = [...roomsByChannel.values()].find(candidate =>
+        !candidate.guildId && candidate.room.roomId === roomId && candidate.room.groupChat === true);
+    return injected ? getMatrixGroupInviteContext(injected.channelId) : undefined;
+}
+
+export function getCurrentMatrixGroupInviteContext(expected: MatrixGroupInviteContext) {
+    const current = getMatrixGroupInviteContext(expected.channelId);
+    return sameGroupInviteBinding(expected, current) ? current : undefined;
+}
+
 function sameInviteBinding(left: MatrixInviteContext, right: MatrixInviteContext | undefined) {
     return Boolean(right)
         && left.guildId === right!.guildId
@@ -4038,7 +4151,7 @@ function normalizedGroupChatUserIds(
     value: unknown,
     context: MatrixGroupChatCreateContext
 ) {
-    if (!Array.isArray(value) || value.length < 2 || value.length > 9) {
+    if (!Array.isArray(value) || value.length > 9) {
         throw new Error("The group chat recipients were invalid.");
     }
     const expectedServer = matrixUserServerName(context.expectedAccountId);
@@ -4058,7 +4171,8 @@ function normalizedGroupChatUserIds(
 function normalizeGroupChatCandidateList(
     value: unknown,
     context: MatrixGroupChatCreateContext,
-    query: string
+    query: string,
+    exact: boolean
 ): MatrixGroupChatCandidateList {
     const response = value as Record<string, unknown> | null;
     const allowedResponseKeys = new Set([
@@ -4069,17 +4183,25 @@ function normalizeGroupChatCandidateList(
         "directoryLimited",
         "complete",
         "queryRequired",
+        "exactLookup",
     ]);
+    const expectedScope = exact
+        ? "homeserver_user_directory_plus_exact_local_profile"
+        : "homeserver_user_directory";
+    const validExactLookup = exact
+        ? response?.exactLookup === "resolved" || response?.exactLookup === "not_found_or_unavailable"
+        : response?.exactLookup === "not_requested";
     if (!response || typeof response !== "object"
         || Object.keys(response).some(key => !allowedResponseKeys.has(key))
         || response.query !== query
-        || response.scope !== "homeserver_user_directory"
+        || response.scope !== expectedScope
         || !Array.isArray(response.candidates)
         || response.candidates.length > 100
         || typeof response.limited !== "boolean"
         || typeof response.directoryLimited !== "boolean"
         || response.complete !== false
-        || response.queryRequired !== false) {
+        || response.queryRequired !== false
+        || !validExactLookup) {
         throw new Error("The group chat directory response was invalid.");
     }
 
@@ -4112,12 +4234,13 @@ function normalizeGroupChatCandidateList(
     });
     return {
         query,
-        scope: "homeserver_user_directory",
+        scope: expectedScope,
         candidates,
         limited: response.limited,
         directoryLimited: response.directoryLimited,
         complete: false,
         queryRequired: false,
+        exactLookup: response.exactLookup as MatrixGroupChatCandidateList["exactLookup"],
     };
 }
 
@@ -4142,7 +4265,6 @@ function normalizeGroupChatCreateResult(
         || result.roomId.length > 2_048
         || !/^![^\s\u0000-\u001f\u007f]+$/u.test(result.roomId)
         || !Array.isArray(result.invitations)
-        || result.invitations.length < 2
         || result.invitations.length > 9
         || typeof result.complete !== "boolean") {
         throw new Error("The group chat creation response was invalid.");
@@ -4188,18 +4310,19 @@ function normalizeGroupChatCreateResult(
 export async function searchMatrixGroupChatCandidates(
     context: MatrixGroupChatCreateContext,
     queryValue: string,
-    limit = 25
+    limit = 25,
+    exact = false
 ) {
     const query = normalizedInviteQuery(queryValue);
     if (!query || !Number.isSafeInteger(limit) || limit < 1 || limit > 100
         || !getCurrentMatrixGroupChatCreateContext(context)) {
         throw new Error("The group chat context is no longer current.");
     }
-    const value = await Native.searchGroupChatCandidates({ query, limit }, context.expectedAccountId) as unknown;
+    const value = await Native.searchGroupChatCandidates({ query, limit, exact }, context.expectedAccountId) as unknown;
     if (!getCurrentMatrixGroupChatCreateContext(context)) {
         throw new Error("The group chat context is no longer current.");
     }
-    return normalizeGroupChatCandidateList(value, context, query);
+    return normalizeGroupChatCandidateList(value, context, query, exact);
 }
 
 export async function createMatrixGroupChat(
@@ -4305,6 +4428,286 @@ export async function waitForMatrixGroupChatProjection(
         await new Promise(resolve => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
     }
     return undefined;
+}
+
+function normalizeGroupInviteCandidateList(
+    value: unknown,
+    context: MatrixGroupInviteContext,
+    query: string,
+    exact: boolean
+): MatrixGroupInviteCandidateList {
+    const response = value as Record<string, unknown> | null;
+    const allowedResponseKeys = new Set([
+        "roomId",
+        "query",
+        "scope",
+        "candidates",
+        "limited",
+        "directoryLimited",
+        "complete",
+        "queryRequired",
+        "exactLookup",
+        "participantCount",
+        "maxParticipants",
+        "full",
+    ]);
+    const expectedScope = exact
+        ? "homeserver_user_directory_plus_exact_local_profile"
+        : "homeserver_user_directory";
+    const validExactLookup = exact
+        ? response?.exactLookup === "resolved" || response?.exactLookup === "not_found_or_unavailable"
+        : response?.exactLookup === "not_requested";
+    const participantCount = Number(response?.participantCount);
+    if (!response || typeof response !== "object"
+        || Object.keys(response).some(key => !allowedResponseKeys.has(key))
+        || response.roomId !== context.roomId
+        || response.query !== query
+        || response.scope !== expectedScope
+        || !Array.isArray(response.candidates)
+        || response.candidates.length > 100
+        || typeof response.limited !== "boolean"
+        || typeof response.directoryLimited !== "boolean"
+        || response.complete !== false
+        || response.queryRequired !== false
+        || !validExactLookup
+        || !Number.isSafeInteger(participantCount)
+        || participantCount < 1
+        || participantCount > 10
+        || response.maxParticipants !== 10
+        || typeof response.full !== "boolean"
+        || response.full !== (participantCount >= 10)) {
+        throw new Error("The group chat invite search response was invalid.");
+    }
+
+    const expectedServer = matrixUserServerName(context.expectedAccountId);
+    const memberships = new Set<MatrixGroupInviteCandidateMembership>([
+        "none",
+        "leave",
+        "knock",
+        "invite",
+        "join",
+        "ban",
+    ]);
+    const seen = new Set<string>();
+    const candidates = response.candidates.map(value => {
+        const candidate = value as Record<string, unknown> | null;
+        if (!candidate || typeof candidate !== "object"
+            || Object.keys(candidate).some(key =>
+                !new Set(["userId", "displayName", "avatarUrl", "membership"]).has(key))
+            || !memberships.has(candidate.membership as MatrixGroupInviteCandidateMembership)) {
+            throw new Error("The group chat invite search response was invalid.");
+        }
+        const userId = normalizedInviteUserId(candidate.userId);
+        if (userId === context.expectedAccountId
+            || matrixUserServerName(userId) !== expectedServer
+            || seen.has(userId)
+            || candidate.displayName != null && typeof candidate.displayName !== "string") {
+            throw new Error("The group chat invite search response was invalid.");
+        }
+        seen.add(userId);
+        return {
+            userId,
+            displayName: cleanDisplayText(
+                candidate.displayName?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+                "Account",
+                100
+            ),
+            avatarUrl: normalizedInviteAvatarUrl(candidate.avatarUrl),
+            membership: candidate.membership as MatrixGroupInviteCandidateMembership,
+        };
+    });
+    return {
+        roomId: context.roomId,
+        query,
+        scope: expectedScope,
+        candidates,
+        limited: response.limited,
+        directoryLimited: response.directoryLimited,
+        complete: false,
+        queryRequired: false,
+        exactLookup: response.exactLookup as MatrixGroupInviteCandidateList["exactLookup"],
+        participantCount,
+        maxParticipants: 10,
+        full: response.full,
+    };
+}
+
+function normalizeGroupInviteResult(
+    value: unknown,
+    context: MatrixGroupInviteContext,
+    expectedUserId?: string
+): MatrixGroupInviteResult {
+    const result = value as Record<string, unknown> | null;
+    if (!result || typeof result !== "object"
+        || Object.keys(result).some(key =>
+            !new Set(["roomId", "userId", "delivery", "observedMembership", "changed"]).has(key))
+        || result.roomId !== context.roomId
+        || (result.delivery !== "accepted" && result.delivery !== "existing")
+        || (result.observedMembership != null
+            && result.observedMembership !== "invite" && result.observedMembership !== "join")
+        || typeof result.changed !== "boolean"
+        || (result.changed
+            ? result.delivery !== "accepted"
+            : result.delivery !== "existing" || result.observedMembership == null)) {
+        throw new Error("The group chat invite response was invalid.");
+    }
+    const userId = normalizedInviteUserId(result.userId);
+    if (userId === context.expectedAccountId
+        || matrixUserServerName(userId) !== matrixUserServerName(context.expectedAccountId)
+        || expectedUserId != null && userId !== expectedUserId) {
+        throw new Error("The group chat invite response was invalid.");
+    }
+    return {
+        roomId: context.roomId,
+        userId,
+        delivery: result.delivery,
+        ...(result.observedMembership != null ? { observedMembership: result.observedMembership } : {}),
+        changed: result.changed,
+    };
+}
+
+export async function searchMatrixGroupInviteCandidates(
+    context: MatrixGroupInviteContext,
+    queryValue: string,
+    limit = 25,
+    exact = false
+) {
+    const query = normalizedInviteQuery(queryValue);
+    const before = getCurrentMatrixGroupInviteContext(context);
+    if (!query || !Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !before?.canInvite) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    const value = await Native.searchGroupChatInviteCandidates({
+        roomId: context.roomId,
+        query,
+        limit,
+        exact,
+    }, context.expectedAccountId) as unknown;
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    return normalizeGroupInviteCandidateList(value, context, query, exact);
+}
+
+export async function inviteMatrixUserToGroupChat(
+    context: MatrixGroupInviteContext,
+    userIdValue: string
+): Promise<MatrixGroupInviteResult> {
+    const userId = normalizedInviteUserId(userIdValue);
+    const before = getCurrentMatrixGroupInviteContext(context);
+    if (!before?.canInvite || before.full) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    const value = await Native.inviteUserToGroupChat({ roomId: context.roomId, userId }, context.expectedAccountId) as unknown;
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    return normalizeGroupInviteResult(value, context, userId);
+}
+
+export async function reconcileMatrixGroupChatInvite(
+    context: MatrixGroupInviteContext
+): Promise<MatrixGroupInviteReconcileResult> {
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    const value = await Native.reconcileGroupChatInvite(context.roomId, context.expectedAccountId) as unknown;
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    const result = value as Record<string, unknown> | null;
+    if (!result || typeof result !== "object" || typeof result.status !== "string") {
+        throw new Error("The group chat invite reconciliation response was invalid.");
+    }
+    if (result.status === "none") {
+        if (Object.keys(result).some(key => key !== "status")) {
+            throw new Error("The group chat invite reconciliation response was invalid.");
+        }
+        return { status: "none" };
+    }
+    if (result.status === "pending") {
+        if (Object.keys(result).some(key => key !== "status" && key !== "roomId" && key !== "userId")
+            || result.roomId !== context.roomId) {
+            throw new Error("The group chat invite reconciliation response was invalid.");
+        }
+        const userId = normalizedInviteUserId(result.userId);
+        if (userId === context.expectedAccountId
+            || matrixUserServerName(userId) !== matrixUserServerName(context.expectedAccountId)) {
+            throw new Error("The group chat invite reconciliation response was invalid.");
+        }
+        return { status: "pending", roomId: context.roomId, userId };
+    }
+    if (result.status !== "resolved"
+        || Object.keys(result).some(key => key !== "status" && key !== "result")) {
+        throw new Error("The group chat invite reconciliation response was invalid.");
+    }
+    return { status: "resolved", result: normalizeGroupInviteResult(result.result, context) };
+}
+
+function projectedGroupInviteMembership(context: MatrixGroupInviteContext, userId: string) {
+    const injected = projectedMatrixGroupChat(context.roomId);
+    const member = injected?.room.members?.find(candidate => candidate.userId === userId);
+    return member?.membership === "invite" || member?.membership === "join"
+        ? member.membership
+        : undefined;
+}
+
+export async function waitForMatrixGroupInviteProjection(
+    context: MatrixGroupInviteContext,
+    userIdValue: string,
+    timeoutMs = 20_000
+) {
+    const userId = normalizedInviteUserId(userIdValue);
+    const deadline = Date.now() + timeoutMs;
+    while (getCurrentMatrixGroupInviteContext(context)) {
+        const membership = projectedGroupInviteMembership(context, userId);
+        if (membership) return membership;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return undefined;
+        const refresh = refreshSnapshot(context.generation);
+        const refreshOutcome = await Promise.race([
+            refresh.then(() => "refreshed" as const, () => "failed" as const),
+            new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), remaining)),
+        ]);
+        if (refreshOutcome === "timeout") {
+            void refresh.catch(error => logger.warn("Late group invite projection refresh failed", error));
+            return undefined;
+        }
+        if (refreshOutcome === "failed") {
+            await new Promise(resolve => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
+            continue;
+        }
+        await new Promise(resolve => setTimeout(resolve, Math.min(500, Math.max(0, deadline - Date.now()))));
+    }
+    return undefined;
+}
+
+export async function acknowledgeMatrixGroupChatInvite(
+    context: MatrixGroupInviteContext,
+    userIdValue: string
+): Promise<void> {
+    const userId = normalizedInviteUserId(userIdValue);
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    await Native.acknowledgeGroupChatInvite({ roomId: context.roomId, userId }, context.expectedAccountId);
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+}
+
+export async function overrideMatrixGroupChatInviteAmbiguity(
+    context: MatrixGroupInviteContext,
+    userIdValue: string
+): Promise<void> {
+    const userId = normalizedInviteUserId(userIdValue);
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
+    await Native.overrideGroupChatInviteAmbiguity({ roomId: context.roomId, userId }, context.expectedAccountId);
+    if (!getCurrentMatrixGroupInviteContext(context)) {
+        throw new Error("The group chat invite context is no longer current.");
+    }
 }
 
 function normalizeInviteCandidateList(

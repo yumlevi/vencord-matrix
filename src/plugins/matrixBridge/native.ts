@@ -72,7 +72,12 @@ import type {
     MatrixGroupChatCandidateSearchRequest,
     MatrixGroupChatCandidateSearchResult,
     MatrixGroupChatInvitationDTO,
+    MatrixGroupChatInviteCandidateDTO,
+    MatrixGroupChatInviteCandidateSearchRequest,
+    MatrixGroupChatInviteCandidateSearchResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToGroupChatRequest,
+    MatrixInviteUserToGroupChatResult,
     MatrixInviteUserToSpaceRequest,
     MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
@@ -92,6 +97,7 @@ import type {
     MatrixReactionDTO,
     MatrixReauthenticationRequest,
     MatrixReconcileGroupChatCreateResult,
+    MatrixReconcileGroupChatInviteResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
     MatrixRequestSpaceAccessResult,
@@ -125,6 +131,7 @@ import {
     MATRIX_WORKER_ORIGIN,
     MATRIX_WORKER_SAVE_CREDENTIALS,
     type MatrixCredentialUpdate,
+    type MatrixJoinedRoomIdsResult,
     type MatrixSessionCredentials,
     type MatrixStoredAccount,
     type MatrixWorkerCommand,
@@ -156,10 +163,14 @@ const MAX_CONCURRENT_SPACE_INVITE_SEARCHES_PER_RENDERER = 3;
 const DEFAULT_GROUP_CHAT_DIRECTORY_LIMIT = 25;
 const MAX_GROUP_CHAT_DIRECTORY_LIMIT = 100;
 const MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH = 256;
+const BARE_MATRIX_LOCALPART_PATTERN = /^[a-z0-9._=\-/+]{1,255}$/u;
 const MAX_CONCURRENT_GROUP_CHAT_SEARCHES = 8;
 const MAX_CONCURRENT_GROUP_CHAT_SEARCHES_PER_RENDERER = 3;
-const MIN_GROUP_CHAT_INVITEES = 2;
+const MIN_GROUP_CHAT_INVITEES = 0;
 const MAX_GROUP_CHAT_INVITEES = 9;
+const MAX_GROUP_CHAT_PARTICIPANTS = 10;
+const MAX_IN_FLIGHT_GROUP_CHAT_INVITES = 32;
+const MAX_GROUP_CHAT_STATE_FILE_BYTES = 256 * 1024;
 const MAX_IN_FLIGHT_SPACE_INVITES = 128;
 const MAX_IN_FLIGHT_ROOM_INVITE_ACTIONS = 128;
 const MAX_IN_FLIGHT_ROOM_JOINS = 128;
@@ -346,6 +357,13 @@ interface PendingGroupChatCreate {
     resolved?: MatrixCreateGroupChatResult;
 }
 
+interface PendingGroupChatInvite extends MatrixInviteUserToGroupChatRequest {
+    homeserver: string;
+    accountUserId: string;
+    /** Durable receipt retained until the renderer acknowledges this exact invite. */
+    resolved?: MatrixInviteUserToGroupChatResult;
+}
+
 let workerWindow: BrowserWindow | null = null;
 let workerReady: Promise<void> | null = null;
 let resolveWorkerReady: (() => void) | null = null;
@@ -384,6 +402,8 @@ const roomInviteActionsInFlight = new Set<string>();
 const roomJoinsInFlight = new Set<string>();
 const suggestedSpaceChannelJoinsInFlight = new Set<string>();
 const groupChatReconciliationsInFlight = new Set<string>();
+const groupChatInviteOperationsInFlight = new Set<string>();
+const groupChatInvitePruneScheduledWorkers = new WeakSet<BrowserWindow>();
 const privateAccountDrainWaiters = new Set<() => void>();
 const accountBoundOperationDrainWaiters = new Set<() => void>();
 const privateAccountRequestContext = new AsyncLocalStorage<boolean>();
@@ -413,6 +433,8 @@ const ambiguousSpaceChildCreates = new Map<string, PendingSpaceChildCreate>();
 const MAX_AMBIGUOUS_SPACE_CHILD_CREATES = 64;
 const ambiguousGroupChatCreates = new Map<string, PendingGroupChatCreate>();
 const MAX_AMBIGUOUS_GROUP_CHAT_CREATES = 64;
+const ambiguousGroupChatInvites = new Map<string, PendingGroupChatInvite>();
+const MAX_AMBIGUOUS_GROUP_CHAT_INVITES = 256;
 
 function bridgeError(code: string, message: string): Error {
     const error = new Error(message);
@@ -592,6 +614,7 @@ function projectShellRoom(room: MatrixRoomDTO): MatrixShellRoom {
         kind: room.kind,
         ...(room.roomType ? { roomType: room.roomType } : {}),
         ...(room.groupChat === true ? { groupChat: true as const } : {}),
+        ...(room.invitePermission ? { invitePermission: { ...room.invitePermission } } : {}),
         ...(room.canConfigureSpaceAccess == null ? {} : {
             canConfigureSpaceAccess: room.canConfigureSpaceAccess
         }),
@@ -1440,12 +1463,11 @@ function validateProtocolRoom(value: unknown): MatrixRoomDTO {
     if (kind === "space" && (room.canManageSpaceChildren == null || room.spaceChildPermission == null)) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space-child permission response was missing.");
     }
-    const hasAccessProjection = raw.canConfigureSpaceAccess !== undefined
+    const hasSpaceAccessProjection = raw.canConfigureSpaceAccess !== undefined
         || raw.accessRequestCount !== undefined
         || raw.accessRequestCountComplete !== undefined
         || raw.canApproveAccessRequests !== undefined
-        || raw.canDenyAccessRequests !== undefined
-        || raw.invitePermission !== undefined;
+        || raw.canDenyAccessRequests !== undefined;
     if (kind === "space" && raw.membership === "join") {
         if (typeof raw.canConfigureSpaceAccess !== "boolean"
             || !Number.isSafeInteger(raw.accessRequestCount)
@@ -1464,8 +1486,17 @@ function validateProtocolRoom(value: unknown): MatrixRoomDTO {
         if (room.canApproveAccessRequests !== room.invitePermission.allowed) {
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite permission response was inconsistent.");
         }
-    } else if (hasAccessProjection) {
+    } else if (hasSpaceAccessProjection) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "A non-joined Matrix Space exposed access-request state.");
+    }
+    if (raw.groupChat === true && raw.membership === "join") {
+        room.invitePermission = validateProtocolPowerLevelPermission(
+            raw.invitePermission,
+            "group-chat invite permission"
+        );
+    } else if (raw.invitePermission !== undefined
+        && !(kind === "space" && raw.membership === "join")) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "A non-group room exposed invite permission state.");
     }
     if (raw.roomType != null) {
         const roomType = protocolText(raw.roomType, "room type", 256);
@@ -2192,7 +2223,7 @@ async function loadSpaceChildCreateState(): Promise<void> {
             }
             throw error;
         }
-        if (encrypted.byteLength > 256 * 1024) throw new Error("oversized");
+        if (encrypted.byteLength > MAX_GROUP_CHAT_STATE_FILE_BYTES) throw new Error("oversized");
         assertSecureStorage();
         const raw = JSON.parse(safeStorage.decryptString(encrypted)) as {
             schema?: unknown;
@@ -2262,6 +2293,13 @@ function groupChatCreateLatchKey(binding: Pick<MatrixAccountBinding, "homeserver
     return binding.userId;
 }
 
+function groupChatInviteLatchKey(
+    binding: Pick<MatrixAccountBinding, "userId">,
+    roomId: string
+): string {
+    return JSON.stringify([binding.userId, roomId]);
+}
+
 function pendingGroupChatCreate(value: unknown): PendingGroupChatCreate {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw bridgeError("MATRIX_CREATE_GROUP_CHAT_STATE_CORRUPT", "The pending Matrix group-chat state is invalid.");
@@ -2290,6 +2328,33 @@ function pendingGroupChatCreate(value: unknown): PendingGroupChatCreate {
     return pending;
 }
 
+function pendingGroupChatInvite(value: unknown): PendingGroupChatInvite {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw bridgeError("MATRIX_GROUP_CHAT_INVITE_STATE_CORRUPT", "The pending group-chat invite state is invalid.");
+    }
+    const raw = value as Partial<PendingGroupChatInvite>;
+    if ((Object.keys(value).length !== 4 && Object.keys(value).length !== 5)
+        || !Object.keys(value).every(key => key === "homeserver" || key === "accountUserId"
+            || key === "roomId" || key === "userId" || key === "resolved")) {
+        throw bridgeError("MATRIX_GROUP_CHAT_INVITE_STATE_CORRUPT", "The pending group-chat invite state is invalid.");
+    }
+    const homeserver = validateHomeserver(raw.homeserver);
+    const accountUserId = validateUserId(raw.accountUserId);
+    const request = validateInviteUserToGroupChatRequest(
+        { roomId: raw.roomId, userId: raw.userId },
+        accountUserId
+    );
+    const pending: PendingGroupChatInvite = { homeserver, accountUserId, ...request };
+    if (Object.hasOwn(raw, "resolved")) {
+        pending.resolved = validateProtocolInviteUserToGroupChatResult(
+            raw.resolved,
+            request,
+            serverNameFromMatrixIdentifier(accountUserId)
+        );
+    }
+    return pending;
+}
+
 async function loadGroupChatCreateState(): Promise<void> {
     if (groupChatCreateStateError) throw groupChatCreateStateError;
     if (groupChatCreateStateLoaded) return;
@@ -2306,19 +2371,43 @@ async function loadGroupChatCreateState(): Promise<void> {
         }
         if (encrypted.byteLength > 256 * 1024) throw new Error("oversized");
         assertSecureStorage();
-        const raw = JSON.parse(safeStorage.decryptString(encrypted)) as { schema?: unknown; entries?: unknown; };
-        if (!raw || raw.schema !== 2 || !Array.isArray(raw.entries)
-            || raw.entries.length > MAX_AMBIGUOUS_GROUP_CHAT_CREATES) {
+        const raw = JSON.parse(safeStorage.decryptString(encrypted)) as {
+            schema?: unknown;
+            entries?: unknown;
+            invites?: unknown;
+        };
+        const topLevelKeys = raw && typeof raw === "object" && !Array.isArray(raw)
+            ? Object.keys(raw)
+            : [];
+        const topLevelShapeValid = raw?.schema === 2
+            ? topLevelKeys.length === 2 && topLevelKeys.every(key => key === "schema" || key === "entries")
+            : raw?.schema === 3
+                && topLevelKeys.length === 3
+                && topLevelKeys.every(key => key === "schema" || key === "entries" || key === "invites");
+        if (!raw || !topLevelShapeValid || (raw.schema !== 2 && raw.schema !== 3) || !Array.isArray(raw.entries)
+            || raw.entries.length > MAX_AMBIGUOUS_GROUP_CHAT_CREATES
+            || (raw.schema === 3 && (!Array.isArray(raw.invites)
+                || raw.invites.length > MAX_AMBIGUOUS_GROUP_CHAT_INVITES))) {
             throw new Error("invalid");
         }
+        const loadedCreates = new Map<string, PendingGroupChatCreate>();
+        const loadedInvites = new Map<string, PendingGroupChatInvite>();
         const markers = new Set<string>();
         for (const value of raw.entries) {
             const entry = pendingGroupChatCreate(value);
             const key = groupChatCreateLatchKey(entry);
-            if (ambiguousGroupChatCreates.has(key) || markers.has(entry.creationMarker)) throw new Error("duplicate");
-            ambiguousGroupChatCreates.set(key, entry);
+            if (loadedCreates.has(key) || markers.has(entry.creationMarker)) throw new Error("duplicate");
+            loadedCreates.set(key, entry);
             markers.add(entry.creationMarker);
         }
+        for (const value of raw.schema === 3 ? raw.invites as unknown[] : []) {
+            const entry = pendingGroupChatInvite(value);
+            const key = groupChatInviteLatchKey({ userId: entry.accountUserId }, entry.roomId);
+            if (loadedInvites.has(key)) throw new Error("duplicate");
+            loadedInvites.set(key, entry);
+        }
+        for (const [key, entry] of loadedCreates) ambiguousGroupChatCreates.set(key, entry);
+        for (const [key, entry] of loadedInvites) ambiguousGroupChatInvites.set(key, entry);
         groupChatCreateStateLoaded = true;
     } catch {
         groupChatCreateStateError = bridgeError(
@@ -2335,9 +2424,11 @@ async function saveGroupChatCreateState(): Promise<void> {
     let encrypted: Buffer;
     try {
         encrypted = safeStorage.encryptString(JSON.stringify({
-            schema: 2,
-            entries: [...ambiguousGroupChatCreates.values()]
+            schema: 3,
+            entries: [...ambiguousGroupChatCreates.values()],
+            invites: [...ambiguousGroupChatInvites.values()]
         }));
+        if (encrypted.byteLength > MAX_GROUP_CHAT_STATE_FILE_BYTES) throw new Error("oversized");
     } catch {
         throw bridgeError(
             "MATRIX_CREATE_GROUP_CHAT_STATE_WRITE_FAILED",
@@ -2465,6 +2556,7 @@ async function clearNativeAccountStorage(): Promise<void> {
         ambiguousGroupChatCreates.clear();
         groupChatCreateStateLoaded = false;
         groupChatCreateStateError = null;
+        ambiguousGroupChatInvites.clear();
     }));
 }
 
@@ -3462,6 +3554,11 @@ function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]
                 "MATRIX_SPACE_INVITE_AMBIGUOUS",
                 "Matrix could not confirm the invite. It may already be pending; refresh before trying again."
             );
+        case "inviteUserToGroupChat":
+            return bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS",
+                "Matrix could not confirm the group-chat invite. Reconcile it before any retry."
+            );
         case "acceptInvite":
             return bridgeError(
                 "MATRIX_ROOM_INVITE_ACCEPT_AMBIGUOUS",
@@ -3495,13 +3592,13 @@ function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]
 
 function mutationSignalCommandType(commandType: MatrixWorkerCommand["type"]): boolean {
     return commandType === "createSpace" || commandType === "createSpaceChild" || commandType === "createGroupChat"
-        || commandType === "inviteUserToSpace" || commandType === "acceptInvite"
+        || commandType === "inviteUserToSpace" || commandType === "inviteUserToGroupChat" || commandType === "acceptInvite"
         || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
         || commandType === "joinRoom" || commandType === "joinRoomAddress";
 }
 
 function accessMutationRequiresDispatchSignal(commandType: MatrixWorkerCommand["type"]): boolean {
-    return commandType === "inviteUserToSpace" || commandType === "acceptInvite"
+    return commandType === "inviteUserToSpace" || commandType === "inviteUserToGroupChat" || commandType === "acceptInvite"
         || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
         || commandType === "joinRoom" || commandType === "joinRoomAddress" || commandType === "createGroupChat";
 }
@@ -3845,6 +3942,14 @@ function handleWorkerMessage(message: MatrixWorkerMessage): void {
         ));
         return;
     }
+    if (pending.commandType === "inviteUserToGroupChat" && pending.mutationDispatched
+        && error.name !== "MATRIX_GROUP_CHAT_INVITE_REJECTED") {
+        pending.reject(bridgeError(
+            "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS",
+            "Matrix could not confirm the group-chat invite after dispatch. Reconcile it before any retry."
+        ));
+        return;
+    }
     if (isSessionRecoveryError(message.error) && activeWorkerBinding) {
         latchActiveSessionFailure(message.error);
         failWorker(error);
@@ -4165,6 +4270,70 @@ async function requireStarted(): Promise<void> {
     });
 }
 
+function validateProtocolJoinedRoomIds(value: unknown): MatrixJoinedRoomIdsResult {
+    const raw = protocolObjectKeys(value, "joined-room IDs", ["roomIds"]);
+    if (!Array.isArray(raw.roomIds) || raw.roomIds.length > 100_000) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix joined-room response was invalid.");
+    }
+    const roomIds = raw.roomIds.map(protocolRoomId);
+    if (roomIds.some((roomId, index) => index > 0 && roomIds[index - 1] >= roomId)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix joined-room response was not unique and sorted.");
+    }
+    return { roomIds };
+}
+
+async function bestEffortPruneUnjoinedGroupChatInviteReceipts(
+    binding: MatrixAccountBinding,
+    expectedWorker: BrowserWindow
+): Promise<void> {
+    try {
+        if (accountLifecycleTransitions > 0 || workerWindow !== expectedWorker
+            || expectedWorker.isDestroyed() || !sameAccountBinding(binding, activeWorkerBinding)) return;
+        const captured = await captureGroupChatInviteReceipts(binding);
+        if (!captured.length || accountLifecycleTransitions > 0 || workerWindow !== expectedWorker
+            || expectedWorker.isDestroyed() || !sameAccountBinding(binding, activeWorkerBinding)) return;
+        const raw = await callWorker<MatrixJoinedRoomIdsResult>({ type: "joinedRoomIds" });
+        const joined = validateProtocolJoinedRoomIds(raw);
+        if (accountLifecycleTransitions > 0 || workerWindow !== expectedWorker
+            || expectedWorker.isDestroyed() || !sameAccountBinding(binding, activeWorkerBinding)) return;
+
+        // The network read deliberately owns no account lease, so a logout or
+        // worker restart can cancel it immediately. Hold a short lease only
+        // while rechecking the exact worker/account and atomically updating the
+        // local receipt file.
+        let releaseAccount: (() => void) | undefined;
+        try {
+            releaseAccount = beginAccountBoundOperation(binding);
+        } catch {
+            return;
+        }
+        try {
+            if (accountLifecycleTransitions > 0 || workerWindow !== expectedWorker
+                || expectedWorker.isDestroyed() || !sameAccountBinding(binding, activeWorkerBinding)) return;
+            await pruneUnjoinedGroupChatInviteReceipts(binding, captured, new Set(joined.roomIds));
+        } finally {
+            releaseAccount();
+        }
+    } catch (error) {
+        // A transient /joined_rooms failure must retain every ambiguity receipt.
+        console.warn(`[MatrixBridge] Could not prune unjoined group-chat invite receipts (${errorDTO(error).code}).`);
+    }
+}
+
+function scheduleUnjoinedGroupChatInviteReceiptPrune(binding: MatrixAccountBinding): void {
+    const expectedWorker = workerWindow;
+    if (!expectedWorker || expectedWorker.isDestroyed()
+        || groupChatInvitePruneScheduledWorkers.has(expectedWorker)) return;
+    groupChatInvitePruneScheduledWorkers.add(expectedWorker);
+    // Never add homeserver latency to startup/snapshot delivery. The captured
+    // worker identity and binding are rechecked before any local deletion. A
+    // worker gets at most one housekeeping request; ordinary snapshots never
+    // turn this into a joined_rooms poller.
+    setTimeout(() => {
+        void bestEffortPruneUnjoinedGroupChatInviteReceipts(binding, expectedWorker);
+    }, 0);
+}
+
 async function startInternal(account: MatrixStoredAccount): Promise<MatrixSnapshot> {
     return await runAccountLifecycleTransition(async () => {
         const binding = accountBinding(account)!;
@@ -4180,6 +4349,7 @@ async function startInternal(account: MatrixStoredAccount): Promise<MatrixSnapsh
             }
             const finalized = finalizeSnapshot(result, sequenceWatermark);
             activeWorkerBinding = binding;
+            scheduleUnjoinedGroupChatInviteReceiptPrune(binding);
             return finalized;
         } catch (error) {
             updateStatus("error", { userId: account.userId }, errorDTO(error));
@@ -4747,13 +4917,34 @@ async function leaveRoom(
     // requireStarted(): an already-running identity transition rejects here,
     // while a later transition must wait until the leave response is checked.
     const releaseAccount = beginAccountBoundOperation(binding);
+    const receiptOperationKey = groupChatInviteLatchKey(binding, targetRoomId);
     try {
+        if (groupChatInviteOperationsInFlight.has(receiptOperationKey)) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_IN_PROGRESS",
+                "Finish reconciling the group-chat invite before leaving this room."
+            );
+        }
+        if (groupChatInviteOperationsInFlight.size >= MAX_IN_FLIGHT_GROUP_CHAT_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending group-chat operations.");
+        }
+        groupChatInviteOperationsInFlight.add(receiptOperationKey);
         const result = await callWorker<MatrixRoomActionResult>({ type: "leaveRoom", roomId: targetRoomId });
         if (!sameAccountBinding(binding, activeWorkerBinding)) {
             throw bridgeError("MATRIX_SESSION_CHANGED", "The Matrix account changed during the leave request.");
         }
-        return validateRoomActionResult(result, targetRoomId);
+        const action = validateRoomActionResult(result, targetRoomId);
+        try {
+            const pending = await pendingGroupChatInviteForRoom(binding, targetRoomId);
+            if (pending) await clearPendingGroupChatInvite(binding, pending);
+        } catch (error) {
+            // The authoritative leave result wins. A retained receipt will be
+            // pruned by the next exact /joined_rooms lifecycle check.
+            console.warn(`[MatrixBridge] Room leave succeeded, but its group-chat invite receipt was not cleared (${errorDTO(error).code}).`);
+        }
+        return action;
     } finally {
+        groupChatInviteOperationsInFlight.delete(receiptOperationKey);
         releaseAccount();
     }
 }
@@ -5387,9 +5578,42 @@ async function searchSpaceInviteCandidates(
     }
 }
 
-function validateGroupChatCandidateSearchRequest(value: unknown): Required<MatrixGroupChatCandidateSearchRequest> {
+function exactLocalProfileUserId(query: string, accountUserId: string): string {
+    const activeServerName = serverNameFromMatrixIdentifier(accountUserId);
+    let userId: string | undefined;
+    if (query.startsWith("@")) {
+        const separator = query.indexOf(":", 1);
+        const localpart = separator > 1 ? query.slice(1, separator) : "";
+        const serverName = separator > 1 ? query.slice(separator + 1) : "";
+        if (BARE_MATRIX_LOCALPART_PATTERN.test(localpart)
+            && serverName === activeServerName
+            && Buffer.byteLength(query, "utf8") <= 255) {
+            try {
+                const validated = validateUserId(query);
+                if (validated === query) userId = validated;
+            } catch { }
+        }
+    } else if (BARE_MATRIX_LOCALPART_PATTERN.test(query)) {
+        const candidate = `@${query}:${activeServerName}`;
+        if (Buffer.byteLength(candidate, "utf8") <= 255) {
+            try { userId = validateUserId(candidate); } catch { }
+        }
+    }
+    if (!userId) {
+        throw bridgeError(
+            "MATRIX_GROUP_CHAT_EXACT_LOOKUP_INVALID",
+            "Enter an exact local Matrix ID or a lowercase local username."
+        );
+    }
+    return userId;
+}
+
+function validateGroupChatCandidateSearchRequest(
+    value: unknown,
+    expectedUserId: string
+): Required<MatrixGroupChatCandidateSearchRequest> {
     const raw = objectRecord(value, "Matrix group-chat directory search");
-    if (!Object.keys(raw).every(key => key === "query" || key === "limit")) {
+    if (!Object.keys(raw).every(key => key === "query" || key === "limit" || key === "exact")) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search contains unsupported fields.");
     }
     const query = validateString(
@@ -5405,7 +5629,12 @@ function validateGroupChatCandidateSearchRequest(value: unknown): Required<Matri
     if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > MAX_GROUP_CHAT_DIRECTORY_LIMIT) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search limit is invalid.");
     }
-    return { query, limit: Number(limit) };
+    const exact = raw.exact ?? false;
+    if (typeof exact !== "boolean") {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat exact-search option is invalid.");
+    }
+    if (exact) exactLocalProfileUserId(query, expectedUserId);
+    return { query, limit: Number(limit), exact };
 }
 
 function validateCreateGroupChatRequest(
@@ -5425,7 +5654,7 @@ function validateCreateGroupChatRequest(
         || raw.userIds.length > MAX_GROUP_CHAT_INVITEES) {
         throw bridgeError(
             "MATRIX_INVALID_ARGUMENT",
-            `A Matrix group chat requires ${MIN_GROUP_CHAT_INVITEES} to ${MAX_GROUP_CHAT_INVITEES} other users.`
+            `A Matrix group chat allows up to ${MAX_GROUP_CHAT_INVITEES} other users.`
         );
     }
     const accountUserId = validateUserId(expectedUserId);
@@ -5485,13 +5714,20 @@ function validateProtocolGroupChatCandidateSearchResult(
         "limited",
         "directoryLimited",
         "complete",
-        "queryRequired"
+        "queryRequired",
+        "exactLookup"
     ]);
+    const expectedScope = request.exact
+        ? "homeserver_user_directory_plus_exact_local_profile"
+        : "homeserver_user_directory";
     if (protocolText(raw.query, "Group-chat directory search query", MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH, true)
-        !== request.query || raw.scope !== "homeserver_user_directory" || !Array.isArray(raw.candidates)
+        !== request.query || raw.scope !== expectedScope || !Array.isArray(raw.candidates)
         || raw.candidates.length > request.limit || typeof raw.limited !== "boolean"
         || typeof raw.directoryLimited !== "boolean" || raw.complete !== false
-        || typeof raw.queryRequired !== "boolean" || (raw.directoryLimited && !raw.limited)) {
+        || typeof raw.queryRequired !== "boolean" || (raw.directoryLimited && !raw.limited)
+        || (request.exact
+            ? raw.exactLookup !== "resolved" && raw.exactLookup !== "not_found_or_unavailable"
+            : raw.exactLookup !== "not_requested")) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat directory search response was invalid.");
     }
     const expectedServerName = serverNameFromMatrixIdentifier(binding.userId);
@@ -5500,19 +5736,24 @@ function validateProtocolGroupChatCandidateSearchResult(
         expectedServerName,
         binding.userId
     ));
+    const exactUserId = request.exact ? exactLocalProfileUserId(request.query, binding.userId) : undefined;
     if (new Set(candidates.map(candidate => candidate.userId)).size !== candidates.length
+        || (raw.exactLookup === "resolved" && !candidates.some(candidate => candidate.userId === exactUserId))
+        || (raw.exactLookup === "not_found_or_unavailable"
+            && candidates.some(candidate => candidate.userId === exactUserId))
         || (raw.queryRequired && (request.query !== "" || candidates.length > 0
-            || raw.limited || raw.directoryLimited))) {
+            || raw.limited || raw.directoryLimited || raw.exactLookup !== "not_requested"))) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat directory search response was inconsistent.");
     }
     return {
         query: request.query,
-        scope: "homeserver_user_directory",
+        scope: expectedScope,
         candidates,
         limited: raw.limited,
         directoryLimited: raw.directoryLimited,
         complete: false,
-        queryRequired: raw.queryRequired
+        queryRequired: raw.queryRequired,
+        exactLookup: raw.exactLookup as MatrixGroupChatCandidateSearchResult["exactLookup"]
     };
 }
 
@@ -5534,7 +5775,7 @@ async function searchGroupChatCandidates(
     groupChatSearchesByRenderer.set(rendererId, rendererCount + 1);
     try {
         return await withExpectedMatrixAccount(expectedUserId, async binding => {
-            const validatedRequest = validateGroupChatCandidateSearchRequest(request);
+            const validatedRequest = validateGroupChatCandidateSearchRequest(request, binding.userId);
             const result = await callWorker<MatrixGroupChatCandidateSearchResult>({
                 type: "searchGroupChatCandidates",
                 request: validatedRequest
@@ -5547,6 +5788,596 @@ async function searchGroupChatCandidates(
         if (remaining > 0) groupChatSearchesByRenderer.set(rendererId, remaining);
         else groupChatSearchesByRenderer.delete(rendererId);
     }
+}
+
+function validateGroupChatInviteCandidateSearchRequest(
+    value: unknown,
+    expectedUserId: string
+): Required<MatrixGroupChatInviteCandidateSearchRequest> {
+    const raw = objectRecord(value, "Matrix group-chat invite search");
+    if (!Object.keys(raw).every(key => key === "roomId" || key === "query" || key === "limit" || key === "exact")) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite search contains unsupported fields.");
+    }
+    const search = validateGroupChatCandidateSearchRequest({
+        query: raw.query,
+        ...(Object.hasOwn(raw, "limit") ? { limit: raw.limit } : {}),
+        ...(Object.hasOwn(raw, "exact") ? { exact: raw.exact } : {})
+    }, expectedUserId);
+    return { roomId: validateRoomId(raw.roomId), ...search };
+}
+
+function validateInviteUserToGroupChatRequest(
+    value: unknown,
+    expectedUserId: string
+): MatrixInviteUserToGroupChatRequest {
+    const raw = objectRecord(value, "Matrix group-chat invite");
+    if (Object.keys(raw).length !== 2 || !Object.hasOwn(raw, "roomId") || !Object.hasOwn(raw, "userId")) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite contains invalid fields.");
+    }
+    const accountUserId = validateUserId(expectedUserId);
+    const userId = validateUserId(raw.userId);
+    if (userId === accountUserId) {
+        throw bridgeError("MATRIX_GROUP_CHAT_INVITE_SELF", "You cannot invite your own Matrix account.");
+    }
+    if (serverNameFromMatrixIdentifier(userId) !== serverNameFromMatrixIdentifier(accountUserId)) {
+        throw bridgeError(
+            "MATRIX_REMOTE_USER_REJECTED",
+            "Only users on this account's Matrix server can be invited to this group chat."
+        );
+    }
+    return { roomId: validateRoomId(raw.roomId), userId };
+}
+
+function validateProtocolGroupChatInviteCandidate(
+    value: unknown,
+    expectedServerName: string,
+    expectedUserId: string
+): MatrixGroupChatInviteCandidateDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "Group-chat invite candidate",
+        ["userId", "displayName", "avatarUrl", "membership"],
+        ["userId", "membership"]
+    );
+    const candidate = validateProtocolGroupChatCandidate({
+        userId: raw.userId,
+        ...(raw.displayName != null ? { displayName: raw.displayName } : {}),
+        ...(raw.avatarUrl != null ? { avatarUrl: raw.avatarUrl } : {})
+    }, expectedServerName, expectedUserId);
+    if (raw.membership !== "none" && raw.membership !== "leave" && raw.membership !== "knock"
+        && raw.membership !== "invite" && raw.membership !== "join" && raw.membership !== "ban") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat invite candidate was invalid.");
+    }
+    return { ...candidate, membership: raw.membership };
+}
+
+function validateProtocolGroupChatInviteCandidateSearchResult(
+    value: unknown,
+    request: Required<MatrixGroupChatInviteCandidateSearchRequest>,
+    binding: MatrixAccountBinding
+): MatrixGroupChatInviteCandidateSearchResult {
+    const raw = protocolObjectKeys(value, "Group-chat invite search", [
+        "roomId",
+        "query",
+        "scope",
+        "candidates",
+        "limited",
+        "directoryLimited",
+        "complete",
+        "queryRequired",
+        "exactLookup",
+        "participantCount",
+        "maxParticipants",
+        "full"
+    ]);
+    const expectedScope = request.exact
+        ? "homeserver_user_directory_plus_exact_local_profile"
+        : "homeserver_user_directory";
+    if (protocolRoomId(raw.roomId) !== request.roomId
+        || protocolText(raw.query, "Group-chat invite search query", MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH, true)
+            !== request.query
+        || raw.scope !== expectedScope || !Array.isArray(raw.candidates)
+        || raw.candidates.length > request.limit || typeof raw.limited !== "boolean"
+        || typeof raw.directoryLimited !== "boolean" || raw.complete !== false
+        || typeof raw.queryRequired !== "boolean" || (raw.directoryLimited && !raw.limited)
+        || (request.exact
+            ? raw.exactLookup !== "resolved" && raw.exactLookup !== "not_found_or_unavailable"
+            : raw.exactLookup !== "not_requested")
+        || !Number.isSafeInteger(raw.participantCount) || Number(raw.participantCount) < 1
+        || Number(raw.participantCount) > 1_000 || raw.maxParticipants !== MAX_GROUP_CHAT_PARTICIPANTS
+        || typeof raw.full !== "boolean"
+        || raw.full !== (Number(raw.participantCount) >= MAX_GROUP_CHAT_PARTICIPANTS)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat invite search response was invalid.");
+    }
+    const expectedServerName = serverNameFromMatrixIdentifier(binding.userId);
+    const candidates = raw.candidates.map(candidate => validateProtocolGroupChatInviteCandidate(
+        candidate,
+        expectedServerName,
+        binding.userId
+    ));
+    const exactUserId = request.exact ? exactLocalProfileUserId(request.query, binding.userId) : undefined;
+    if (new Set(candidates.map(candidate => candidate.userId)).size !== candidates.length
+        || (raw.exactLookup === "resolved" && !candidates.some(candidate => candidate.userId === exactUserId))
+        || (raw.exactLookup === "not_found_or_unavailable"
+            && candidates.some(candidate => candidate.userId === exactUserId))
+        || (raw.queryRequired && (request.query !== "" || candidates.length > 0
+            || raw.limited || raw.directoryLimited || raw.exactLookup !== "not_requested"))) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat invite search response was inconsistent.");
+    }
+    return {
+        roomId: request.roomId,
+        query: request.query,
+        scope: expectedScope,
+        candidates,
+        limited: raw.limited,
+        directoryLimited: raw.directoryLimited,
+        complete: false,
+        queryRequired: raw.queryRequired,
+        exactLookup: raw.exactLookup as MatrixGroupChatCandidateSearchResult["exactLookup"],
+        participantCount: Number(raw.participantCount),
+        maxParticipants: MAX_GROUP_CHAT_PARTICIPANTS,
+        full: raw.full
+    };
+}
+
+function validateProtocolInviteUserToGroupChatResult(
+    value: unknown,
+    request: MatrixInviteUserToGroupChatRequest,
+    expectedServerName: string
+): MatrixInviteUserToGroupChatResult {
+    const raw = protocolObjectKeys(
+        value,
+        "Group-chat invite result",
+        ["roomId", "userId", "delivery", "observedMembership", "changed"],
+        ["roomId", "userId", "delivery", "changed"]
+    );
+    const userId = protocolUserId(raw.userId);
+    if (protocolRoomId(raw.roomId) !== request.roomId || userId !== request.userId
+        || serverNameFromMatrixIdentifier(userId) !== expectedServerName
+        || (raw.delivery !== "accepted" && raw.delivery !== "existing")
+        || (raw.observedMembership != null
+            && raw.observedMembership !== "invite" && raw.observedMembership !== "join")
+        || typeof raw.changed !== "boolean"
+        || (raw.changed
+            ? raw.delivery !== "accepted"
+            : raw.delivery !== "existing" || raw.observedMembership == null)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix group-chat invite result was invalid.");
+    }
+    return {
+        ...request,
+        delivery: raw.delivery,
+        ...(raw.observedMembership != null ? { observedMembership: raw.observedMembership } : {}),
+        changed: raw.changed
+    };
+}
+
+async function searchGroupChatInviteCandidates(
+    event: IpcMainInvokeEvent,
+    request: MatrixGroupChatInviteCandidateSearchRequest,
+    expectedUserId: string
+): Promise<MatrixGroupChatInviteCandidateSearchResult> {
+    const rendererId = event.sender.id;
+    const rendererCount = groupChatSearchesByRenderer.get(rendererId) ?? 0;
+    if (concurrentGroupChatSearches >= MAX_CONCURRENT_GROUP_CHAT_SEARCHES
+        || rendererCount >= MAX_CONCURRENT_GROUP_CHAT_SEARCHES_PER_RENDERER) {
+        throw bridgeError(
+            "MATRIX_GROUP_CHAT_SEARCH_BUSY",
+            "Too many Matrix group-chat directory searches are already running."
+        );
+    }
+    concurrentGroupChatSearches++;
+    groupChatSearchesByRenderer.set(rendererId, rendererCount + 1);
+    try {
+        return await withExpectedMatrixAccount(expectedUserId, async binding => {
+            const validatedRequest = validateGroupChatInviteCandidateSearchRequest(request, binding.userId);
+            const result = await callWorker<MatrixGroupChatInviteCandidateSearchResult>({
+                type: "searchGroupChatInviteCandidates",
+                request: validatedRequest
+            });
+            return validateProtocolGroupChatInviteCandidateSearchResult(result, validatedRequest, binding);
+        });
+    } finally {
+        concurrentGroupChatSearches--;
+        const remaining = (groupChatSearchesByRenderer.get(rendererId) ?? 1) - 1;
+        if (remaining > 0) groupChatSearchesByRenderer.set(rendererId, remaining);
+        else groupChatSearchesByRenderer.delete(rendererId);
+    }
+}
+
+async function pendingGroupChatInviteForRoom(
+    binding: MatrixAccountBinding,
+    roomId: string
+): Promise<PendingGroupChatInvite | undefined> {
+    return await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        return ambiguousGroupChatInvites.get(groupChatInviteLatchKey(binding, roomId));
+    });
+}
+
+async function createPendingGroupChatInvite(
+    binding: MatrixAccountBinding,
+    request: MatrixInviteUserToGroupChatRequest
+): Promise<PendingGroupChatInvite> {
+    const key = groupChatInviteLatchKey(binding, request.roomId);
+    const pending: PendingGroupChatInvite = {
+        homeserver: binding.homeserver,
+        accountUserId: binding.userId,
+        ...request
+    };
+    await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        if (ambiguousGroupChatInvites.has(key)) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_RECONCILE_REQUIRED",
+                "Reconcile or acknowledge the pending invite for this group chat before inviting another person."
+            );
+        }
+        if (ambiguousGroupChatInvites.size >= MAX_AMBIGUOUS_GROUP_CHAT_INVITES) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_RECONCILE_REQUIRED",
+                "Too many group-chat invites require reconciliation before another can start."
+            );
+        }
+        ambiguousGroupChatInvites.set(key, pending);
+        try {
+            await saveGroupChatCreateState();
+        } catch (error) {
+            ambiguousGroupChatInvites.delete(key);
+            throw error;
+        }
+    });
+    return pending;
+}
+
+function samePendingGroupChatInvite(
+    current: PendingGroupChatInvite | undefined,
+    expected: PendingGroupChatInvite
+): current is PendingGroupChatInvite {
+    return current?.accountUserId === expected.accountUserId
+        && current.roomId === expected.roomId
+        && current.userId === expected.userId;
+}
+
+async function persistResolvedGroupChatInvite(
+    binding: MatrixAccountBinding,
+    pending: PendingGroupChatInvite,
+    result: MatrixInviteUserToGroupChatResult
+): Promise<PendingGroupChatInvite> {
+    const key = groupChatInviteLatchKey(binding, pending.roomId);
+    return await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        const current = ambiguousGroupChatInvites.get(key);
+        if (!samePendingGroupChatInvite(current, pending)) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_STATE_CORRUPT",
+                "The pending group-chat invite state changed unexpectedly."
+            );
+        }
+        if (current.resolved) return current;
+        const resolved: PendingGroupChatInvite = { ...current, resolved: result };
+        ambiguousGroupChatInvites.set(key, resolved);
+        try {
+            await saveGroupChatCreateState();
+        } catch (error) {
+            ambiguousGroupChatInvites.set(key, current);
+            throw error;
+        }
+        return resolved;
+    });
+}
+
+async function clearPendingGroupChatInvite(
+    binding: MatrixAccountBinding,
+    pending: PendingGroupChatInvite
+): Promise<void> {
+    const key = groupChatInviteLatchKey(binding, pending.roomId);
+    await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        const current = ambiguousGroupChatInvites.get(key);
+        if (!samePendingGroupChatInvite(current, pending)) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_STATE_CORRUPT",
+                "The pending group-chat invite state changed unexpectedly."
+            );
+        }
+        ambiguousGroupChatInvites.delete(key);
+        try {
+            await saveGroupChatCreateState();
+        } catch (error) {
+            ambiguousGroupChatInvites.set(key, current);
+            throw error;
+        }
+    });
+}
+
+async function pruneUnjoinedGroupChatInviteReceipts(
+    binding: MatrixAccountBinding,
+    captured: ReadonlyArray<readonly [string, PendingGroupChatInvite]>,
+    joinedRoomIds: ReadonlySet<string>
+): Promise<number> {
+    return await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        const removed: Array<[string, PendingGroupChatInvite]> = [];
+        for (const [key, pending] of captured) {
+            // The membership cut may be older than a newly-created or newly-
+            // resolved receipt. Delete only the exact object captured before
+            // /joined_rooms and never interfere with an active room mutation.
+            if (ambiguousGroupChatInvites.get(key) !== pending
+                || groupChatInviteOperationsInFlight.has(key)
+                || pending.accountUserId !== binding.userId
+                || joinedRoomIds.has(pending.roomId)) continue;
+            removed.push([key, pending]);
+        }
+        if (!removed.length) return 0;
+        for (const [key] of removed) ambiguousGroupChatInvites.delete(key);
+        try {
+            await saveGroupChatCreateState();
+        } catch (error) {
+            for (const [key, pending] of removed) ambiguousGroupChatInvites.set(key, pending);
+            throw error;
+        }
+        return removed.length;
+    });
+}
+
+async function captureGroupChatInviteReceipts(
+    binding: MatrixAccountBinding
+): Promise<Array<readonly [string, PendingGroupChatInvite]>> {
+    return await runGroupChatCreateState(async () => {
+        await loadGroupChatCreateState();
+        return [...ambiguousGroupChatInvites].filter(([, pending]) => pending.accountUserId === binding.userId);
+    });
+}
+
+function definitiveGroupChatInviteError(error: unknown): boolean {
+    return error instanceof Error && (
+        error.name === "MATRIX_INVALID_ARGUMENT"
+        || error.name === "MATRIX_NOT_STARTED"
+        || error.name === "MATRIX_WORKER_UNAVAILABLE"
+        || error.name === "MATRIX_WORKER_CLOSED"
+        || error.name === "MATRIX_WORKER_CRASHED"
+        || error.name === "MATRIX_COMMAND_QUEUE_TIMEOUT"
+        || error.name === "MATRIX_BACKEND_BUSY"
+        || error.name === "MATRIX_SESSION_CHANGED"
+        || error.name === "MATRIX_PROTOCOL_ERROR"
+        || error.name === "MATRIX_GROUP_CHAT_REQUIRED"
+        || error.name === "MATRIX_GROUP_CHAT_NOT_JOINED"
+        || error.name === "MATRIX_GROUP_CHAT_PRIVACY_UNVERIFIABLE"
+        || error.name === "MATRIX_GROUP_CHAT_INVITE_PERMISSION_UNVERIFIABLE"
+        || error.name === "MATRIX_GROUP_CHAT_INVITE_FORBIDDEN"
+        || error.name === "MATRIX_GROUP_CHAT_INVITE_SELF"
+        || error.name === "MATRIX_GROUP_CHAT_INVITE_BANNED"
+        || error.name === "MATRIX_GROUP_CHAT_FULL"
+        || error.name === "MATRIX_GROUP_CHAT_CANDIDATE_STALE"
+        || error.name === "MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID"
+        || error.name === "MATRIX_GROUP_CHAT_INVITE_REJECTED"
+    );
+}
+
+function validateProtocolReconcileGroupChatInviteResult(
+    value: unknown,
+    pending: PendingGroupChatInvite,
+    expectedServerName: string
+): Exclude<MatrixReconcileGroupChatInviteResult, { status: "none"; }> {
+    const raw = protocolObjectKeys(
+        value,
+        "group-chat invite reconciliation",
+        ["status", "roomId", "userId", "result"],
+        ["status"]
+    );
+    if (raw.status === "pending") {
+        if (Object.hasOwn(raw, "result") || protocolRoomId(raw.roomId) !== pending.roomId
+            || protocolUserId(raw.userId) !== pending.userId) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The group-chat invite reconciliation response was invalid.");
+        }
+        return { status: "pending", roomId: pending.roomId, userId: pending.userId };
+    }
+    if (raw.status !== "resolved" || Object.hasOwn(raw, "roomId") || Object.hasOwn(raw, "userId")
+        || !Object.hasOwn(raw, "result")) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The group-chat invite reconciliation response was invalid.");
+    }
+    return {
+        status: "resolved",
+        result: validateProtocolInviteUserToGroupChatResult(raw.result, pending, expectedServerName)
+    };
+}
+
+async function inviteUserToGroupChat(
+    _: IpcMainInvokeEvent,
+    request: MatrixInviteUserToGroupChatRequest,
+    expectedUserId: string
+): Promise<MatrixInviteUserToGroupChatResult> {
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const validatedRequest = validateInviteUserToGroupChatRequest(request, binding.userId);
+        const operationKey = groupChatInviteLatchKey(binding, validatedRequest.roomId);
+        if (groupChatInviteOperationsInFlight.has(operationKey)) {
+            throw bridgeError("MATRIX_GROUP_CHAT_INVITE_IN_PROGRESS", "A group-chat invite is already in progress for this room.");
+        }
+        if (groupChatInviteOperationsInFlight.size >= MAX_IN_FLIGHT_GROUP_CHAT_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending group-chat invites.");
+        }
+        groupChatInviteOperationsInFlight.add(operationKey);
+        try {
+            const pending = await createPendingGroupChatInvite(binding, validatedRequest);
+            let rawResult: MatrixInviteUserToGroupChatResult;
+            try {
+                rawResult = await callWorker<MatrixInviteUserToGroupChatResult>({
+                    type: "inviteUserToGroupChat",
+                    request: validatedRequest
+                });
+            } catch (error) {
+                if (definitiveGroupChatInviteError(error)) {
+                    await clearPendingGroupChatInvite(binding, pending);
+                }
+                throw error;
+            }
+            let result: MatrixInviteUserToGroupChatResult;
+            try {
+                result = validateProtocolInviteUserToGroupChatResult(
+                    rawResult,
+                    validatedRequest,
+                    serverNameFromMatrixIdentifier(binding.userId)
+                );
+            } catch {
+                throw bridgeError(
+                    "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS",
+                    "Matrix may have sent the group-chat invite but returned an invalid confirmation. Reconcile it before any retry."
+                );
+            }
+            if (!result.changed) {
+                await clearPendingGroupChatInvite(binding, pending);
+                return result;
+            }
+            try {
+                await persistResolvedGroupChatInvite(binding, pending, result);
+            } catch (error) {
+                console.warn(`[MatrixBridge] Group-chat invite succeeded, but its resolved receipt was not cached (${errorDTO(error).code}).`);
+            }
+            return result;
+        } finally {
+            groupChatInviteOperationsInFlight.delete(operationKey);
+        }
+    });
+}
+
+async function reconcileGroupChatInvite(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    expectedUserId: string
+): Promise<MatrixReconcileGroupChatInviteResult> {
+    const targetRoomId = validateRoomId(roomId);
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const operationKey = groupChatInviteLatchKey(binding, targetRoomId);
+        if (groupChatInviteOperationsInFlight.has(operationKey)) {
+            throw bridgeError(
+                "MATRIX_GROUP_CHAT_INVITE_RECONCILE_IN_PROGRESS",
+                "This group-chat invite is already being reconciled."
+            );
+        }
+        if (groupChatInviteOperationsInFlight.size >= MAX_IN_FLIGHT_GROUP_CHAT_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending group-chat invites.");
+        }
+        groupChatInviteOperationsInFlight.add(operationKey);
+        try {
+            const pending = await pendingGroupChatInviteForRoom(binding, targetRoomId);
+            if (!pending) return { status: "none" };
+            if (pending.resolved) return { status: "resolved", result: pending.resolved };
+            let result: Exclude<MatrixReconcileGroupChatInviteResult, { status: "none"; }>;
+            try {
+                const rawResult = await callWorker<MatrixReconcileGroupChatInviteResult>({
+                    type: "reconcileGroupChatInvite",
+                    request: { roomId: pending.roomId, userId: pending.userId }
+                });
+                result = validateProtocolReconcileGroupChatInviteResult(
+                    rawResult,
+                    pending,
+                    serverNameFromMatrixIdentifier(binding.userId)
+                );
+            } catch (error) {
+                if (error instanceof Error && error.name !== "MATRIX_PROTOCOL_ERROR") throw error;
+                throw bridgeError(
+                    "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS",
+                    "Matrix returned an invalid invite reconciliation response; the durable receipt was retained."
+                );
+            }
+            if (result.status === "resolved") {
+                try {
+                    await persistResolvedGroupChatInvite(binding, pending, result.result);
+                } catch (error) {
+                    console.warn(`[MatrixBridge] Group-chat invite reconciliation resolved, but its receipt was not cached (${errorDTO(error).code}).`);
+                }
+            }
+            return result;
+        } finally {
+            groupChatInviteOperationsInFlight.delete(operationKey);
+        }
+    });
+}
+
+async function acknowledgeGroupChatInvite(
+    _: IpcMainInvokeEvent,
+    request: MatrixInviteUserToGroupChatRequest,
+    expectedUserId: string
+): Promise<void> {
+    await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const validatedRequest = validateInviteUserToGroupChatRequest(request, binding.userId);
+        const operationKey = groupChatInviteLatchKey(binding, validatedRequest.roomId);
+        if (groupChatInviteOperationsInFlight.has(operationKey)) {
+            throw bridgeError("MATRIX_GROUP_CHAT_INVITE_RECONCILE_IN_PROGRESS", "This group-chat invite is still being reconciled.");
+        }
+        if (groupChatInviteOperationsInFlight.size >= MAX_IN_FLIGHT_GROUP_CHAT_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending group-chat invites.");
+        }
+        groupChatInviteOperationsInFlight.add(operationKey);
+        try {
+            const pending = await pendingGroupChatInviteForRoom(binding, validatedRequest.roomId);
+            if (!pending) return;
+            if (pending.userId !== validatedRequest.userId) {
+                throw bridgeError("MATRIX_GROUP_CHAT_INVITE_STATE_MISMATCH", "A different invite is pending for this group chat.");
+            }
+            if (!pending.resolved) {
+                throw bridgeError(
+                    "MATRIX_GROUP_CHAT_INVITE_ACK_NOT_READY",
+                    "The group-chat invite is still unconfirmed; reconcile or explicitly override it first."
+                );
+            }
+            await clearPendingGroupChatInvite(binding, pending);
+        } finally {
+            groupChatInviteOperationsInFlight.delete(operationKey);
+        }
+    });
+}
+
+async function overrideGroupChatInviteAmbiguity(
+    _: IpcMainInvokeEvent,
+    request: MatrixInviteUserToGroupChatRequest,
+    expectedUserId: string
+): Promise<void> {
+    await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const validatedRequest = validateInviteUserToGroupChatRequest(request, binding.userId);
+        const operationKey = groupChatInviteLatchKey(binding, validatedRequest.roomId);
+        if (groupChatInviteOperationsInFlight.has(operationKey)) {
+            throw bridgeError("MATRIX_GROUP_CHAT_INVITE_RECONCILE_IN_PROGRESS", "This group-chat invite is still being reconciled.");
+        }
+        if (groupChatInviteOperationsInFlight.size >= MAX_IN_FLIGHT_GROUP_CHAT_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending group-chat invites.");
+        }
+        groupChatInviteOperationsInFlight.add(operationKey);
+        try {
+            const pending = await pendingGroupChatInviteForRoom(binding, validatedRequest.roomId);
+            if (!pending) return;
+            if (pending.userId !== validatedRequest.userId) {
+                throw bridgeError("MATRIX_GROUP_CHAT_INVITE_STATE_MISMATCH", "A different invite is pending for this group chat.");
+            }
+            if (pending.resolved) {
+                throw bridgeError(
+                    "MATRIX_GROUP_CHAT_INVITE_OVERRIDE_NOT_ALLOWED",
+                    "Matrix already confirmed this invite. Acknowledge the confirmed result instead."
+                );
+            }
+            const rawResult = await callWorker<MatrixReconcileGroupChatInviteResult>({
+                type: "reconcileGroupChatInvite",
+                request: validatedRequest
+            });
+            const reconciliation = validateProtocolReconcileGroupChatInviteResult(
+                rawResult,
+                pending,
+                serverNameFromMatrixIdentifier(binding.userId)
+            );
+            if (reconciliation.status === "resolved") {
+                try { await persistResolvedGroupChatInvite(binding, pending, reconciliation.result); } catch { }
+                throw bridgeError(
+                    "MATRIX_GROUP_CHAT_INVITE_OVERRIDE_NOT_ALLOWED",
+                    "Matrix now confirms this invite. Acknowledge the confirmed result instead."
+                );
+            }
+            // Explicit user confirmation only abandons the uncertainty receipt;
+            // it never sends or retries an invite by itself.
+            await clearPendingGroupChatInvite(binding, pending);
+        } finally {
+            groupChatInviteOperationsInFlight.delete(operationKey);
+        }
+    });
 }
 
 async function inviteUserToSpace(
@@ -6875,6 +7706,7 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
             break;
         case "joinRoom":
         case "acknowledgeGroupChatCreate":
+        case "reconcileGroupChatInvite":
         case "acceptInvite":
         case "rejectInvite":
         case "leaveRoom":
@@ -6897,9 +7729,24 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
             exactObjectKeys(
                 request.request,
                 "group-chat directory search",
-                ["query", "limit"],
+                ["query", "limit", "exact"],
                 ["query"]
             );
+            break;
+        case "searchGroupChatInviteCandidates":
+            exactObjectKeys(request, "secure view request", ["type", "request"]);
+            exactObjectKeys(
+                request.request,
+                "group-chat invite search",
+                ["roomId", "query", "limit", "exact"],
+                ["roomId", "query"]
+            );
+            break;
+        case "inviteUserToGroupChat":
+        case "acknowledgeGroupChatInvite":
+        case "overrideGroupChatInviteAmbiguity":
+            exactObjectKeys(request, "secure view request", ["type", "request"]);
+            exactObjectKeys(request.request, "group-chat invite request", ["roomId", "userId"]);
             break;
         case "createGroupChat":
             exactObjectKeys(request, "secure view request", ["type", "request"]);
@@ -7286,6 +8133,23 @@ async function handlePrivateRequest(
             createSpace(event, request.request, secureViewExpectedUserId(state)));
         case "searchGroupChatCandidates":
             return await searchGroupChatCandidates(event, request.request, secureViewExpectedUserId(state));
+        case "searchGroupChatInviteCandidates":
+            return await searchGroupChatInviteCandidates(event, request.request, secureViewExpectedUserId(state));
+        case "inviteUserToGroupChat": return await runPrivateRoomInviteMutation(event, state, () =>
+            inviteUserToGroupChat(event, request.request, secureViewExpectedUserId(state)));
+        case "reconcileGroupChatInvite": {
+            const result = await reconcileGroupChatInvite(
+                event,
+                request.roomId,
+                secureViewExpectedUserId(state)
+            );
+            if (result.status === "resolved") await bestEffortMutationRefresh(event, state);
+            return result;
+        }
+        case "acknowledgeGroupChatInvite":
+            return await acknowledgeGroupChatInvite(event, request.request, secureViewExpectedUserId(state));
+        case "overrideGroupChatInviteAmbiguity":
+            return await overrideGroupChatInviteAmbiguity(event, request.request, secureViewExpectedUserId(state));
         case "createGroupChat": return await runPrivateCreateMutation(event, state, () =>
             createGroupChat(event, request.request, secureViewExpectedUserId(state)));
         case "reconcileGroupChatCreate": {
@@ -7707,6 +8571,7 @@ export async function secureViewDispose(event: IpcMainInvokeEvent): Promise<void
 export {
     acceptInvite,
     acknowledgeGroupChatCreate,
+    acknowledgeGroupChatInvite,
     cancelPending,
     configureSpaceAccess,
     createGroupChat,
@@ -7718,6 +8583,7 @@ export {
     getSpaceAccess,
     getSpaceAccessRequests,
     getStatus,
+    inviteUserToGroupChat,
     inviteUserToSpace,
     joinRoom,
     joinRoomAddress,
@@ -7727,12 +8593,14 @@ export {
     logout,
     messageContext,
     openDirectMessage,
+    overrideGroupChatInviteAmbiguity,
     paginate,
     publicRooms,
     react,
     read,
     reauthenticate,
     reconcileGroupChatCreate,
+    reconcileGroupChatInvite,
     reconcileSpaceChildCreate,
     redact,
     register,
@@ -7741,6 +8609,7 @@ export {
     requestSpaceAccess,
     resolveSpaceAccessRequest,
     searchGroupChatCandidates,
+    searchGroupChatInviteCandidates,
     searchMessages,
     searchSpaceInviteCandidates,
     sendAttachment,

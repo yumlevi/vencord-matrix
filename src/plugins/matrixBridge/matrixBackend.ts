@@ -54,10 +54,15 @@ import type {
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateDTO,
+    MatrixGroupChatCandidateMembership,
     MatrixGroupChatCandidateSearchRequest,
     MatrixGroupChatCandidateSearchResult,
     MatrixGroupChatInvitationDTO,
+    MatrixGroupChatInviteCandidateSearchRequest,
+    MatrixGroupChatInviteCandidateSearchResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToGroupChatRequest,
+    MatrixInviteUserToGroupChatResult,
     MatrixInviteUserToSpaceRequest,
     MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
@@ -77,6 +82,7 @@ import type {
     MatrixReactionDTO,
     MatrixReauthenticationRequest,
     MatrixReconcileGroupChatCreateResult,
+    MatrixReconcileGroupChatInviteResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRequestSpaceAccessResult,
     MatrixResolveSpaceAccessRequest,
@@ -104,6 +110,7 @@ import type {
 } from "./types";
 import type {
     MatrixCredentialUpdate,
+    MatrixJoinedRoomIdsResult,
     MatrixSessionCredentials,
     MatrixStoredAccount,
     MatrixWorkerCommand,
@@ -124,11 +131,16 @@ const SPACE_INVITE_MEMBERSHIP_CONCURRENCY = 6;
 const DEFAULT_GROUP_CHAT_DIRECTORY_LIMIT = 25;
 const MAX_GROUP_CHAT_DIRECTORY_LIMIT = 100;
 const MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH = 256;
-const MIN_GROUP_CHAT_INVITEES = 2;
+const MIN_GROUP_CHAT_INVITEES = 0;
 const MAX_GROUP_CHAT_INVITEES = 9;
+const MAX_GROUP_CHAT_PARTICIPANTS = 10;
 const GROUP_CHAT_INVITE_CONCURRENCY = 3;
 const GROUP_CHAT_DIRECTORY_CANDIDATE_TTL_MS = 5 * 60_000;
 const MAX_GROUP_CHAT_DIRECTORY_CANDIDATES = 1_000;
+const GROUP_CHAT_EXACT_LOOKUP_WINDOW_MS = 60_000;
+const MAX_GROUP_CHAT_EXACT_LOOKUPS_PER_WINDOW = 10;
+const MAX_GROUP_CHAT_MEMBERSHIP_EVENTS = 1_000;
+const BARE_MATRIX_LOCALPART_PATTERN = /^[a-z0-9._=\-/+]{1,255}$/u;
 const SUGGESTED_SPACE_CHANNEL_HIERARCHY_LIMIT = 100;
 const MAX_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
 const MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS = 16;
@@ -309,6 +321,7 @@ const historyCursors = new Map<string, HistoryCursorState>();
 const searchCursors = new Map<string, SearchCursorState>();
 const searchEventCache = new Map<string, CachedSearchEvent>();
 const groupChatDirectoryCandidates = new Map<string, number>();
+const groupChatExactLookupTimestamps: number[] = [];
 const reactionMapCache = new WeakMap<Room, Map<string, MatrixReactionDTO[]>>();
 const isolatedDecryptionEvents = new WeakSet<MatrixEvent>();
 const activeMediaReadControllers = new Set<AbortController>();
@@ -2380,7 +2393,10 @@ function normalizeRoom(
     };
 
     if (roomType) result.roomType = roomType;
-    if (groupChat) result.groupChat = true;
+    if (groupChat) {
+        result.groupChat = true;
+        if (membership === "join") result.invitePermission = spaceInvitePermission(room);
+    }
     const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
     const creatorId = createEvent && !Array.isArray(createEvent) ? optionalUserId(createEvent.getSender()) : undefined;
     if (creatorId) result.creatorId = creatorId;
@@ -2742,6 +2758,7 @@ async function disposeClient(clearStores: boolean): Promise<void> {
     searchCursors.clear();
     searchEventCache.clear();
     groupChatDirectoryCandidates.clear();
+    groupChatExactLookupTimestamps.length = 0;
     const client = matrixClient;
     const store = matrixStore;
     const prefix = cryptoDatabasePrefix;
@@ -3859,6 +3876,10 @@ async function addDirectRoom(userIdValue: unknown, roomIdValue: unknown): Promis
 }
 
 async function exactOwnJoinedRoom(roomId: string): Promise<boolean> {
+    return (await exactJoinedRoomIds()).roomIds.includes(roomId);
+}
+
+async function exactJoinedRoomIds(): Promise<MatrixJoinedRoomIdsResult> {
     const response: unknown = await matrixClient!.getJoinedRooms();
     if (!response || typeof response !== "object" || Array.isArray(response)) {
         fail("MATRIX_JOINED_ROOMS_INVALID", "Matrix returned an invalid joined-room response.");
@@ -3867,12 +3888,18 @@ async function exactOwnJoinedRoom(roomId: string): Promise<boolean> {
     if (!Array.isArray(joinedRooms) || joinedRooms.length > 100_000) {
         fail("MATRIX_JOINED_ROOMS_INVALID", "Matrix returned an invalid joined-room response.");
     }
-    let found = false;
+    const roomIds: string[] = [];
+    const unique = new Set<string>();
     for (const joinedRoomId of joinedRooms) {
         const validated = validateRoomId(joinedRoomId);
-        if (validated === roomId) found = true;
+        if (unique.has(validated)) {
+            fail("MATRIX_JOINED_ROOMS_INVALID", "Matrix returned duplicate joined-room state.");
+        }
+        unique.add(validated);
+        roomIds.push(validated);
     }
-    return found;
+    roomIds.sort();
+    return { roomIds };
 }
 
 async function acceptInvite(
@@ -4665,7 +4692,7 @@ function validateGroupChatCandidateSearchRequest(value: unknown): Required<Matri
         fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search is invalid.");
     }
     const input = value as Partial<MatrixGroupChatCandidateSearchRequest>;
-    if (!Object.keys(input).every(key => key === "query" || key === "limit")) {
+    if (!Object.keys(input).every(key => key === "query" || key === "limit" || key === "exact")) {
         fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search contains unsupported fields.");
     }
     const query = validateString(
@@ -4681,7 +4708,40 @@ function validateGroupChatCandidateSearchRequest(value: unknown): Required<Matri
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_GROUP_CHAT_DIRECTORY_LIMIT) {
         fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search limit is invalid.");
     }
-    return { query, limit };
+    if (input.exact != null && typeof input.exact !== "boolean") {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat exact lookup option is invalid.");
+    }
+    if (input.exact === true && !query) {
+        fail("MATRIX_GROUP_CHAT_EXACT_LOOKUP_INVALID", "Enter an exact local Matrix ID or username.");
+    }
+    return { query, limit, exact: input.exact === true };
+}
+
+function validateGroupChatInviteCandidateSearchRequest(
+    value: unknown
+): Required<MatrixGroupChatInviteCandidateSearchRequest> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite search is invalid.");
+    }
+    const input = value as Partial<MatrixGroupChatInviteCandidateSearchRequest>;
+    if (!Object.keys(input).every(key => key === "roomId" || key === "query" || key === "limit" || key === "exact")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite search contains unsupported fields.");
+    }
+    return {
+        roomId: validateRoomId(input.roomId),
+        ...validateGroupChatCandidateSearchRequest({ query: input.query, limit: input.limit, exact: input.exact })
+    };
+}
+
+function validateInviteUserToGroupChatRequest(value: unknown): MatrixInviteUserToGroupChatRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite is invalid.");
+    }
+    const input = value as Partial<MatrixInviteUserToGroupChatRequest>;
+    if (Object.keys(input).length !== 2 || !Object.hasOwn(input, "roomId") || !Object.hasOwn(input, "userId")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat invite contains invalid fields.");
+    }
+    return { roomId: validateRoomId(input.roomId), userId: requireLocalServerUserId(input.userId) };
 }
 
 function validateInviteUserToSpaceRequest(value: unknown): MatrixInviteUserToSpaceRequest {
@@ -4736,7 +4796,7 @@ function validateCreateGroupChatRequest(value: unknown): MatrixCreateGroupChatRe
         || input.userIds.length > MAX_GROUP_CHAT_INVITEES) {
         fail(
             "MATRIX_INVALID_ARGUMENT",
-            `A Matrix group chat requires ${MIN_GROUP_CHAT_INVITEES} to ${MAX_GROUP_CHAT_INVITEES} other users.`
+            `A Matrix group chat allows up to ${MAX_GROUP_CHAT_INVITEES} other users.`
         );
     }
     const userIds = input.userIds.map(requireLocalServerUserId);
@@ -4898,14 +4958,73 @@ async function searchSpaceInviteCandidates(
     };
 }
 
-async function searchGroupChatCandidates(
-    command: Extract<MatrixWorkerCommand, { type: "searchGroupChatCandidates"; }>
+function exactLocalProfileUserId(query: string): string {
+    let userId: string | undefined;
+    if (query.startsWith("@")) {
+        const separator = query.indexOf(":", 1);
+        const localpart = separator > 1 ? query.slice(1, separator) : "";
+        const serverName = separator > 1 ? query.slice(separator + 1) : "";
+        if (BARE_MATRIX_LOCALPART_PATTERN.test(localpart)
+            && serverName === activeServerName()
+            && new TextEncoder().encode(query).byteLength <= 255) {
+            userId = localServerUserId(query);
+            if (userId !== query) userId = undefined;
+        }
+    } else if (BARE_MATRIX_LOCALPART_PATTERN.test(query)) {
+        const candidate = `@${query}:${activeServerName()}`;
+        if (new TextEncoder().encode(candidate).byteLength <= 255) userId = localServerUserId(candidate);
+    }
+    if (!userId || new TextEncoder().encode(userId).byteLength > 255) {
+        fail(
+            "MATRIX_GROUP_CHAT_EXACT_LOOKUP_INVALID",
+            "Enter an exact local Matrix ID or a lowercase local username."
+        );
+    }
+    return userId;
+}
+
+function consumeGroupChatExactLookup(): void {
+    const cutoff = Date.now() - GROUP_CHAT_EXACT_LOOKUP_WINDOW_MS;
+    while (groupChatExactLookupTimestamps[0] != null && groupChatExactLookupTimestamps[0] <= cutoff) {
+        groupChatExactLookupTimestamps.shift();
+    }
+    if (groupChatExactLookupTimestamps.length >= MAX_GROUP_CHAT_EXACT_LOOKUPS_PER_WINDOW) {
+        fail(
+            "MATRIX_GROUP_CHAT_EXACT_LOOKUP_RATE_LIMITED",
+            "Too many exact Matrix account lookups were requested. Wait before trying again."
+        );
+    }
+    groupChatExactLookupTimestamps.push(Date.now());
+}
+
+function groupChatDirectoryCandidate(
+    userId: string,
+    displayNameValue: unknown,
+    avatarValue: unknown
+): MatrixGroupChatCandidateDTO {
+    const candidate: MatrixGroupChatCandidateDTO = { userId };
+    const displayName = publicRoomText(displayNameValue, 256)
+        ?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+        .trim();
+    const avatarUrl = mediaUrl(avatarValue, 96, 96);
+    if (displayName) candidate.displayName = displayName;
+    if (avatarUrl) candidate.avatarUrl = avatarUrl;
+    return candidate;
+}
+
+async function groupChatCandidateSearch(
+    request: Required<MatrixGroupChatCandidateSearchRequest>
 ): Promise<MatrixGroupChatCandidateSearchResult> {
     if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
-    const request = validateGroupChatCandidateSearchRequest(command.request);
-    let directory: Awaited<ReturnType<MatrixClient["searchUserDirectory"]>>;
+    // Validate explicit lookup scope before any homeserver request. A remote or
+    // malformed MXID must never reach even the standard directory endpoint.
+    const exactUserId = request.exact ? exactLocalProfileUserId(request.query) : undefined;
+    let directory: Awaited<ReturnType<MatrixClient["searchUserDirectory"]>> | undefined;
     try {
-        directory = await matrixClient.searchUserDirectory({ term: request.query, limit: request.limit });
+        directory = await matrixClient.searchUserDirectory({
+            term: exactUserId ?? request.query,
+            limit: request.limit
+        });
     } catch (error) {
         if (request.query === "" && emptyUserDirectoryQueryUnsupported(error)) {
             return {
@@ -4915,42 +5034,281 @@ async function searchGroupChatCandidates(
                 limited: false,
                 directoryLimited: false,
                 complete: false,
-                queryRequired: true
+                queryRequired: true,
+                exactLookup: "not_requested"
             };
         }
-        throw error;
+        if (!request.exact) throw error;
     }
-    if (!directory || typeof directory !== "object" || !Array.isArray(directory.results)
-        || typeof directory.limited !== "boolean") {
+    if (directory && (typeof directory !== "object" || !Array.isArray(directory.results)
+        || typeof directory.limited !== "boolean")) {
         fail("MATRIX_USER_DIRECTORY_INVALID", "Matrix returned an invalid user-directory response.");
     }
 
-    const locallyLimited = directory.results.length > request.limit;
+    const directoryResults = directory?.results ?? [];
+    const directoryLimited = directory?.limited ?? false;
+    const locallyLimited = directoryResults.length > request.limit;
     const unique = new Set<string>();
     const candidates: MatrixGroupChatCandidateDTO[] = [];
-    for (const raw of directory.results.slice(0, request.limit)) {
+    for (const raw of directoryResults.slice(0, request.limit)) {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
         const userId = localServerUserId(raw.user_id);
         if (!userId || userId === activeCredentials.userId || unique.has(userId)) continue;
         unique.add(userId);
-        const candidate: MatrixGroupChatCandidateDTO = { userId };
-        const displayName = publicRoomText(raw.display_name, 256)
-            ?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
-            .trim();
-        const avatarUrl = mediaUrl(raw.avatar_url, 96, 96);
-        if (displayName) candidate.displayName = displayName;
-        if (avatarUrl) candidate.avatarUrl = avatarUrl;
-        candidates.push(candidate);
+        candidates.push(groupChatDirectoryCandidate(userId, raw.display_name, raw.avatar_url));
         rememberGroupChatDirectoryCandidate(userId);
+    }
+
+    let exactLookup: MatrixGroupChatCandidateSearchResult["exactLookup"] = "not_requested";
+    if (exactUserId) {
+        const existing = candidates.find(candidate => candidate.userId === exactUserId);
+        if (exactUserId === activeCredentials.userId) {
+            exactLookup = "not_found_or_unavailable";
+        } else if (existing) {
+            exactLookup = "resolved";
+        } else {
+            consumeGroupChatExactLookup();
+            try {
+                const profile = await matrixClient.getProfileInfo(exactUserId);
+                if (!profile || typeof profile !== "object" || Array.isArray(profile)) throw new Error("invalid profile");
+                candidates.unshift(groupChatDirectoryCandidate(exactUserId, profile.displayname, profile.avatar_url));
+                rememberGroupChatDirectoryCandidate(exactUserId);
+                exactLookup = "resolved";
+            } catch {
+                // Deliberately collapse missing, private, malformed, and
+                // unavailable profile responses into one non-oracular result.
+                exactLookup = "not_found_or_unavailable";
+            }
+        }
     }
     return {
         query: request.query,
-        scope: "homeserver_user_directory",
-        candidates,
-        limited: directory.limited || locallyLimited,
-        directoryLimited: directory.limited,
+        scope: request.exact
+            ? "homeserver_user_directory_plus_exact_local_profile"
+            : "homeserver_user_directory",
+        candidates: candidates.slice(0, request.limit),
+        limited: directoryLimited || locallyLimited || candidates.length > request.limit,
+        directoryLimited,
         complete: false,
-        queryRequired: false
+        queryRequired: false,
+        exactLookup
+    };
+}
+
+async function searchGroupChatCandidates(
+    command: Extract<MatrixWorkerCommand, { type: "searchGroupChatCandidates"; }>
+): Promise<MatrixGroupChatCandidateSearchResult> {
+    return await groupChatCandidateSearch(validateGroupChatCandidateSearchRequest(command.request));
+}
+
+function requireGroupChatInvitePermission(room: Room): void {
+    const permission = spaceInvitePermission(room);
+    if (permissionIsUnverifiable(permission)) {
+        fail(
+            "MATRIX_GROUP_CHAT_INVITE_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify this group chat's invite power levels."
+        );
+    }
+    if (!permission.allowed) {
+        fail("MATRIX_GROUP_CHAT_INVITE_FORBIDDEN", "You do not have permission to invite people to this group chat.");
+    }
+}
+
+function rawGroupChatPowerLevelPermission(
+    powerLevels: RawGroupChatStateEvent | undefined,
+    creatorId: string,
+    roomVersion: string
+): MatrixPowerLevelPermissionDTO {
+    if (!activeCredentials) {
+        return { current: "unverifiable", required: "unverifiable", allowed: false };
+    }
+    const content = powerLevels?.content ?? {};
+    const current = powerLevels
+        ? isHydraRoomVersion(roomVersion) && activeCredentials.userId === creatorId
+            ? { valid: true, value: Infinity }
+            : userPowerLevel(content, activeCredentials.userId, roomVersion)
+        : isHydraRoomVersion(roomVersion)
+            ? { valid: true, value: activeCredentials.userId === creatorId ? Infinity : 0 }
+            : { valid: true, value: activeCredentials.userId === creatorId ? 100 : 0 };
+    return powerLevelPermissionDTO(
+        current,
+        defaultedMatrixPowerLevel(content, "invite", 0, roomVersion)
+    );
+}
+
+async function exactGroupChatInvitePermission(room: Room): Promise<MatrixPowerLevelPermissionDTO> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const localIdentity = groupChatRoomIdentity(room);
+    let state: unknown;
+    try { state = await matrixClient.roomState(room.roomId); } catch {
+        fail(
+            "MATRIX_GROUP_CHAT_PRIVACY_UNVERIFIABLE",
+            "Matrix could not verify the current private encrypted-room state before inviting."
+        );
+    }
+    if (!localIdentity || !Array.isArray(state) || state.length > 10_000) {
+        fail(
+            "MATRIX_GROUP_CHAT_PRIVACY_UNVERIFIABLE",
+            "Matrix returned an invalid current group-chat state snapshot."
+        );
+    }
+    const create = rawGroupChatStateEvent(state, EventType.RoomCreate, "");
+    const marker = rawGroupChatStateEvent(state, GROUP_CHAT_CREATION_EVENT_TYPE, "");
+    const encryption = rawGroupChatStateEvent(state, EventType.RoomEncryption, "");
+    const joinRules = rawGroupChatStateEvent(state, EventType.RoomJoinRules, "");
+    const history = rawGroupChatStateEvent(state, EventType.RoomHistoryVisibility, "");
+    const guest = rawGroupChatStateEvent(state, EventType.RoomGuestAccess, "");
+    const ownMembership = rawGroupChatStateEvent(state, EventType.RoomMember, activeCredentials.userId);
+    const powerLevelEvents = state.filter(value => value && typeof value === "object" && !Array.isArray(value)
+        && (value as Record<string, unknown>).type === EventType.RoomPowerLevels
+        && (value as Record<string, unknown>).state_key === "");
+    const hasCreateMarker = create != null && Object.hasOwn(create.content, GROUP_CHAT_CREATION_CONTENT_KEY);
+    const exactCreationMarker = hasCreateMarker
+        ? validGroupChatCreationMarker(create.content[GROUP_CHAT_CREATION_CONTENT_KEY])
+        : validGroupChatCreationMarker(marker?.content.marker);
+    if (!create || create.sender !== localIdentity.creatorId
+        || !exactGroupChatCreationContent(create.content, localIdentity.roomVersion)
+        || exactCreationMarker !== localIdentity.creationMarker
+        || marker?.sender !== create.sender || marker.content.marker !== localIdentity.creationMarker
+        || encryption?.content.algorithm !== "m.megolm.v1.aes-sha2"
+        || joinRules?.content.join_rule !== JoinRule.Invite
+        || history?.content.history_visibility !== HistoryVisibility.Joined
+        || guest?.content.guest_access !== GuestAccess.Forbidden
+        || ownMembership?.content.membership !== "join"
+        || powerLevelEvents.length > 1) {
+        fail(
+            "MATRIX_GROUP_CHAT_PRIVACY_UNVERIFIABLE",
+            "The current Matrix room state no longer matches this private encrypted group chat."
+        );
+    }
+    const powerLevels = powerLevelEvents.length === 1
+        ? rawGroupChatStateEvent(state, EventType.RoomPowerLevels, "")
+        : undefined;
+    if (powerLevelEvents.length === 1 && !powerLevels) {
+        fail(
+            "MATRIX_GROUP_CHAT_INVITE_PERMISSION_UNVERIFIABLE",
+            "Matrix returned invalid current group-chat power levels."
+        );
+    }
+    return rawGroupChatPowerLevelPermission(
+        powerLevels,
+        localIdentity.creatorId,
+        localIdentity.roomVersion
+    );
+}
+
+async function searchGroupChatInviteCandidates(
+    command: Extract<MatrixWorkerCommand, { type: "searchGroupChatInviteCandidates"; }>
+): Promise<MatrixGroupChatInviteCandidateSearchResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateGroupChatInviteCandidateSearchRequest(command.request);
+    // Post-create exact lookup has the same existence-oracle boundary as the
+    // create modal: reject remote/noncanonical input before /members or any
+    // other homeserver request, even though native performs the same check.
+    if (request.exact) exactLocalProfileUserId(request.query);
+    const room = joinedInvitableGroupChat(request.roomId);
+    requireGroupChatInvitePermission(room);
+    const membership = await exactGroupChatMembershipSnapshot(room);
+    const directory = await groupChatCandidateSearch(request);
+    return {
+        ...directory,
+        roomId: room.roomId,
+        candidates: directory.candidates.map(candidate => ({
+            ...candidate,
+            membership: membership.memberships.get(candidate.userId) ?? "none"
+        })),
+        participantCount: membership.participantCount,
+        maxParticipants: MAX_GROUP_CHAT_PARTICIPANTS,
+        full: membership.participantCount >= MAX_GROUP_CHAT_PARTICIPANTS
+    };
+}
+
+async function inviteUserToGroupChat(
+    command: Extract<MatrixWorkerCommand, { type: "inviteUserToGroupChat"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixInviteUserToGroupChatResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateInviteUserToGroupChatRequest(command.request);
+    if (request.userId === activeCredentials.userId) {
+        fail("MATRIX_GROUP_CHAT_INVITE_SELF", "You cannot invite your own Matrix account.");
+    }
+    requireCurrentGroupChatDirectoryCandidates([request.userId]);
+    const room = identifiedGroupChat(request.roomId);
+    const snapshot = await exactGroupChatMembershipSnapshot(room);
+    const before = snapshot.memberships.get(request.userId) ?? "none";
+    if (before === "invite" || before === "join") {
+        return { ...request, delivery: "existing", observedMembership: before, changed: false };
+    }
+    if (before === "ban") {
+        fail("MATRIX_GROUP_CHAT_INVITE_BANNED", "That Matrix user is banned from this group chat.");
+    }
+    if (snapshot.participantCount >= MAX_GROUP_CHAT_PARTICIPANTS) {
+        fail("MATRIX_GROUP_CHAT_FULL", "This group chat already has the maximum of 10 joined or invited participants.");
+    }
+    const permission = await exactGroupChatInvitePermission(room);
+    if (permissionIsUnverifiable(permission)) {
+        fail(
+            "MATRIX_GROUP_CHAT_INVITE_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify the current group-chat invite power levels."
+        );
+    }
+    if (!permission.allowed) {
+        fail("MATRIX_GROUP_CHAT_INVITE_FORBIDDEN", "You do not have permission to invite people to this group chat.");
+    }
+
+    try {
+        mutationDispatched();
+        await matrixClient.invite(room.roomId, request.userId);
+    } catch (error) {
+        let actual: ExactSpaceInviteMembership | undefined;
+        try { actual = await exactSpaceInviteMembership(room.roomId, request.userId); } catch { }
+        if (actual === "invite" || actual === "join") {
+            try { emitRoom(room); } catch { }
+            return { ...request, delivery: "accepted", observedMembership: actual, changed: true };
+        }
+        if (isDefinitiveMatrixMutationRejection(error)) {
+            fail(
+                "MATRIX_GROUP_CHAT_INVITE_REJECTED",
+                "The Matrix homeserver rejected the group-chat invite. No new invite was sent."
+            );
+        }
+        fail(
+            "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS",
+            "Matrix could not confirm the group-chat invite. Reconcile it before any retry."
+        );
+    }
+
+    let observedMembership: MatrixInviteUserToGroupChatResult["observedMembership"];
+    try {
+        const actual = await exactSpaceInviteMembership(room.roomId, request.userId);
+        if (actual === "invite" || actual === "join") observedMembership = actual;
+    } catch { }
+    try { emitRoom(room); } catch { }
+    return {
+        ...request,
+        delivery: "accepted",
+        ...(observedMembership ? { observedMembership } : {}),
+        changed: true
+    };
+}
+
+async function reconcileGroupChatInvite(
+    command: Extract<MatrixWorkerCommand, { type: "reconcileGroupChatInvite"; }>
+): Promise<MatrixReconcileGroupChatInviteResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateInviteUserToGroupChatRequest(command.request);
+    if (request.userId === activeCredentials.userId) {
+        fail("MATRIX_GROUP_CHAT_INVITE_SELF", "You cannot reconcile an invite for your own Matrix account.");
+    }
+    // Reconciliation is read-only truth recovery for a native-attested durable
+    // receipt. It deliberately does not require the room to remain joined or
+    // locally cached: either condition could otherwise trap the receipt.
+    let membership: ExactSpaceInviteMembership | undefined;
+    try { membership = await exactSpaceInviteMembership(request.roomId, request.userId); } catch { }
+    if (membership !== "invite" && membership !== "join") return { status: "pending", ...request };
+    return {
+        status: "resolved",
+        result: { ...request, delivery: "accepted", observedMembership: membership, changed: true }
     };
 }
 
@@ -5466,7 +5824,7 @@ function groupChatRoomIdentity(room: Room): GroupChatRoomContract | undefined {
     return { creatorId, creationMarker, roomVersion };
 }
 
-function groupChatRoomContract(room: Room): GroupChatRoomContract | undefined {
+function groupChatPrivacyContract(room: Room): GroupChatRoomContract | undefined {
     const identity = groupChatRoomIdentity(room);
     if (!identity) return undefined;
     const encryption = matrixRoomStateContent(room, EventType.RoomEncryption);
@@ -5477,9 +5835,79 @@ function groupChatRoomContract(room: Room): GroupChatRoomContract | undefined {
         || joinRules?.join_rule !== JoinRule.Invite
         || history?.history_visibility !== HistoryVisibility.Joined
         || guest?.guest_access !== GuestAccess.Forbidden
-        || groupChatStateMarker(room, identity.creatorId) !== identity.creationMarker
-        || !exactGroupChatPowerLevels(room, identity.creatorId, identity.roomVersion)) return undefined;
+        || groupChatStateMarker(room, identity.creatorId) !== identity.creationMarker) return undefined;
     return identity;
+}
+
+function groupChatRoomContract(room: Room): GroupChatRoomContract | undefined {
+    const privacy = groupChatPrivacyContract(room);
+    return privacy && exactGroupChatPowerLevels(room, privacy.creatorId, privacy.roomVersion)
+        ? privacy
+        : undefined;
+}
+
+function identifiedGroupChat(roomId: string): Room {
+    if (!activeCredentials) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const room = getRoom(roomId);
+    if (!groupChatRoomIdentity(room)) {
+        fail("MATRIX_GROUP_CHAT_REQUIRED", "The selected Matrix room is not a bridge-created group chat.");
+    }
+    return room;
+}
+
+function joinedInvitableGroupChat(roomId: string): Room {
+    const room = identifiedGroupChat(roomId);
+    if (room.getMyMembership() !== "join") {
+        fail("MATRIX_GROUP_CHAT_NOT_JOINED", "Join the Matrix group chat before inviting people.");
+    }
+    if (!groupChatPrivacyContract(room)) {
+        fail(
+            "MATRIX_GROUP_CHAT_PRIVACY_UNVERIFIABLE",
+            "Matrix could not verify this group chat's private encrypted-room contract."
+        );
+    }
+    return room;
+}
+
+interface GroupChatMembershipSnapshot {
+    memberships: Map<string, MatrixGroupChatCandidateMembership>;
+    participantCount: number;
+}
+
+async function exactGroupChatMembershipSnapshot(room: Room): Promise<GroupChatMembershipSnapshot> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const response = await matrixClient.members(room.roomId, undefined, "leave");
+    const { chunk } = (response as unknown as { chunk?: unknown; });
+    if (!Array.isArray(chunk) || chunk.length > MAX_GROUP_CHAT_MEMBERSHIP_EVENTS) {
+        fail("MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID", "Matrix returned an invalid group-chat membership snapshot.");
+    }
+    const memberships = new Map<string, MatrixGroupChatCandidateMembership>();
+    for (const value of chunk) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            fail("MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID", "Matrix returned an invalid group-chat membership snapshot.");
+        }
+        const event = value as Record<string, unknown>;
+        if (event.type !== EventType.RoomMember || typeof event.state_key !== "string"
+            || !event.content || typeof event.content !== "object" || Array.isArray(event.content)) {
+            fail("MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID", "Matrix returned an invalid group-chat membership snapshot.");
+        }
+        const userId = requireLocalServerUserId(event.state_key);
+        const { membership } = (event.content as Record<string, unknown>);
+        if (membership !== "leave" && membership !== "knock" && membership !== "invite"
+            && membership !== "join" && membership !== "ban") {
+            fail("MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID", "Matrix returned an invalid group-chat membership snapshot.");
+        }
+        if (memberships.has(userId)) {
+            fail("MATRIX_GROUP_CHAT_MEMBERSHIP_INVALID", "Matrix returned duplicate group-chat membership state.");
+        }
+        memberships.set(userId, membership);
+    }
+    if (memberships.get(activeCredentials.userId) !== "join") {
+        fail("MATRIX_GROUP_CHAT_NOT_JOINED", "The active Matrix account is not joined to this group chat.");
+    }
+    const participantCount = [...memberships.values()]
+        .filter(membership => membership === "join" || membership === "invite").length;
+    return { memberships, participantCount };
 }
 
 function attestedGroupChatRoom(room: Room, creationMarker: string): boolean {
@@ -8068,6 +8496,7 @@ async function handleCommand(
         case "suspend": await suspend(); return undefined;
         case "logout": await logout(); return undefined;
         case "snapshot": return snapshot();
+        case "joinedRoomIds": return await exactJoinedRoomIds();
         case "publicRooms": return await publicRooms(command);
         case "joinRoom": return await joinRoom(command, mutationDispatched);
         case "joinRoomAddress": return await joinRoomAddress(command, mutationDispatched);
@@ -8083,6 +8512,9 @@ async function handleCommand(
         case "searchSpaceInviteCandidates": return await searchSpaceInviteCandidates(command);
         case "inviteUserToSpace": return await inviteUserToSpace(command, mutationDispatched);
         case "searchGroupChatCandidates": return await searchGroupChatCandidates(command);
+        case "searchGroupChatInviteCandidates": return await searchGroupChatInviteCandidates(command);
+        case "inviteUserToGroupChat": return await inviteUserToGroupChat(command, mutationDispatched);
+        case "reconcileGroupChatInvite": return await reconcileGroupChatInvite(command);
         case "createGroupChat": return await createGroupChat(command, mutationDispatched);
         case "reconcileGroupChatCreate": return await reconcileGroupChatCreate(command);
         case "createSpaceChild": return await createSpaceChild(command, mutationDispatched);
@@ -8199,7 +8631,7 @@ function lifecycleCommand(command: MatrixWorkerCommand): boolean {
 
 function mutationSignalCommand(command: MatrixWorkerCommand): boolean {
     return command.type === "createSpace" || command.type === "createSpaceChild" || command.type === "createGroupChat"
-        || command.type === "inviteUserToSpace" || command.type === "acceptInvite"
+        || command.type === "inviteUserToSpace" || command.type === "inviteUserToGroupChat" || command.type === "acceptInvite"
         || command.type === "rejectInvite" || command.type === "joinSuggestedSpaceChannels"
         || command.type === "joinRoom" || command.type === "joinRoomAddress";
 }
@@ -8209,10 +8641,13 @@ function concurrentLane(command: MatrixWorkerCommand): BoundedLane | undefined {
         case "downloadMedia": return mediaLane;
         case "publicRooms":
         case "snapshot":
+        case "joinedRoomIds":
         case "messageContext":
         case "searchMessages":
         case "searchSpaceInviteCandidates":
         case "searchGroupChatCandidates":
+        case "searchGroupChatInviteCandidates":
+        case "reconcileGroupChatInvite":
         case "urlPreview": return metadataLane;
         default: return undefined;
     }

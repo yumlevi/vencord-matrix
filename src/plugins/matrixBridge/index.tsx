@@ -48,6 +48,7 @@ import {
     getMatrixAccessRequestContext,
     getMatrixCategoryCreateContext,
     getMatrixGroupChatCreateContext,
+    getMatrixGroupInviteContext,
     getMatrixGroupLeaveContext,
     getMatrixInviteContext,
     getMatrixSendSessionToken,
@@ -75,6 +76,7 @@ import {
     suspendBridge,
 } from "./bridge";
 import { openMatrixGroupChatCreate } from "./groupCreate";
+import { openMatrixGroupInvite } from "./groupInvite";
 import { openMatrixInvitePeople } from "./invite";
 import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
@@ -581,9 +583,35 @@ function renderMatrixGroupChatHeaderButton() {
     return <MatrixGroupChatHeaderButton />;
 }
 
+function MatrixGroupInviteToolbarButton({ channelId }: { channelId: string; }) {
+    const [, setRevision] = React.useState(0);
+    React.useEffect(() => subscribeMatrixSpaceProjection(() => setRevision(value => value + 1)), []);
+    const context = getMatrixGroupInviteContext(channelId);
+    if (!context) return null;
+    const tooltip = context.full
+        ? "Add People - group is full; open to check invite status"
+        : context.canInvite ? "Add People" : matrixPermissionMenuLabel("Add People", context.permission);
+    return (
+        <Tooltip text={tooltip}>
+            {tooltipProps => (
+                <button
+                    {...tooltipProps}
+                    type="button"
+                    className="vc-matrix-search-button"
+                    aria-label={tooltip}
+                    onClick={() => openMatrixGroupInvite(channelId, context)}
+                >
+                    <GroupAddIcon />
+                </button>
+            )}
+        </Tooltip>
+    );
+}
+
 function renderMatrixToolbar(channel: any) {
     const guildId = typeof channel.guild_id === "string" ? channel.guild_id : undefined;
     return [
+        <MatrixGroupInviteToolbarButton key="matrix-add-people" channelId={channel.id} />,
         channel.type !== ChannelType.DM && (
             <Tooltip key="matrix-members" text="Show Member List">
                 {tooltipProps => (
@@ -657,8 +685,9 @@ function confirmLeaveMatrixGroup(channelId: string, label: string, isCreator: bo
             onConfirm={() => void leaveMatrixGroup(channelId)}
         >
             {isCreator
-                ? "You created this group. Leaving removes the only invite and admin authority. You cannot be invited back unless you first transferred that authority in another Matrix client. Treat this as irreversible."
-                : "This removes the group chat from this account. You may need another invitation to return."}
+                ? "You created this group. Leaving removes the only invite and admin authority. You cannot be invited back unless you first transferred that authority in another Matrix client. Treat this as irreversible. "
+                : "This removes the group chat from this account. You may need another invitation to return. "}
+            Leaving does not cancel an Add People invitation that may already have landed or been declined. Any unfinished local Add People warning or recovery receipt for this group will be discarded.
         </ConfirmModal>
     ));
 }
@@ -703,13 +732,11 @@ function removeMatrixMenuItemsWhere(
         }
         let nested = child.props.children;
         if (typeof nested === "function") {
-            if (typeof child.props.id === "string" && child.props.id.includes("invite-to-server")) {
-                const renderChildren = nested;
-                child.props.children = (...args: any[]) => {
-                    const rendered = renderChildren(...args);
-                    return filterMatrixMenuTree(rendered, predicate);
-                };
-            }
+            const renderChildren = nested;
+            child.props.children = (...args: any[]) => {
+                const rendered = renderChildren(...args);
+                return filterMatrixMenuTree(rendered, predicate);
+            };
             continue;
         }
         if (!nested) continue;
@@ -887,6 +914,10 @@ const MATRIX_GROUP_MUTATION_MENU_IDS = [
     "invite-people",
     "add-friends",
     "add-people",
+    "add-friends-to-dm",
+    "add-people-to-group",
+    "add-participant",
+    "manage-members",
     "edit-channel",
 ] as const;
 
@@ -913,7 +944,31 @@ const matrixUserInviteToServerMenuPatch: NavContextMenuPatchCallback = (children
 const matrixGroupLeaveMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
     const context = channel?.id ? getMatrixGroupLeaveContext(channel.id) : undefined;
     if (!context) return;
-    removeMatrixMenuItemsWhere(children, isMatrixGroupMutationMenuItem);
+    const inviteContext = getMatrixGroupInviteContext(context.channelId);
+    if (inviteContext) {
+        replaceMatrixMenuAction({
+            children,
+            stockIds: [
+                "add-recipient",
+                "invite-people",
+                "add-friends",
+                "add-friends-to-dm",
+                "add-people",
+                "add-people-to-group",
+                "add-participant",
+                "invite-to-group",
+                "manage-members",
+            ],
+            matrixId: "vc-matrix-group-add-people",
+            label: inviteContext.full
+                ? "Add People (group is full)"
+                : matrixPermissionMenuLabel("Add People", inviteContext.permission),
+            action: () => openMatrixGroupInvite(context.channelId, inviteContext),
+            disabled: false,
+        });
+    }
+    removeMatrixMenuItemsWhere(children, id =>
+        id !== "vc-matrix-group-add-people" && isMatrixGroupMutationMenuItem(id));
     const replacement = (
         <Menu.MenuItem
             key="vc-matrix-leave-group"

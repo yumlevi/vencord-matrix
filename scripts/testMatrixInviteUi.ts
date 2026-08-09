@@ -281,7 +281,7 @@ assert.match(secureCreateServer, /may have been created, but the result could no
 assert.match(secureCreateServer, /MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS/u);
 assert.match(secureCreateServer, /general chat result is unconfirmed and an unlinked chat may exist/u);
 assert.match(secureView, /renderSuggestedChannelsOverlay\(\)/u);
-assert.match(secureView, /overlay === "directMessage"[\s\S]*renderDirectMessageOverlay\(\)[\s\S]*overlay === "groupChat" \? renderGroupChatOverlay\(\) : renderSuggestedChannelsOverlay\(\)/u);
+assert.match(secureView, /overlay === "directMessage"[\s\S]*renderDirectMessageOverlay\(\)[\s\S]*overlay === "groupChat"[\s\S]{0,80}renderGroupChatOverlay\(\)[\s\S]*overlay === "groupInvite"[\s\S]{0,80}renderGroupInviteOverlay\(\)[\s\S]*renderSuggestedChannelsOverlay\(\)/u);
 assert.match(secureView, /renderModal\("Join Suggested Channels\?", body, \[submit\], suggestedChannelJoinBusy\)/u);
 
 assert.match(suggested, /\\u0000-\\u001f\\u007f\\u061c/u);

@@ -24,8 +24,12 @@ import type {
     MatrixConfigureSpaceAccessResult,
     MatrixCreateGroupChatResult,
     MatrixGroupChatCandidateDTO,
+    MatrixGroupChatCandidateSearchResult,
     MatrixGroupChatInvitationStatus,
+    MatrixGroupChatInviteCandidateDTO,
+    MatrixGroupChatInviteCandidateSearchResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToGroupChatResult,
     MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMessageDTO,
     MatrixMessageSearchResultDTO,
@@ -43,7 +47,7 @@ import type {
 } from "./types";
 
 type Child = Node | string | number | false | null | undefined;
-type Overlay = "createSpace" | "directMessage" | "groupChat" | "search" | "suggestedChannels" | null;
+type Overlay = "createSpace" | "directMessage" | "groupChat" | "groupInvite" | "search" | "suggestedChannels" | null;
 type AuthMode = "login" | "register" | "token";
 type MediaState = "loading" | "ready" | "error";
 type MediaTombstone = "error" | "evicted" | "deferred";
@@ -112,6 +116,10 @@ interface SecureGroupChatCandidate extends MatrixGroupChatCandidateDTO {
     provenanceAt: number;
 }
 
+interface SecureGroupInviteCandidate extends MatrixGroupChatInviteCandidateDTO {
+    provenanceAt: number;
+}
+
 type GroupChatPhase = "checking" | "pick" | "review" | "unconfirmed" | "result";
 
 interface PendingUploadItem {
@@ -142,9 +150,9 @@ const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
 const MATRIX_ROOM_ADDRESS_PATTERN = /^(?:#[^\s:]+:[^\s]+|![^\s:]+(?::[^\s]+)?)$/u;
 const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const UNSAFE_GROUP_CHAT_TEXT_PATTERN = /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const SAFE_GROUP_CHAT_LOCALPART_PATTERN = /^[a-z0-9._=\-/+]+$/u;
 const GROUP_CHAT_PROVENANCE_REFRESH_MS = 4 * 60_000 + 45_000;
 const MAX_GROUP_CHAT_RECIPIENTS = 9;
-const MIN_GROUP_CHAT_RECIPIENTS = 2;
 const host = window.MatrixSecureViewHost;
 function requireRoot() {
     const result = document.getElementById("matrix-secure-view-root");
@@ -209,6 +217,7 @@ let groupChatReconcileBusy = false;
 let groupChatAckBusy = false;
 let groupChatSearched = false;
 let groupChatLimited = false;
+let groupChatExactLookup: MatrixGroupChatCandidateSearchResult["exactLookup"] = "not_requested";
 let groupChatError = "";
 let groupChatResult: MatrixCreateGroupChatResult | undefined;
 let groupChatResultAcknowledged = false;
@@ -216,6 +225,28 @@ let groupChatAmbiguityLocked = false;
 let groupChatOverlayGeneration = 0;
 let groupChatSearchSerial = 0;
 let groupChatExpiryTimer: ReturnType<typeof setTimeout> | undefined;
+let groupInviteExpectedUserId: string | undefined;
+let groupInviteRoomId: string | undefined;
+let groupInvitePhase: "checking" | "search" | "pending" | "result" = "checking";
+let groupInviteQuery = "";
+let groupInviteCandidates: SecureGroupInviteCandidate[] = [];
+let groupInviteSearchBusy = false;
+let groupInviteMutationBusy = false;
+let groupInviteReconcileBusy = false;
+let groupInviteAckBusy = false;
+let groupInviteOverrideBusy = false;
+let groupInviteSearched = false;
+let groupInviteLimited = false;
+let groupInviteExactLookup: MatrixGroupChatInviteCandidateSearchResult["exactLookup"] = "not_requested";
+let groupInviteParticipantCount = 1;
+let groupInviteFull = false;
+let groupInvitePendingUserId: string | undefined;
+let groupInviteResult: MatrixInviteUserToGroupChatResult | undefined;
+let groupInviteOverrideArmed = false;
+let groupInviteError = "";
+let groupInviteOverlayGeneration = 0;
+let groupInviteSearchSerial = 0;
+let groupInviteExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 let suggestedChannelsLoading: string | undefined;
 let suggestedChannelPlan: MatrixSuggestedSpaceChannelPlanDTO | undefined;
 let suggestedChannelExpectedUserId: string | undefined;
@@ -413,6 +444,20 @@ function groupChatDisplayName(candidate: MatrixGroupChatCandidateDTO) {
     return cleanGroupChatText(candidate.displayName ?? "", 100) || "Account";
 }
 
+function isExactGroupChatQuery(value: string, accountId: string) {
+    const accountSeparator = accountId.indexOf(":");
+    if (accountSeparator <= 1) return false;
+    const accountServer = accountId.slice(accountSeparator + 1);
+    if (SAFE_GROUP_CHAT_LOCALPART_PATTERN.test(value)) {
+        return new TextEncoder().encode(`@${value}:${accountServer}`).byteLength <= 255;
+    }
+    if (!value.startsWith("@") || new TextEncoder().encode(value).byteLength > 255) return false;
+    const querySeparator = value.indexOf(":");
+    return querySeparator > 1
+        && SAFE_GROUP_CHAT_LOCALPART_PATTERN.test(value.slice(1, querySeparator))
+        && value.slice(querySeparator + 1) === accountServer;
+}
+
 function clearGroupChatOverlayState() {
     groupChatOverlayGeneration++;
     groupChatSearchSerial++;
@@ -430,6 +475,7 @@ function clearGroupChatOverlayState() {
     groupChatAckBusy = false;
     groupChatSearched = false;
     groupChatLimited = false;
+    groupChatExactLookup = "not_requested";
     groupChatError = "";
     groupChatResult = undefined;
     groupChatResultAcknowledged = false;
@@ -475,7 +521,7 @@ function groupChatCreateError(error: unknown) {
 
 function groupChatInvitationLabel(status: MatrixGroupChatInvitationStatus) {
     switch (status) {
-        case "invited": return "Invitation requested";
+        case "invited": return "Invite request accepted";
         case "joined": return "Joined";
         case "rejected": return "Invitation rejected";
         case "ambiguous": return "Invitation unconfirmed";
@@ -592,7 +638,9 @@ function roomById(roomId: string | undefined) {
 }
 
 function roomName(room: Pick<MatrixRoomDTO, "name" | "roomId"> | undefined) {
-    return room?.name?.trim() || room?.roomId || "Matrix";
+    return cleanGroupChatText(room?.name ?? "", 100)
+        || cleanGroupChatText(room?.roomId ?? "", 255)
+        || "Chat";
 }
 
 function isSpace(room: Pick<MatrixRoomDTO, "kind" | "roomType">) {
@@ -1979,7 +2027,10 @@ async function rejectInvite(roomId: string) {
 }
 
 async function leaveRoom(room: MatrixRoomDTO) {
-    if (!host || !window.confirm(`Leave ${roomName(room)}?`)) return;
+    const confirmation = room.groupChat === true
+        ? `Leave ${roomName(room)}? Leaving does not cancel an Add People invitation that may already have landed or been declined. Any unfinished local Add People warning or recovery receipt for this group will be discarded.`
+        : `Leave ${roomName(room)}?`;
+    if (!host || !window.confirm(confirmation)) return;
     const generation = uiGeneration;
     try {
         await host.request({ type: "leaveRoom", roomId: room.roomId });
@@ -2370,6 +2421,7 @@ function searchSecureGroupChatCandidates() {
         return;
     }
     const serial = ++groupChatSearchSerial;
+    const exact = isExactGroupChatQuery(query, expectedUserId);
     groupChatQuery = query;
     groupChatSearchBusy = true;
     groupChatSearched = true;
@@ -2377,13 +2429,14 @@ function searchSecureGroupChatCandidates() {
     scheduleRender();
     void host.request({
         type: "searchGroupChatCandidates",
-        request: { query, limit: 25 },
+        request: { query, limit: 25, exact },
     }).then(result => {
         if (!groupChatOperationCurrent(generation, expectedUserId)
             || serial !== groupChatSearchSerial || result.query !== query) return;
         const provenanceAt = Date.now();
         groupChatCandidates = result.candidates.map(candidate => ({ ...candidate, provenanceAt }));
         groupChatLimited = result.limited || result.directoryLimited;
+        groupChatExactLookup = result.exactLookup;
         const byUserId = new Map(groupChatCandidates.map(candidate => [candidate.userId, candidate]));
         groupChatSelected = new Map([...groupChatSelected].map(([userId, candidate]) =>
             [userId, byUserId.get(userId) ?? candidate]));
@@ -2392,6 +2445,7 @@ function searchSecureGroupChatCandidates() {
         if (!groupChatOperationCurrent(generation, expectedUserId) || serial !== groupChatSearchSerial) return;
         groupChatCandidates = [];
         groupChatLimited = false;
+        groupChatExactLookup = "not_requested";
         groupChatError = errorCode(error) === "MATRIX_GROUP_CHAT_SEARCH_BUSY"
             ? "Another account search is still running. Wait for it to finish, then search again."
             : "Your account provider could not search its user directory. Try again.";
@@ -2409,8 +2463,6 @@ function reviewSecureGroupChat() {
     const name = cleanGroupChatText(groupChatName, 100);
     if (!name) {
         groupChatError = "Enter a group chat name.";
-    } else if (groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS) {
-        groupChatError = "Select at least two people.";
     } else if ([...groupChatSelected.values()].some(candidate =>
         Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS)) {
         groupChatPhase = "pick";
@@ -2427,8 +2479,7 @@ async function createSecureGroupChat() {
     const expectedUserId = groupChatExpectedUserId;
     const generation = groupChatOverlayGeneration;
     if (!host || !expectedUserId || !groupChatOperationCurrent(generation, expectedUserId)
-        || groupChatCreateBusy || groupChatAmbiguityLocked
-        || groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS) return;
+        || groupChatCreateBusy || groupChatAmbiguityLocked) return;
     if ([...groupChatSelected.values()].some(candidate =>
         Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS)) {
         groupChatPhase = "pick";
@@ -2483,6 +2534,368 @@ async function createSecureGroupChat() {
     }
     if (shouldReconcile && groupChatOperationCurrent(generation, expectedUserId)) {
         void reconcileSecureGroupChat(generation, expectedUserId, true);
+    }
+}
+
+function clearGroupInviteOverlayState() {
+    groupInviteOverlayGeneration++;
+    groupInviteSearchSerial++;
+    if (groupInviteExpiryTimer) clearTimeout(groupInviteExpiryTimer);
+    groupInviteExpiryTimer = undefined;
+    groupInviteExpectedUserId = undefined;
+    groupInviteRoomId = undefined;
+    groupInvitePhase = "checking";
+    groupInviteQuery = "";
+    groupInviteCandidates = [];
+    groupInviteSearchBusy = false;
+    groupInviteMutationBusy = false;
+    groupInviteReconcileBusy = false;
+    groupInviteAckBusy = false;
+    groupInviteOverrideBusy = false;
+    groupInviteSearched = false;
+    groupInviteLimited = false;
+    groupInviteExactLookup = "not_requested";
+    groupInviteParticipantCount = 1;
+    groupInviteFull = false;
+    groupInvitePendingUserId = undefined;
+    groupInviteResult = undefined;
+    groupInviteOverrideArmed = false;
+    groupInviteError = "";
+}
+
+function currentSecureGroupInviteRoom() {
+    const room = groupInviteRoomId ? roomById(groupInviteRoomId) : undefined;
+    return room?.groupChat === true && room.membership === "join" ? room : undefined;
+}
+
+function groupInviteOperationCurrent(generation: number, expectedUserId: string, roomId: string) {
+    return generation === groupInviteOverlayGeneration
+        && overlay === "groupInvite"
+        && groupInviteExpectedUserId === expectedUserId
+        && groupInviteRoomId === roomId
+        && isCurrentSecureAccount(expectedUserId)
+        && currentSecureGroupInviteRoom()?.roomId === roomId;
+}
+
+function secureGroupInvitePermissionMessage(room: MatrixRoomDTO) {
+    const permission = room.invitePermission;
+    if (!permission || permission.current === "unverifiable" || permission.required === "unverifiable") {
+        return "The server could not verify your permission to invite people.";
+    }
+    return `Your server permission level is ${permission.current === "infinite" ? "\u221e" : permission.current}; inviting requires ${permission.required}.`;
+}
+
+function secureGroupInviteProjected(userId: string) {
+    const member = currentSecureGroupInviteRoom()?.members?.find(candidate => candidate.userId === userId);
+    return member?.membership === "invite" || member?.membership === "join";
+}
+
+function secureGroupInviteCount(room: MatrixRoomDTO, expectedUserId: string) {
+    const participants = new Set((room.members ?? [])
+        .filter(member => member.membership === "join" || member.membership === "invite")
+        .map(member => member.userId));
+    participants.add(expectedUserId);
+    return participants.size;
+}
+
+function scheduleGroupInviteExpiry(generation: number, expectedUserId: string, roomId: string) {
+    if (groupInviteExpiryTimer) clearTimeout(groupInviteExpiryTimer);
+    if (!groupInviteCandidates.length) return;
+    const expiry = Math.min(...groupInviteCandidates.map(candidate =>
+        candidate.provenanceAt + GROUP_CHAT_PROVENANCE_REFRESH_MS));
+    groupInviteExpiryTimer = setTimeout(() => {
+        groupInviteExpiryTimer = undefined;
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        groupInviteCandidates = [];
+        groupInviteSearched = false;
+        groupInviteError = "Search results expired. Search again before inviting anyone.";
+        scheduleRender();
+    }, Math.max(0, expiry - Date.now()));
+}
+
+function secureGroupInviteError(error: unknown) {
+    switch (errorCode(error)) {
+        case "MATRIX_GROUP_CHAT_CANDIDATE_STALE":
+            return "That search result expired. Search again before inviting. No new invite was sent.";
+        case "MATRIX_GROUP_CHAT_INVITE_FORBIDDEN":
+            return "You no longer have permission to invite people to this group.";
+        case "MATRIX_GROUP_CHAT_INVITE_PERMISSION_UNVERIFIABLE":
+            return "The server could not verify your permission to invite people.";
+        case "MATRIX_GROUP_CHAT_FULL":
+            return "This group already has the maximum of 10 participants and pending invites.";
+        case "MATRIX_GROUP_CHAT_INVITE_SELF":
+        case "MATRIX_GROUP_CHAT_INVITE_BANNED":
+        case "MATRIX_REMOTE_USER_REJECTED":
+            return "That account is not eligible for this group. No new invite was sent.";
+        case "MATRIX_GROUP_CHAT_INVITE_REJECTED":
+            return "The account provider rejected this invite. No new invite was sent.";
+        case "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS":
+        case "MATRIX_GROUP_CHAT_INVITE_RECONCILE_REQUIRED":
+            return "The provider could not confirm whether the invite was sent. Check its status before any retry.";
+        case "MATRIX_GROUP_CHAT_INVITE_IN_PROGRESS":
+        case "MATRIX_GROUP_CHAT_INVITE_RECONCILE_IN_PROGRESS":
+            return "Another window is already handling an invite for this group. Check its status before any retry.";
+        default:
+            return "The account provider could not send this invite. Try again.";
+    }
+}
+
+function setSecureGroupInviteResult(result: MatrixInviteUserToGroupChatResult) {
+    groupInviteResult = result;
+    groupInvitePendingUserId = result.userId;
+    groupInviteOverrideArmed = false;
+    groupInvitePhase = "result";
+    groupInviteError = "";
+}
+
+async function reconcileSecureGroupInvite(afterAmbiguity: boolean) {
+    const expectedUserId = groupInviteExpectedUserId;
+    const roomId = groupInviteRoomId;
+    const generation = groupInviteOverlayGeneration;
+    if (!host || !expectedUserId || !roomId
+        || !groupInviteOperationCurrent(generation, expectedUserId, roomId)
+        || groupInviteReconcileBusy || groupInviteMutationBusy) return;
+    groupInviteReconcileBusy = true;
+    groupInviteError = "";
+    scheduleRender();
+    try {
+        const result = await host.request({ type: "reconcileGroupChatInvite", roomId });
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        if (result.status === "resolved") {
+            setSecureGroupInviteResult(result.result);
+        } else if (result.status === "pending") {
+            groupInvitePendingUserId = result.userId;
+            groupInviteOverrideArmed = false;
+            groupInvitePhase = "pending";
+            groupInviteError = "This invite is still unconfirmed. Checking status never sends it again.";
+        } else if (afterAmbiguity) {
+            groupInvitePhase = "pending";
+            groupInviteError = "The invite is still unconfirmed. Inspect the participant list and check again before any retry.";
+        } else {
+            groupInvitePendingUserId = undefined;
+            groupInvitePhase = "search";
+        }
+    } catch {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        groupInvitePhase = "pending";
+        groupInviteError = afterAmbiguity
+            ? "The invite is unconfirmed and its status could not be checked. Check again later; do not retry it yet."
+            : "The provider could not check for an unfinished invite. Check again before inviting anyone.";
+    } finally {
+        if (groupInviteOperationCurrent(generation, expectedUserId, roomId)) {
+            groupInviteReconcileBusy = false;
+            scheduleRender();
+        }
+    }
+}
+
+function openSecureGroupInvite(room: MatrixRoomDTO) {
+    const expectedUserId = config?.userId;
+    if (!expectedUserId || !isCurrentSecureAccount(expectedUserId)
+        || room.groupChat !== true || room.membership !== "join") {
+        showToast("That group or signed-in account changed. Refresh and try again.", "error");
+        return;
+    }
+    clearGroupInviteOverlayState();
+    overlay = "groupInvite";
+    groupInviteExpectedUserId = expectedUserId;
+    groupInviteRoomId = room.roomId;
+    groupInviteParticipantCount = secureGroupInviteCount(room, expectedUserId);
+    groupInviteFull = groupInviteParticipantCount >= 10;
+    groupInvitePhase = "checking";
+    scheduleRender();
+    void reconcileSecureGroupInvite(false);
+}
+
+function searchSecureGroupInviteCandidates() {
+    const expectedUserId = groupInviteExpectedUserId;
+    const roomId = groupInviteRoomId;
+    const generation = groupInviteOverlayGeneration;
+    const query = cleanGroupChatText(groupInviteQuery, 256);
+    const room = currentSecureGroupInviteRoom();
+    if (!host || !expectedUserId || !roomId || !room
+        || !groupInviteOperationCurrent(generation, expectedUserId, roomId)
+        || groupInviteSearchBusy || groupInviteMutationBusy || groupInviteReconcileBusy) return;
+    if (!query) {
+        groupInviteError = "Enter a display name, full account ID, or exact local username.";
+        scheduleRender();
+        return;
+    }
+    if (room.invitePermission?.allowed !== true) {
+        groupInviteError = secureGroupInvitePermissionMessage(room);
+        scheduleRender();
+        return;
+    }
+    if (groupInviteFull) {
+        groupInviteError = "This group already has the maximum of 10 participants and pending invites.";
+        scheduleRender();
+        return;
+    }
+    const serial = ++groupInviteSearchSerial;
+    const exact = isExactGroupChatQuery(query, expectedUserId);
+    groupInviteQuery = query;
+    groupInviteSearchBusy = true;
+    groupInviteSearched = true;
+    groupInviteError = "";
+    scheduleRender();
+    void host.request({
+        type: "searchGroupChatInviteCandidates",
+        request: { roomId, query, limit: 25, exact },
+    }).then(result => {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)
+            || serial !== groupInviteSearchSerial || result.query !== query || result.roomId !== roomId) return;
+        const provenanceAt = Date.now();
+        groupInviteCandidates = result.candidates.map(candidate => ({ ...candidate, provenanceAt }));
+        groupInviteLimited = result.limited || result.directoryLimited;
+        groupInviteExactLookup = result.exactLookup;
+        groupInviteParticipantCount = result.participantCount;
+        groupInviteFull = result.full;
+        scheduleGroupInviteExpiry(generation, expectedUserId, roomId);
+    }).catch(error => {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)
+            || serial !== groupInviteSearchSerial) return;
+        groupInviteCandidates = [];
+        groupInviteLimited = false;
+        groupInviteExactLookup = "not_requested";
+        const code = errorCode(error);
+        groupInviteError = code === "MATRIX_GROUP_CHAT_EXACT_LOOKUP_INVALID"
+            ? "Enter an exact lowercase local username or full account ID on this account domain."
+            : code === "MATRIX_GROUP_CHAT_EXACT_LOOKUP_RATE_LIMITED"
+                ? "Too many exact account lookups were requested. Wait a moment and try again."
+                : code === "MATRIX_GROUP_CHAT_SEARCH_BUSY"
+                    ? "Another account search is still running. Wait for it to finish, then search again."
+                    : "Your account provider could not search its user directory. Try again.";
+    }).finally(() => {
+        if (groupInviteOperationCurrent(generation, expectedUserId, roomId)
+            && serial === groupInviteSearchSerial) {
+            groupInviteSearchBusy = false;
+            scheduleRender();
+        }
+    });
+}
+
+async function inviteSecureGroupChatCandidate(candidate: SecureGroupInviteCandidate) {
+    const expectedUserId = groupInviteExpectedUserId;
+    const roomId = groupInviteRoomId;
+    const generation = groupInviteOverlayGeneration;
+    const room = currentSecureGroupInviteRoom();
+    if (!host || !expectedUserId || !roomId || !room
+        || !groupInviteOperationCurrent(generation, expectedUserId, roomId)
+        || groupInviteMutationBusy || groupInviteReconcileBusy
+        || candidate.membership === "join" || candidate.membership === "invite" || candidate.membership === "ban") return;
+    if (room.invitePermission?.allowed !== true) {
+        groupInviteError = secureGroupInvitePermissionMessage(room);
+        scheduleRender();
+        return;
+    }
+    if (groupInviteFull) {
+        groupInviteError = "This group already has the maximum of 10 participants and pending invites.";
+        scheduleRender();
+        return;
+    }
+    if (Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS) {
+        groupInviteCandidates = [];
+        groupInviteSearched = false;
+        groupInviteError = "That search result expired. Search again before inviting anyone.";
+        scheduleRender();
+        return;
+    }
+    groupInviteMutationBusy = true;
+    groupInvitePendingUserId = candidate.userId;
+    groupInviteError = "";
+    let shouldReconcile = false;
+    scheduleRender();
+    try {
+        const result = await host.request({
+            type: "inviteUserToGroupChat",
+            request: { roomId, userId: candidate.userId },
+        });
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        setSecureGroupInviteResult(result);
+    } catch (error) {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        const code = errorCode(error);
+        if (code === "MATRIX_GROUP_CHAT_INVITE_AMBIGUOUS"
+            || code === "MATRIX_GROUP_CHAT_INVITE_RECONCILE_REQUIRED"
+            || code === "MATRIX_GROUP_CHAT_INVITE_IN_PROGRESS"
+            || code === "MATRIX_GROUP_CHAT_INVITE_RECONCILE_IN_PROGRESS") {
+            groupInvitePhase = "pending";
+            groupInviteError = secureGroupInviteError(error);
+            shouldReconcile = true;
+        } else if (code === "MATRIX_GROUP_CHAT_CANDIDATE_STALE") {
+            groupInviteCandidates = [];
+            groupInviteSearched = false;
+            groupInviteError = secureGroupInviteError(error);
+        } else {
+            groupInviteError = secureGroupInviteError(error);
+        }
+    } finally {
+        if (groupInviteOperationCurrent(generation, expectedUserId, roomId)) {
+            groupInviteMutationBusy = false;
+            scheduleRender();
+        }
+    }
+    if (shouldReconcile && groupInviteOperationCurrent(generation, expectedUserId, roomId)) {
+        void reconcileSecureGroupInvite(true);
+    }
+}
+
+async function overrideSecureGroupInvite() {
+    const expectedUserId = groupInviteExpectedUserId;
+    const roomId = groupInviteRoomId;
+    const userId = groupInvitePendingUserId;
+    const generation = groupInviteOverlayGeneration;
+    if (!host || !expectedUserId || !roomId || !userId || !groupInviteOverrideArmed
+        || !groupInviteOperationCurrent(generation, expectedUserId, roomId)
+        || groupInviteOverrideBusy || groupInviteReconcileBusy || groupInviteMutationBusy) return;
+    groupInviteOverrideBusy = true;
+    groupInviteError = "";
+    scheduleRender();
+    try {
+        await host.request({ type: "overrideGroupChatInviteAmbiguity", request: { roomId, userId } });
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        groupInviteCandidates = [];
+        groupInviteSearched = false;
+        groupInvitePendingUserId = undefined;
+        groupInviteOverrideArmed = false;
+        groupInvitePhase = "search";
+        groupInviteError = "The unconfirmed invite receipt was cleared after a fresh status check. Search for the account again before deciding whether to retry.";
+    } catch {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        groupInviteError = "The provider could not safely clear this unconfirmed invite. Check its status again later; do not retry it yet.";
+    } finally {
+        if (groupInviteOperationCurrent(generation, expectedUserId, roomId)) {
+            groupInviteOverrideBusy = false;
+            scheduleRender();
+        }
+    }
+}
+
+async function acknowledgeSecureGroupInvite() {
+    const expectedUserId = groupInviteExpectedUserId;
+    const roomId = groupInviteRoomId;
+    const result = groupInviteResult;
+    const generation = groupInviteOverlayGeneration;
+    if (!host || !expectedUserId || !roomId || !result
+        || !groupInviteOperationCurrent(generation, expectedUserId, roomId)
+        || groupInviteAckBusy || groupInviteReconcileBusy || groupInviteMutationBusy) return;
+    groupInviteAckBusy = true;
+    groupInviteError = "";
+    scheduleRender();
+    try {
+        await host.request({
+            type: "acknowledgeGroupChatInvite",
+            request: { roomId, userId: result.userId },
+        });
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        overlay = null;
+        clearGroupInviteOverlayState();
+    } catch {
+        if (!groupInviteOperationCurrent(generation, expectedUserId, roomId)) return;
+        groupInviteError = "The invite was confirmed, but its local recovery receipt could not be cleared. Close for now or try Done again; do not send another invite to this account.";
+    } finally {
+        if (groupInviteOperationCurrent(generation, expectedUserId, roomId)) groupInviteAckBusy = false;
+        scheduleRender();
     }
 }
 
@@ -3381,6 +3794,23 @@ function renderHeading(title: string, topic = "", showLeave?: MatrixRoomDTO) {
         makeButton("Search", "matrix-icon-button", openSearch, { ariaLabel: "Search Matrix messages" }),
         makeButton("Refresh", "matrix-icon-button", () => void refresh(true), { ariaLabel: "Refresh Matrix" }),
     );
+    if (showLeave?.groupChat === true) {
+        const expectedUserId = config?.userId;
+        const participantCount = expectedUserId ? secureGroupInviteCount(showLeave, expectedUserId) : 10;
+        const full = participantCount >= 10;
+        const canInvite = showLeave.invitePermission?.allowed === true;
+        actions.append(makeButton(
+            full ? "Group full" : canInvite ? "Add People" : "Add People unavailable",
+            "matrix-icon-button",
+            () => openSecureGroupInvite(showLeave),
+            {
+                ariaLabel: full
+                    ? "Group is full"
+                    : canInvite ? "Add People" : secureGroupInvitePermissionMessage(showLeave),
+                disabled: false,
+            }
+        ));
+    }
     if (showLeave) {
         actions.append(makeButton("Leave", "matrix-icon-button", () => void leaveRoom(showLeave), {
             ariaLabel: `Leave ${roomName(showLeave)}`,
@@ -3461,12 +3891,22 @@ function renderHomeMain() {
     ));
     const chatGrid = element("div", "matrix-grid");
     for (const room of chats.slice(0, 12)) {
-        chatGrid.append(roomCard(room, [
-            makeButton("Open", "matrix-button", () => setRoute({
+        const actions = [makeButton("Open", "matrix-button", () => setRoute({
                 kind: isDirect(room) ? "dm" : "room",
                 roomId: room.roomId,
-            })),
-        ]));
+            }))];
+        if (room.groupChat === true) {
+            const expectedUserId = config?.userId;
+            const full = !expectedUserId || secureGroupInviteCount(room, expectedUserId) >= 10;
+            const canInvite = room.invitePermission?.allowed === true;
+            actions.push(makeButton(
+                full ? "Group full" : canInvite ? "Add People" : "Add People unavailable",
+                "matrix-button",
+                () => openSecureGroupInvite(room),
+                { disabled: false }
+            ));
+        }
+        chatGrid.append(roomCard(room, actions));
     }
     if (!chats.length) chatGrid.append(textElement("div", "matrix-subtle", "No joined chats yet."));
     narrow.append(chatGrid);
@@ -4230,7 +4670,9 @@ function renderSecureGroupChatResult(body: HTMLElement, result: MatrixCreateGrou
     body.append(textElement(
         "p",
         "matrix-subtle",
-        `Group chat created. ${[...counts].map(([label, count]) => `${count} ${label.toLocaleLowerCase()}`).join(", ")}.`
+        result.invitations.length
+            ? `Group chat created. ${[...counts].map(([label, count]) => `${count} ${label.toLocaleLowerCase()}`).join(", ")}.`
+            : "Group chat created. No invitations were sent. Open it, then use Add People whenever you are ready."
     ));
     if (!result.complete) {
         body.append(textElement(
@@ -4239,6 +4681,7 @@ function renderSecureGroupChatResult(body: HTMLElement, result: MatrixCreateGrou
             "Some invitations were rejected or could not be confirmed. Do not assume those people received an invitation."
         ));
     }
+    if (!result.invitations.length) return;
     const list = element("div", "matrix-form");
     list.setAttribute("role", "list");
     list.setAttribute("aria-label", "Invitation results");
@@ -4286,7 +4729,7 @@ function renderGroupChatOverlay() {
         body.append(labelledField("Group name", name));
 
         const searchForm = element("form", "matrix-form matrix-group-chat-search");
-        const search = input("search", "groupQuery", "Search by name or full account ID", groupChatQuery);
+        const search = input("search", "groupQuery", "Display name, @username:domain, or exact local username", groupChatQuery);
         search.maxLength = 256;
         search.disabled = !current || groupChatSearchBusy || groupChatCreateBusy;
         search.dataset.focusKey = "matrix-group-chat-search";
@@ -4322,6 +4765,11 @@ function renderGroupChatOverlay() {
             textElement(
                 "p",
                 "matrix-subtle",
+                "A full account ID or safe lowercase local username also performs an exact provider lookup. This can reveal whether an account exists even when display-name directory results omit it."
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
                 `This private group does not federate; everyone's full account ID must use the ${accountDomain} domain. Search results expire after five minutes.`
             ),
             textElement(
@@ -4329,7 +4777,7 @@ function renderGroupChatOverlay() {
                 "matrix-subtle",
                 "Message contents and media are end-to-end encrypted. The provider can still see the group name, participant accounts, membership, and traffic timing and size. Participants can see one another's full account IDs."
             ),
-            textElement("h3", "", `Selected people (${groupChatSelected.size} of ${MAX_GROUP_CHAT_RECIPIENTS})`),
+            textElement("h3", "", `People to invite now - optional (${groupChatSelected.size} of ${MAX_GROUP_CHAT_RECIPIENTS})`),
         );
         const selected = element("div", "matrix-form");
         selected.setAttribute("role", "list");
@@ -4345,13 +4793,23 @@ function renderGroupChatOverlay() {
                 },
             }));
         }
-        if (!groupChatSelected.size) selected.append(textElement("p", "matrix-subtle", "Select at least two people."));
+        if (!groupChatSelected.size) selected.append(textElement(
+            "p",
+            "matrix-subtle",
+            "No one selected. Create the private group now and add people later."
+        ));
         body.append(selected);
         if (groupChatLimited) {
             body.append(textElement("p", "matrix-subtle", "More accounts may match. Refine your search to narrow the results."));
         }
         if (groupChatSearched && !groupChatSearchBusy && !groupChatCandidates.length && !groupChatError) {
-            body.append(textElement("p", "matrix-subtle", "No matching accounts were found."));
+            body.append(textElement(
+                "p",
+                "matrix-subtle",
+                groupChatExactLookup === "not_found_or_unavailable"
+                    ? "No directory match or exact local account could be verified. Check the spelling and provider domain."
+                    : "No display-name matches were returned. Directory results can omit accounts; try the exact @username:domain or exact lowercase local username."
+            ));
         }
         if (groupChatCandidates.length) {
             const results = element("div", "matrix-form");
@@ -4380,9 +4838,11 @@ function renderGroupChatOverlay() {
         }
         footer.push(
             makeButton("Cancel", "matrix-button", dismissOverlay),
-            makeButton("Review", "matrix-button matrix-button-primary", reviewSecureGroupChat, {
-                disabled: !current || groupChatSearchBusy || !cleanGroupChatText(groupChatName, 100)
-                    || groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS,
+            makeButton(groupChatSelected.size ? "Review" : groupChatCreateBusy ? "Creating..." : "Create Group Chat", "matrix-button matrix-button-primary", () => {
+                if (groupChatSelected.size) reviewSecureGroupChat();
+                else void createSecureGroupChat();
+            }, {
+                disabled: !current || groupChatSearchBusy || groupChatCreateBusy || !cleanGroupChatText(groupChatName, 100),
             }),
         );
     } else if (groupChatPhase === "review") {
@@ -4488,6 +4948,212 @@ function renderGroupChatOverlay() {
     );
 }
 
+function secureGroupInviteCandidateStatus(candidate: MatrixGroupChatInviteCandidateDTO) {
+    switch (candidate.membership) {
+        case "join": return "Already joined";
+        case "invite": return "Already invited";
+        case "ban": return "Unavailable";
+        case "knock": return "Requested access";
+        default: return undefined;
+    }
+}
+
+function closeSecureGroupInviteForNow() {
+    if (groupInviteSearchBusy || groupInviteMutationBusy || groupInviteReconcileBusy
+        || groupInviteAckBusy || groupInviteOverrideBusy) return;
+    overlay = null;
+    clearGroupInviteOverlayState();
+    scheduleRender();
+}
+
+function renderGroupInviteOverlay() {
+    const body = element("div", "matrix-modal-body matrix-group-chat-create");
+    const room = currentSecureGroupInviteRoom();
+    const expectedUserId = groupInviteExpectedUserId;
+    const current = Boolean(room && expectedUserId && isCurrentSecureAccount(expectedUserId));
+    const homeserver = serverLabel(config?.homeserver).replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "") || "your account provider";
+    const accountDomain = accountServerName()?.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "") || "your account domain";
+    const participantCount = room && expectedUserId
+        ? Math.max(groupInviteParticipantCount, secureGroupInviteCount(room, expectedUserId))
+        : groupInviteParticipantCount;
+    const full = groupInviteFull || participantCount >= 10;
+    const canInvite = room?.invitePermission?.allowed === true;
+    const busy = groupInviteSearchBusy || groupInviteMutationBusy || groupInviteReconcileBusy
+        || groupInviteAckBusy || groupInviteOverrideBusy;
+    if (!current) {
+        body.append(textElement("p", "matrix-access-error", "This group or signed-in account changed. Close this window and try again."));
+    } else if (!canInvite) {
+        body.append(textElement("p", "matrix-access-warning", secureGroupInvitePermissionMessage(room!)));
+    }
+    if (groupInviteError) {
+        const error = textElement("p", "matrix-access-error", groupInviteError);
+        error.setAttribute("role", "alert");
+        body.append(error);
+    }
+    body.append(textElement(
+        "p",
+        "matrix-subtle",
+        `${participantCount} of 10 places used; ${Math.max(0, 10 - participantCount)} remaining.`
+    ));
+
+    const footer: HTMLElement[] = [];
+    if (groupInvitePhase === "checking") {
+        body.append(textElement("p", "matrix-subtle", "Checking for an unfinished invite..."));
+    } else if (groupInvitePhase === "search") {
+        const searchForm = element("form", "matrix-form matrix-group-chat-search");
+        const search = input(
+            "search",
+            "groupInviteQuery",
+            "Display name, @username:domain, or exact local username",
+            groupInviteQuery
+        );
+        search.maxLength = 256;
+        search.disabled = !current || !canInvite || full || busy;
+        search.dataset.focusKey = "matrix-group-invite-search";
+        search.addEventListener("input", () => {
+            groupInviteQuery = search.value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").slice(0, 256);
+            groupInviteError = "";
+        });
+        const searchButton = makeButton(
+            groupInviteSearchBusy ? "Searching..." : "Search",
+            "matrix-button matrix-button-primary",
+            () => searchForm.requestSubmit(),
+            { disabled: !current || !canInvite || full || busy }
+        );
+        searchButton.type = "submit";
+        searchForm.append(labelledField("Search accounts", search), searchButton);
+        searchForm.addEventListener("submit", event => {
+            event.preventDefault();
+            groupInviteQuery = search.value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").slice(0, 256);
+            searchSecureGroupInviteCandidates();
+        });
+        body.append(
+            searchForm,
+            textElement(
+                "p",
+                "matrix-subtle",
+                `Display-name results come from the account directory hosted by ${homeserver} and may be incomplete. That homeserver can observe searches.`
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                "Search text and results are displayed inside Discord, where Discord and installed client plugins can read them."
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                `A full account ID or safe lowercase local username performs an exact lookup on the ${accountDomain} account domain. This can probe whether an account exists outside limited display-name results.`
+            ),
+        );
+        if (full) body.append(textElement("p", "matrix-access-warning", "This group already has the maximum of 10 participants and pending invites."));
+        if (groupInviteLimited) body.append(textElement("p", "matrix-subtle", "More display-name matches may exist. Refine the search or use an exact account ID."));
+        if (groupInviteSearchBusy) body.append(textElement("p", "matrix-subtle", "Searching..."));
+        if (groupInviteSearched && !groupInviteSearchBusy && !groupInviteCandidates.length && !groupInviteError) {
+            body.append(textElement(
+                "p",
+                "matrix-subtle",
+                groupInviteExactLookup === "not_found_or_unavailable"
+                    ? "That exact local account was not found or could not be verified. Check the spelling and account domain."
+                    : "No display-name matches were returned. The directory can omit accounts; try the exact @username:domain or exact lowercase local username."
+            ));
+        }
+        if (groupInviteCandidates.length) {
+            const results = element("div", "matrix-form");
+            results.setAttribute("role", "list");
+            results.setAttribute("aria-label", "Accounts available to invite");
+            for (const candidate of groupInviteCandidates) {
+                const status = secureGroupInviteCandidateStatus(candidate);
+                const unavailable = candidate.membership === "join"
+                    || candidate.membership === "invite"
+                    || candidate.membership === "ban";
+                results.append(secureGroupChatCandidateRow(candidate, {
+                    label: status ?? (groupInviteMutationBusy ? "Inviting..." : "Invite"),
+                    disabled: !current || !canInvite || full || busy || unavailable,
+                    run: () => void inviteSecureGroupChatCandidate(candidate),
+                }, status));
+            }
+            body.append(results);
+        }
+        footer.push(makeButton("Close", "matrix-button", closeSecureGroupInviteForNow, { disabled: busy }));
+    } else if (groupInvitePhase === "pending") {
+        body.append(textElement(
+            "p",
+            "matrix-access-warning",
+            groupInvitePendingUserId
+                ? `Invite outcome for ${visibleRequesterUserId(groupInvitePendingUserId)} is unconfirmed. Do not send it again while this receipt remains.`
+                : "An invite outcome is unconfirmed. Do not send another invite while this receipt remains."
+        ));
+        if (groupInviteOverrideArmed) {
+            body.append(textElement(
+                "p",
+                "matrix-access-warning",
+                "Clearing the warning does not cancel an invite that may already have landed or that the recipient may already have declined. The provider checks once more, then only clears the local receipt; it never retries the invite. Inspect the participant list first."
+            ));
+            footer.push(
+                makeButton("Keep waiting", "matrix-button", () => {
+                    groupInviteOverrideArmed = false;
+                    scheduleRender();
+                }, { disabled: busy }),
+                makeButton(
+                    groupInviteOverrideBusy ? "Checking and clearing..." : "Clear warning and allow another attempt",
+                    "matrix-button matrix-button-danger",
+                    () => void overrideSecureGroupInvite(),
+                    { disabled: !current || busy || !groupInvitePendingUserId }
+                )
+            );
+        } else {
+            footer.push(
+                makeButton("Close for now", "matrix-button", closeSecureGroupInviteForNow, { disabled: busy }),
+                makeButton("Review retry safety", "matrix-button", () => {
+                    groupInviteOverrideArmed = true;
+                    scheduleRender();
+                }, { disabled: busy || !groupInvitePendingUserId }),
+                makeButton(
+                    groupInviteReconcileBusy ? "Checking..." : "Check Status",
+                    "matrix-button matrix-button-primary",
+                    () => void reconcileSecureGroupInvite(true),
+                    { disabled: !current || busy }
+                )
+            );
+        }
+    } else if (groupInviteResult) {
+        const projected = secureGroupInviteProjected(groupInviteResult.userId);
+        body.append(textElement(
+            "p",
+            "matrix-subtle",
+            groupInviteResult.delivery === "accepted"
+                ? `The provider accepted an invite request for ${visibleRequesterUserId(groupInviteResult.userId)}.`
+                : groupInviteResult.observedMembership === "join"
+                    ? `The provider found ${visibleRequesterUserId(groupInviteResult.userId)} already joined.`
+                    : `The provider found an existing invite for ${visibleRequesterUserId(groupInviteResult.userId)}.`
+        ));
+        if (!projected) {
+            body.append(textElement(
+                "p",
+                "matrix-subtle",
+                "Discord does not show a current invite or membership. The person may already have declined or left."
+            ));
+        }
+        footer.push(
+            makeButton("Close for now", "matrix-button", closeSecureGroupInviteForNow, { disabled: groupInviteAckBusy }),
+            makeButton(
+                groupInviteAckBusy ? "Confirming..." : "Done",
+                "matrix-button matrix-button-primary",
+                () => void acknowledgeSecureGroupInvite(),
+                { disabled: !current || groupInviteAckBusy }
+            )
+        );
+    }
+    const receiptLocked = Boolean(groupInviteResult);
+    return renderModal(
+        room ? `Add People - ${roomName(room)}` : "Add People",
+        body,
+        footer,
+        groupInviteMutationBusy || groupInviteReconcileBusy || groupInviteAckBusy
+            || groupInviteOverrideBusy || receiptLocked
+    );
+}
+
 function dismissOverlay() {
     if (overlay === "suggestedChannels") {
         if (suggestedChannelJoinBusy) return;
@@ -4497,6 +5163,11 @@ function dismissOverlay() {
         if (groupChatCreateBusy || groupChatReconcileBusy || groupChatAckBusy
             || groupChatResult && !groupChatResultAcknowledged) return;
         clearGroupChatOverlayState();
+    }
+    if (overlay === "groupInvite") {
+        if (groupInviteSearchBusy || groupInviteMutationBusy || groupInviteReconcileBusy
+            || groupInviteAckBusy || groupInviteOverrideBusy || groupInviteResult) return;
+        clearGroupInviteOverlayState();
     }
     overlay = null;
     scheduleRender();
@@ -4734,7 +5405,9 @@ function render() {
                 ? renderCreateSpaceOverlay()
                 : overlay === "directMessage"
                     ? renderDirectMessageOverlay()
-                    : overlay === "groupChat" ? renderGroupChatOverlay() : renderSuggestedChannelsOverlay());
+                    : overlay === "groupChat"
+                        ? renderGroupChatOverlay()
+                        : overlay === "groupInvite" ? renderGroupInviteOverlay() : renderSuggestedChannelsOverlay());
     }
     if (config?.configured && !fatalMessage && (status?.state === "error" || status?.state === "stopped")) {
         const connectionProblem = element(

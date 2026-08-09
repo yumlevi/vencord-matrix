@@ -21,7 +21,11 @@ import type {
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateSearchRequest,
     MatrixGroupChatCandidateSearchResult,
+    MatrixGroupChatInviteCandidateSearchRequest,
+    MatrixGroupChatInviteCandidateSearchResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToGroupChatRequest,
+    MatrixInviteUserToGroupChatResult,
     MatrixInviteUserToSpaceRequest,
     MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
@@ -35,6 +39,7 @@ import type {
     MatrixPublicRoomDirectoryDTO,
     MatrixReauthenticationRequest,
     MatrixReconcileGroupChatCreateResult,
+    MatrixReconcileGroupChatInviteResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
     MatrixRequestSpaceAccessResult,
@@ -73,6 +78,11 @@ export interface MatrixStoredAccount extends MatrixSessionCredentials {
     storageKey: string;
 }
 
+/** Exact /joined_rooms response used only to retire unreachable local receipts. */
+export interface MatrixJoinedRoomIdsResult {
+    roomIds: string[];
+}
+
 export interface MatrixCredentialUpdate extends MatrixSessionCredentials { }
 
 export type MatrixWorkerCommand =
@@ -83,6 +93,7 @@ export type MatrixWorkerCommand =
     | { type: "suspend"; }
     | { type: "logout"; }
     | { type: "snapshot"; }
+    | { type: "joinedRoomIds"; }
     | { type: "publicRooms"; }
     | { type: "joinRoom"; roomId: string; }
     | { type: "joinRoomAddress"; address: string; }
@@ -98,6 +109,9 @@ export type MatrixWorkerCommand =
     | { type: "searchSpaceInviteCandidates"; request: MatrixSpaceInviteCandidateSearchRequest; }
     | { type: "inviteUserToSpace"; request: MatrixInviteUserToSpaceRequest; }
     | { type: "searchGroupChatCandidates"; request: MatrixGroupChatCandidateSearchRequest; }
+    | { type: "searchGroupChatInviteCandidates"; request: MatrixGroupChatInviteCandidateSearchRequest; }
+    | { type: "inviteUserToGroupChat"; request: MatrixInviteUserToGroupChatRequest; }
+    | { type: "reconcileGroupChatInvite"; request: MatrixInviteUserToGroupChatRequest; }
     | { type: "createGroupChat"; request: MatrixCreateGroupChatRequest; creationMarker: string; }
     | {
         type: "reconcileGroupChatCreate";
@@ -140,6 +154,7 @@ export type MatrixWorkerResult =
     | MatrixCreateSpaceResult
     | MatrixCreateSpaceChildResult
     | MatrixJoinRoomResult
+    | MatrixJoinedRoomIdsResult
     | MatrixRoomActionResult
     | MatrixRequestSpaceAccessResult
     | MatrixResolveSpaceAccessRequestResult
@@ -147,11 +162,13 @@ export type MatrixWorkerResult =
     | MatrixMediaDownloadResult
     | MatrixHistoryPageDTO
     | MatrixInviteUserToSpaceResult
+    | MatrixInviteUserToGroupChatResult
     | MatrixJoinSuggestedSpaceChannelsResult
     | MatrixMessageContextDTO
     | MatrixMessageSearchResponse
     | MatrixPublicRoomDirectoryDTO
     | MatrixReconcileGroupChatCreateResult
+    | MatrixReconcileGroupChatInviteResult
     | MatrixReconcileSpaceChildCreateResult
     | MatrixRoomDTO
     | MatrixSnapshot
@@ -160,6 +177,7 @@ export type MatrixWorkerResult =
     | MatrixSpaceHierarchyDTO
     | MatrixSpaceInviteCandidateSearchResult
     | MatrixGroupChatCandidateSearchResult
+    | MatrixGroupChatInviteCandidateSearchResult
     | MatrixSuggestedSpaceChannelPlanDTO
     | MatrixStickerSendResult
     | MatrixAttachmentSendResult

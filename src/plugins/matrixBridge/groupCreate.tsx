@@ -37,10 +37,10 @@ import { matrixErrorCode } from "./errorCode";
 
 const SEARCH_LIMIT = 25;
 const MAX_RECIPIENTS = 9;
-const MIN_RECIPIENTS = 2;
 const PROVENANCE_REFRESH_MS = 4 * 60_000 + 45_000;
 const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const UNSAFE_VISIBLE_TEXT_PATTERN = /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const SAFE_BARE_LOCALPART_PATTERN = /^[a-z0-9._=\-/+]+$/u;
 let activeGroupChatCreateModalKey: string | undefined;
 
 interface SelectedCandidate extends MatrixGroupChatCandidate {
@@ -95,6 +95,20 @@ function cleanQuery(value: string) {
     return value.replace(UNSAFE_VISIBLE_TEXT_PATTERN, "").slice(0, 256);
 }
 
+function isExplicitExactQuery(value: string, accountId: string) {
+    const accountSeparator = accountId.indexOf(":");
+    if (accountSeparator <= 1) return false;
+    const accountServer = accountId.slice(accountSeparator + 1);
+    if (SAFE_BARE_LOCALPART_PATTERN.test(value)) {
+        return new TextEncoder().encode(`@${value}:${accountServer}`).byteLength <= 255;
+    }
+    if (!value.startsWith("@") || new TextEncoder().encode(value).byteLength > 255) return false;
+    const querySeparator = value.indexOf(":");
+    return querySeparator > 1
+        && SAFE_BARE_LOCALPART_PATTERN.test(value.slice(1, querySeparator))
+        && value.slice(querySeparator + 1) === accountServer;
+}
+
 function publicSearchError(error: unknown) {
     const code = matrixErrorCode(error);
     if (code === "MATRIX_GROUP_CHAT_SEARCH_BUSY") {
@@ -138,7 +152,7 @@ function publicCreateError(error: unknown) {
 
 function invitationLabel(status: MatrixGroupChatCreateResult["invitations"][number]["status"]) {
     switch (status) {
-        case "invited": return "Invitation requested";
+        case "invited": return "Invite request accepted";
         case "joined": return "Joined";
         case "rejected": return "Invitation rejected";
         case "ambiguous": return "Invitation unconfirmed";
@@ -146,6 +160,7 @@ function invitationLabel(status: MatrixGroupChatCreateResult["invitations"][numb
 }
 
 function resultSummary(result: MatrixGroupChatCreateResult) {
+    if (!result.invitations.length) return "No invitations were sent";
     const counts = new Map<string, number>();
     for (const invitation of result.invitations) {
         const label = invitationLabel(invitation.status).toLocaleLowerCase();
@@ -191,6 +206,7 @@ function MatrixGroupChatCreateModal({
     const [checking, setChecking] = useState(true);
     const [creating, setCreating] = useState(false);
     const [limited, setLimited] = useState(false);
+    const [exactLookup, setExactLookup] = useState<"not_requested" | "resolved" | "not_found_or_unavailable">("not_requested");
     const [searched, setSearched] = useState(false);
     const [error, setError] = useState("");
     const [result, setResult] = useState<MatrixGroupChatCreateResult>();
@@ -327,15 +343,17 @@ function MatrixGroupChatCreateModal({
             return;
         }
         const serial = ++searchSerial.current;
+        const exact = isExplicitExactQuery(submittedQuery, expected.expectedAccountId);
         setSearching(true);
         setSearched(true);
         setError("");
-        void searchMatrixGroupChatCandidates(before, submittedQuery, SEARCH_LIMIT).then(response => {
+        void searchMatrixGroupChatCandidates(before, submittedQuery, SEARCH_LIMIT, exact).then(response => {
             if (!mounted.current || searchSerial.current !== serial || !currentBoundContext(expected)) return;
             const provenanceAt = Date.now();
             const nextCandidates = response.candidates.map(candidate => ({ ...candidate, provenanceAt }));
             setCandidates(nextCandidates);
             setLimited(response.limited || response.directoryLimited);
+            setExactLookup(response.exactLookup);
             setSelected(current => {
                 const next = new Map(current);
                 for (const candidate of nextCandidates) {
@@ -347,6 +365,7 @@ function MatrixGroupChatCreateModal({
             if (!mounted.current || searchSerial.current !== serial || !currentBoundContext(expected)) return;
             setCandidates([]);
             setLimited(false);
+            setExactLookup("not_requested");
             setError(publicSearchError(caught));
         }).finally(() => {
             if (mounted.current && searchSerial.current === serial) setSearching(false);
@@ -375,10 +394,6 @@ function MatrixGroupChatCreateModal({
             setError("Enter a group chat name.");
             return;
         }
-        if (selected.size < MIN_RECIPIENTS) {
-            setError("Select at least two people.");
-            return;
-        }
         const now = Date.now();
         if ([...selected.values()].some(candidate => now - candidate.provenanceAt >= PROVENANCE_REFRESH_MS)) {
             setPhase("pick");
@@ -392,7 +407,7 @@ function MatrixGroupChatCreateModal({
 
     async function create() {
         const before = currentBoundContext(expected);
-        if (!before || createLock.current || ambiguityLock.current || selected.size < MIN_RECIPIENTS) return;
+        if (!before || createLock.current || ambiguityLock.current) return;
         const now = Date.now();
         if ([...selected.values()].some(candidate => now - candidate.provenanceAt >= PROVENANCE_REFRESH_MS)) {
             setPhase("pick");
@@ -500,10 +515,10 @@ function MatrixGroupChatCreateModal({
         disabled: creating || checking,
         onClick: close,
     }, {
-        text: "Review",
+        text: selected.size ? "Review" : creating ? "Creating..." : "Create Group Chat",
         variant: "primary" as const,
-        disabled: !context || searching || creating || !cleanName(name) || selected.size < MIN_RECIPIENTS,
-        onClick: review,
+        disabled: !context || searching || creating || !cleanName(name),
+        onClick: selected.size ? review : () => void create(),
     }] : phase === "review" ? [{
         text: "Back",
         variant: "secondary" as const,
@@ -581,7 +596,7 @@ function MatrixGroupChatCreateModal({
                             <TextInput
                                 disabled={!context || searching || creating}
                                 value={query}
-                                placeholder="Search by name or full account ID"
+                                placeholder="Display name, @username:domain, or exact local username"
                                 maxLength={256}
                                 onChange={value => {
                                     setQuery(cleanQuery(value));
@@ -601,6 +616,10 @@ function MatrixGroupChatCreateModal({
                             where Discord and installed client plugins can read them.
                         </p>
                         <p className="vc-matrix-group-chat-scope">
+                            A full account ID or safe lowercase local username also performs an exact provider lookup.
+                            This can reveal whether an account exists even when display-name directory results omit it.
+                        </p>
+                        <p className="vc-matrix-group-chat-scope">
                             This private, encrypted group does not connect to other account domains. Everyone&apos;s full account ID
                             must use the {provider} domain. Search results expire after five minutes.
                         </p>
@@ -610,7 +629,7 @@ function MatrixGroupChatCreateModal({
                         </p>
                         <section aria-labelledby="vc-matrix-group-chat-selected-heading">
                             <div className="vc-matrix-group-chat-section-heading" id="vc-matrix-group-chat-selected-heading">
-                                Selected people ({selected.size} of {MAX_RECIPIENTS})
+                                People to invite now - optional ({selected.size} of {MAX_RECIPIENTS})
                             </div>
                             {selectedCandidates.length ? (
                                 <div className="vc-matrix-group-chat-list" role="list" aria-label="Selected people">
@@ -628,7 +647,9 @@ function MatrixGroupChatCreateModal({
                                     ))}
                                 </div>
                             ) : (
-                                <div className="vc-matrix-group-chat-empty">Select at least two people.</div>
+                                <div className="vc-matrix-group-chat-empty">
+                                    No one selected. Create the private group now and add people later.
+                                </div>
                             )}
                         </section>
                         {limited && !searching && (
@@ -638,7 +659,11 @@ function MatrixGroupChatCreateModal({
                         )}
                         {searching && <div className="vc-matrix-group-chat-empty" role="status">Searching...</div>}
                         {!searching && searched && !candidates.length && !status && (
-                            <div className="vc-matrix-group-chat-empty" role="status">No matching accounts were found.</div>
+                            <div className="vc-matrix-group-chat-empty" role="status">
+                                {exactLookup === "not_found_or_unavailable"
+                                    ? "No directory match or exact local account could be verified. Check the spelling and provider domain."
+                                    : "No display-name matches were returned. Directory results can omit accounts; try the exact @username:domain or exact lowercase local username."}
+                            </div>
                         )}
                         {!searching && candidates.length > 0 && (
                             <div className="vc-matrix-group-chat-list" role="list" aria-label="Account search results">
@@ -686,11 +711,12 @@ function MatrixGroupChatCreateModal({
                     <>
                         <div className="vc-matrix-group-chat-notice" role="status">
                             Group chat created. {resultSummary(result)}.
+                            {!result.invitations.length && " Open the group and use Add People whenever you are ready."}
                             {!result.complete && " Some invitations were rejected or could not be confirmed."}
                             {syncing && " The new chat is still syncing into Discord."}
                             {!syncing && !projectionReady && " The new chat has not appeared in Discord yet. Close for now keeps its recovery receipt; reopen Create Group Chat or refresh Chats later."}
                         </div>
-                        <div className="vc-matrix-group-chat-list" role="list" aria-label="Invitation results">
+                        {result.invitations.length > 0 && <div className="vc-matrix-group-chat-list" role="list" aria-label="Invitation results">
                             {result.invitations.map(invitation => {
                                 const candidate = selected.get(invitation.userId) ?? {
                                     userId: invitation.userId,
@@ -703,7 +729,7 @@ function MatrixGroupChatCreateModal({
                                     </div>
                                 );
                             })}
-                        </div>
+                        </div>}
                     </>
                 )}
             </div>

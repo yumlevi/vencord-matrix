@@ -22,7 +22,11 @@ import type {
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateSearchRequest,
     MatrixGroupChatCandidateSearchResult,
+    MatrixGroupChatInviteCandidateSearchRequest,
+    MatrixGroupChatInviteCandidateSearchResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToGroupChatRequest,
+    MatrixInviteUserToGroupChatResult,
     MatrixJoinRoomResult,
     MatrixJoinSuggestedSpaceChannelsRequest,
     MatrixJoinSuggestedSpaceChannelsResult,
@@ -31,8 +35,10 @@ import type {
     MatrixMessageContextDTO,
     MatrixMessageSearchRequest,
     MatrixMessageSearchResponse,
+    MatrixPowerLevelPermissionDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixReconcileGroupChatCreateResult,
+    MatrixReconcileGroupChatInviteResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
     MatrixRequestSpaceAccessResult,
@@ -90,6 +96,8 @@ export interface MatrixShellRoom {
     roomType?: string;
     /** Creator-signed bridge group identity; takes precedence over Space and m.direct classification. */
     groupChat?: true;
+    /** Current account's fail-closed Matrix invite threshold for a joined Space or group. */
+    invitePermission?: MatrixPowerLevelPermissionDTO;
     canConfigureSpaceAccess?: boolean;
     accessRequestCount?: number;
     accessRequestCountComplete?: boolean;
@@ -233,6 +241,26 @@ export interface MatrixSecureViewRequestMap {
     searchGroupChatCandidates: {
         input: { request: MatrixGroupChatCandidateSearchRequest; };
         output: MatrixGroupChatCandidateSearchResult;
+    };
+    searchGroupChatInviteCandidates: {
+        input: { request: MatrixGroupChatInviteCandidateSearchRequest; };
+        output: MatrixGroupChatInviteCandidateSearchResult;
+    };
+    inviteUserToGroupChat: {
+        input: { request: MatrixInviteUserToGroupChatRequest; };
+        output: MatrixInviteUserToGroupChatResult;
+    };
+    reconcileGroupChatInvite: {
+        input: { roomId: string; };
+        output: MatrixReconcileGroupChatInviteResult;
+    };
+    acknowledgeGroupChatInvite: {
+        input: { request: MatrixInviteUserToGroupChatRequest; };
+        output: void;
+    };
+    overrideGroupChatInviteAmbiguity: {
+        input: { request: MatrixInviteUserToGroupChatRequest; };
+        output: void;
     };
     createGroupChat: { input: { request: MatrixCreateGroupChatRequest; }; output: MatrixCreateGroupChatResult; };
     reconcileGroupChatCreate: { input: {}; output: MatrixReconcileGroupChatCreateResult; };
