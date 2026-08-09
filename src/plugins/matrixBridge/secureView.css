@@ -1031,6 +1031,44 @@ audio.matrix-media {
     background: var(--matrix-bg);
 }
 
+.matrix-group-chat-create {
+    display: grid;
+    gap: 16px;
+}
+
+.matrix-group-chat-create > :where(p, h3, .matrix-form, .matrix-field) {
+    margin: 0;
+}
+
+.matrix-group-chat-search {
+    align-items: end;
+    grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.matrix-group-chat-identity > strong,
+.matrix-group-chat-user-id {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.matrix-group-chat-identity > strong {
+    unicode-bidi: plaintext;
+}
+
+.matrix-group-chat-user-id {
+    color: var(--matrix-text-muted);
+    direction: ltr;
+    font-size: 12px;
+    unicode-bidi: isolate;
+}
+
+.matrix-card-row > .matrix-card-actions {
+    align-items: center;
+    margin-top: 0;
+}
+
 .matrix-modal-footer {
     justify-content: flex-end;
     border-top: 1px solid var(--matrix-border);
@@ -1230,6 +1268,15 @@ audio.matrix-media {
 
     .matrix-modal {
         max-height: 100%;
+    }
+
+    .matrix-group-chat-search {
+        grid-template-columns: 1fr;
+    }
+
+    .matrix-group-chat-create .matrix-card-row {
+        align-items: stretch;
+        flex-direction: column;
     }
 }
 

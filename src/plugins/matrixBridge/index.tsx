@@ -47,6 +47,7 @@ import {
     getLatestSnapshot,
     getMatrixAccessRequestContext,
     getMatrixCategoryCreateContext,
+    getMatrixGroupChatCreateContext,
     getMatrixGroupLeaveContext,
     getMatrixInviteContext,
     getMatrixSendSessionToken,
@@ -70,8 +71,10 @@ import {
     sendMatrixMessage,
     sendMatrixSticker,
     startBridge,
+    subscribeMatrixSpaceProjection,
     suspendBridge,
 } from "./bridge";
+import { openMatrixGroupChatCreate } from "./groupCreate";
 import { openMatrixInvitePeople } from "./invite";
 import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
@@ -544,6 +547,40 @@ function MembersIcon({ height = 24, width = 24 }: IconProps) {
     );
 }
 
+function GroupAddIcon({ height = 20, width = 20 }: IconProps) {
+    return (
+        <svg aria-hidden="true" width={width} height={height} viewBox="0 0 24 24">
+            <path fill="currentColor" d="M7.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-1a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM1 20.5C1 16.4 3.7 14 7.5 14c2.1 0 3.8.7 4.9 1.9A6.9 6.9 0 0 0 11 20v1H2a1 1 0 0 1-1-1v.5Zm15-7.5h2v3h3v2h-3v3h-2v-3h-3v-2h3v-3Z" />
+        </svg>
+    );
+}
+
+function MatrixGroupChatHeaderButton() {
+    const [, setRevision] = React.useState(0);
+    React.useEffect(() => subscribeMatrixSpaceProjection(() => setRevision(value => value + 1)), []);
+    const context = getMatrixGroupChatCreateContext();
+    if (!context) return null;
+    return (
+        <Tooltip text="Create Group Chat" position="top">
+            {tooltipProps => (
+                <button
+                    {...tooltipProps}
+                    type="button"
+                    className="vc-matrix-group-chat-header-button"
+                    aria-label="Create Group Chat"
+                    onClick={() => openMatrixGroupChatCreate(context)}
+                >
+                    <GroupAddIcon />
+                </button>
+            )}
+        </Tooltip>
+    );
+}
+
+function renderMatrixGroupChatHeaderButton() {
+    return <MatrixGroupChatHeaderButton />;
+}
+
 function renderMatrixToolbar(channel: any) {
     const guildId = typeof channel.guild_id === "string" ? channel.guild_id : undefined;
     return [
@@ -609,7 +646,7 @@ function confirmLeaveMatrixGuild(guildId: string, label: string) {
     ));
 }
 
-function confirmLeaveMatrixGroup(channelId: string, label: string) {
+function confirmLeaveMatrixGroup(channelId: string, label: string, isCreator: boolean) {
     openModal(modalProps => (
         <ConfirmModal
             {...modalProps}
@@ -619,7 +656,9 @@ function confirmLeaveMatrixGroup(channelId: string, label: string) {
             variant="danger"
             onConfirm={() => void leaveMatrixGroup(channelId)}
         >
-            This leaves the Matrix group chat from this account. You may need another invitation to return.
+            {isCreator
+                ? "You created this group. Leaving removes the only invite and admin authority. You cannot be invited back unless you first transferred that authority in another Matrix client. Treat this as irreversible."
+                : "This removes the group chat from this account. You may need another invitation to return."}
         </ConfirmModal>
     ));
 }
@@ -830,23 +869,58 @@ const matrixCategoryCreateMenuPatch: NavContextMenuPatchCallback = (children, { 
     });
 };
 
-const matrixUserInviteToServerMenuPatch: NavContextMenuPatchCallback = children => {
+const MATRIX_GROUP_MUTATION_MENU_IDS = [
+    "add-recipient",
+    "remove-recipient",
+    "remove-from-group",
+    "remove",
+    "make-owner",
+    "set-owner",
+    "transfer-owner",
+    "transfer-ownership",
+    "change-icon",
+    "set-icon",
+    "edit-group",
+    "rename-group",
+    "change-name",
+    "invite-to-group",
+    "invite-people",
+    "add-friends",
+    "add-people",
+    "edit-channel",
+] as const;
+
+function isMatrixGroupMutationMenuItem(id: unknown) {
+    if (typeof id !== "string") return false;
+    const normalized = id.toLocaleLowerCase("en-US");
+    return normalized.includes("recipient")
+        || normalized.includes("owner")
+        || normalized === "remove"
+        || MATRIX_GROUP_MUTATION_MENU_IDS.some(token =>
+            token !== "remove" && (normalized === token || normalized.includes(token)));
+}
+
+const matrixUserInviteToServerMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
     const prefix = "invite-to-server--";
     removeMatrixMenuItemsWhere(children, id => typeof id === "string"
         && id.startsWith(prefix)
         && isMatrixGuildId(id.slice(prefix.length)));
+    if (channel?.id && getMatrixGroupLeaveContext(channel.id)) {
+        removeMatrixMenuItemsWhere(children, isMatrixGroupMutationMenuItem);
+    }
 };
 
 const matrixGroupLeaveMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
     const context = channel?.id ? getMatrixGroupLeaveContext(channel.id) : undefined;
     if (!context) return;
+    removeMatrixMenuItemsWhere(children, isMatrixGroupMutationMenuItem);
     const replacement = (
         <Menu.MenuItem
             key="vc-matrix-leave-group"
             id="vc-matrix-leave-group"
-            label="Leave Matrix group"
+            label="Leave Group"
             color="danger"
-            action={() => confirmLeaveMatrixGroup(context.channelId, context.label)}
+            action={() => confirmLeaveMatrixGroup(context.channelId, context.label, context.isCreator)}
         />
     );
     const leaveGroup = findGroupChildrenByChildId("leave-channel", children);
@@ -897,6 +971,16 @@ export default definePlugin({
     },
 
     patches: [
+        {
+            // Add a separate provider-backed group-chat action beside Discord's
+            // stock Create Message action. The stock component and callback are
+            // deliberately untouched so ordinary Discord DMs keep their exact path.
+            find: '"clean-up-inactive-gdms"',
+            replacement: {
+                match: /(?=\(0,\i\.jsx\)\(\i\.\i,\{tooltip:\i\.intl\.string\(\i\.t\.\i\),tooltipPosition:"top",className:\i\.\i,iconClassName:\i\.\i,icon:\i\.\i,subscribeToGlobalHotkey:!0\}\))/,
+                replace: "$self.renderMatrixGroupChatHeaderButton(),",
+            },
+        },
         {
             // Discord's lazy-image experiment can mount a synthetic room while
             // it is hidden, then never deliver a later intersection callback.
@@ -997,27 +1081,27 @@ export default definePlugin({
                 },
                 {
                     match: /addRecipient\((\i),\i,\i,\i\)\{/,
-                    replace: "$&if($self.isMatrixChannelId($1))return Promise.resolve($1);",
+                    replace: '$&if($self.isMatrixChannelId($1))return Promise.reject(new Error("Group membership changes are unavailable here."));',
                 },
                 {
                     match: /removeRecipient:\((\i),(\i)\)=>/,
-                    replace: "$&$self.isMatrixChannelId($1)?Promise.resolve():",
+                    replace: '$&$self.isMatrixChannelId($1)?Promise.reject(new Error("Group membership changes are unavailable here.")):',
                 },
                 {
                     match: /setDMOwner:\((\i),(\i)\)=>/,
-                    replace: "$&$self.isMatrixChannelId($1)?Promise.resolve():",
+                    replace: '$&$self.isMatrixChannelId($1)?Promise.reject(new Error("Group ownership changes are unavailable here.")):',
                 },
                 {
                     match: /async setName\((\i),\i\)\{/,
-                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                    replace: '$&if($self.isMatrixChannelId($1))throw new Error("Group name changes are unavailable here.");',
                 },
                 {
                     match: /async setIcon\((\i),\i,\i\)\{/,
-                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                    replace: '$&if($self.isMatrixChannelId($1))throw new Error("Group icon changes are unavailable here.");',
                 },
                 {
                     match: /async updateChannel\((\i),\i,\i\)\{/,
-                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                    replace: '$&if($self.isMatrixChannelId($1))throw new Error("Group settings changes are unavailable here.");',
                 },
             ],
         },
@@ -1331,6 +1415,7 @@ export default definePlugin({
     isMatrixMediaUrl,
     hasMatrixRecipients,
     openMatrixPrivateChannel,
+    renderMatrixGroupChatHeaderButton,
     renderMatrixToolbar,
     renderMatrixReadOnlyTitle,
     fetchMatrixMessages,

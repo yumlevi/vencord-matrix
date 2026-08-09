@@ -45,12 +45,18 @@ import type {
     MatrixConfigureSpaceAccessRequest,
     MatrixConfigureSpaceAccessResult,
     MatrixConfigureSpaceAccessStep,
+    MatrixCreateGroupChatRequest,
+    MatrixCreateGroupChatResult,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpacePartialResult,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
+    MatrixGroupChatCandidateDTO,
+    MatrixGroupChatCandidateSearchRequest,
+    MatrixGroupChatCandidateSearchResult,
+    MatrixGroupChatInvitationDTO,
     MatrixHistoryPageDTO,
     MatrixInviteUserToSpaceRequest,
     MatrixInviteUserToSpaceResult,
@@ -70,6 +76,7 @@ import type {
     MatrixPublicRoomDTO,
     MatrixReactionDTO,
     MatrixReauthenticationRequest,
+    MatrixReconcileGroupChatCreateResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRequestSpaceAccessResult,
     MatrixResolveSpaceAccessRequest,
@@ -114,6 +121,14 @@ const DEFAULT_SPACE_INVITE_DIRECTORY_LIMIT = 25;
 const MAX_SPACE_INVITE_DIRECTORY_LIMIT = 100;
 const MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH = 256;
 const SPACE_INVITE_MEMBERSHIP_CONCURRENCY = 6;
+const DEFAULT_GROUP_CHAT_DIRECTORY_LIMIT = 25;
+const MAX_GROUP_CHAT_DIRECTORY_LIMIT = 100;
+const MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH = 256;
+const MIN_GROUP_CHAT_INVITEES = 2;
+const MAX_GROUP_CHAT_INVITEES = 9;
+const GROUP_CHAT_INVITE_CONCURRENCY = 3;
+const GROUP_CHAT_DIRECTORY_CANDIDATE_TTL_MS = 5 * 60_000;
+const MAX_GROUP_CHAT_DIRECTORY_CANDIDATES = 1_000;
 const SUGGESTED_SPACE_CHANNEL_HIERARCHY_LIMIT = 100;
 const MAX_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
 const MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS = 16;
@@ -168,6 +183,9 @@ const ATTACHMENT_GROUP_CONTENT_KEY = "dev.vencord.matrix_bridge.attachment_group
 const ATTACHMENT_GROUP_ID_PATTERN = /^vcgrp_[0-9a-f]{64}$/u;
 const SPACE_CHILD_CREATION_EVENT_TYPE = "dev.vencord.matrix_bridge.space_child_creation";
 const SPACE_CHILD_CREATION_MARKER_PATTERN = /^vccreate_[0-9a-f]{64}$/u;
+const GROUP_CHAT_CREATION_EVENT_TYPE = "dev.vencord.matrix_bridge.group_chat_creation";
+const GROUP_CHAT_CREATION_CONTENT_KEY = "dev.vencord.matrix_bridge.group_chat_marker";
+const GROUP_CHAT_CREATION_MARKER_PATTERN = /^vcgroup_[0-9a-f]{64}$/u;
 const SPACE_JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
 const SDK_STANDARD_ROOM_VERSIONS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"] as const;
 const SDK_STANDARD_ROOM_VERSIONS_NEWEST_FIRST = [...SDK_STANDARD_ROOM_VERSIONS].reverse();
@@ -290,6 +308,7 @@ const timelineGenerations = new WeakMap<Room, number>();
 const historyCursors = new Map<string, HistoryCursorState>();
 const searchCursors = new Map<string, SearchCursorState>();
 const searchEventCache = new Map<string, CachedSearchEvent>();
+const groupChatDirectoryCandidates = new Map<string, number>();
 const reactionMapCache = new WeakMap<Room, Map<string, MatrixReactionDTO[]>>();
 const isolatedDecryptionEvents = new WeakSet<MatrixEvent>();
 const activeMediaReadControllers = new Set<AbortController>();
@@ -1941,6 +1960,10 @@ function localSpaceParents(room: Room): string[] {
 
 function roomKind(room: Room, directRooms: Map<string, string>): MatrixRoomKind {
     if (room.isSpaceRoom()) return "space";
+    // The creator-signed bridge identity is permanent classification state.
+    // Mutable privacy or power-level changes must not let a group collapse
+    // into m.direct or be claimed by a unilateral Space link.
+    if (groupChatRoomIdentity(room)) return "room";
     if (directRooms.has(room.roomId) || (room.getMyMembership() === "invite" && optionalUserId(room.getDMInviter()))) {
         return "dm";
     }
@@ -1948,6 +1971,7 @@ function roomKind(room: Room, directRooms: Map<string, string>): MatrixRoomKind 
 }
 
 function roomDirectUserId(room: Room, directRooms: Map<string, string>): string | undefined {
+    if (groupChatRoomIdentity(room)) return undefined;
     const mapped = directRooms.get(room.roomId);
     if (mapped && mapped !== activeCredentials?.userId) return mapped;
     if (room.getMyMembership() !== "invite") return undefined;
@@ -1969,7 +1993,7 @@ function inferredSpaceParents(): Map<string, string[]> {
         if (pendingHiddenRooms.has(parent.roomId)
             || (membership !== "join" && membership !== "invite")
             || !parent.isSpaceRoom()) continue;
-        for (const child of localSpaceChildren(parent)) {
+        for (const child of projectableSpaceChildren(parent)) {
             const parents = result.get(child.roomId) ?? [];
             if (!parents.includes(parent.roomId)) parents.push(parent.roomId);
             result.set(child.roomId, parents);
@@ -2326,9 +2350,10 @@ function normalizeRoom(
         : [];
     const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, "");
     const topicContent = topicEvent?.getContent<Record<string, any>>();
-    const spaceChildren = localSpaceChildren(room);
+    const groupChat = groupChatRoomIdentity(room) != null;
+    const spaceChildren = groupChat ? [] : projectableSpaceChildren(room);
     const roomType = publicRoomText(room.getType(), 256);
-    const parentIds = [...new Set([...localSpaceParents(room), ...(parentMap.get(room.roomId) ?? [])])]
+    const parentIds = groupChat ? [] : [...new Set([...localSpaceParents(room), ...(parentMap.get(room.roomId) ?? [])])]
         .sort()
         .slice(0, 1_000);
     const result: MatrixRoomDTO = {
@@ -2336,7 +2361,7 @@ function normalizeRoom(
         timelineGeneration: timelineGenerations.get(room) ?? 0,
         name: publicRoomText(room.name, 256) || publicRoomText(room.getCanonicalAlias(), 256) || room.roomId,
         membership,
-        kind: roomKind(room, directRooms),
+        kind: groupChat ? "room" : roomKind(room, directRooms),
         joinRule: normalizeJoinRule(room.getJoinRule()) ?? "invite",
         parentIds,
         childIds: spaceChildren.map(child => child.roomId),
@@ -2355,6 +2380,10 @@ function normalizeRoom(
     };
 
     if (roomType) result.roomType = roomType;
+    if (groupChat) result.groupChat = true;
+    const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
+    const creatorId = createEvent && !Array.isArray(createEvent) ? optionalUserId(createEvent.getSender()) : undefined;
+    if (creatorId) result.creatorId = creatorId;
     if (result.kind === "space") {
         const childPermission = spaceChildPermission(room);
         result.canManageSpaceChildren = childPermission.allowed;
@@ -2712,6 +2741,7 @@ async function disposeClient(clearStores: boolean): Promise<void> {
     historyCursors.clear();
     searchCursors.clear();
     searchEventCache.clear();
+    groupChatDirectoryCandidates.clear();
     const client = matrixClient;
     const store = matrixStore;
     const prefix = cryptoDatabasePrefix;
@@ -3399,7 +3429,7 @@ function normalizeHierarchyRoom(
 }
 
 function localHierarchyRoom(room: Room, directRooms: Map<string, string>): MatrixSpaceHierarchyRoomDTO {
-    const spaceChildren = localSpaceChildren(room);
+    const spaceChildren = projectableSpaceChildren(room);
     const roomType = publicRoomText(room.getType(), 256);
     const topicEvent = room.currentState.getStateEvents(EventType.RoomTopic, "");
     const topic = publicRoomText(topicEvent?.getContent<Record<string, unknown>>().topic, 2_048);
@@ -4630,6 +4660,30 @@ function validateSpaceInviteCandidateSearchRequest(value: unknown): Required<Mat
     return { spaceId: validateRoomId(input.spaceId), query, limit };
 }
 
+function validateGroupChatCandidateSearchRequest(value: unknown): Required<MatrixGroupChatCandidateSearchRequest> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search is invalid.");
+    }
+    const input = value as Partial<MatrixGroupChatCandidateSearchRequest>;
+    if (!Object.keys(input).every(key => key === "query" || key === "limit")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search contains unsupported fields.");
+    }
+    const query = validateString(
+        input.query,
+        "Group-chat directory search query",
+        MAX_GROUP_CHAT_DIRECTORY_QUERY_LENGTH,
+        true
+    ).trim();
+    if (/[\u0000-\u001f\u007f]/u.test(query)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search query is invalid.");
+    }
+    const limit = input.limit ?? DEFAULT_GROUP_CHAT_DIRECTORY_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_GROUP_CHAT_DIRECTORY_LIMIT) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat directory search limit is invalid.");
+    }
+    return { query, limit };
+}
+
 function validateInviteUserToSpaceRequest(value: unknown): MatrixInviteUserToSpaceRequest {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite is invalid.");
@@ -4663,6 +4717,64 @@ function requireLocalServerUserId(value: unknown): string {
         fail("MATRIX_REMOTE_USER_REJECTED", "Only users on this account's Matrix server can be invited here.");
     }
     return localUserId;
+}
+
+function validateCreateGroupChatRequest(value: unknown): MatrixCreateGroupChatRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat details are invalid.");
+    }
+    const input = value as Partial<MatrixCreateGroupChatRequest>;
+    if (!Object.keys(input).every(key => key === "name" || key === "userIds")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat details contain unsupported fields.");
+    }
+    const name = validateString(input.name, "Group-chat name", 100).trim();
+    if (!name || /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(name)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat name is invalid.");
+    }
+    if (!Array.isArray(input.userIds)
+        || input.userIds.length < MIN_GROUP_CHAT_INVITEES
+        || input.userIds.length > MAX_GROUP_CHAT_INVITEES) {
+        fail(
+            "MATRIX_INVALID_ARGUMENT",
+            `A Matrix group chat requires ${MIN_GROUP_CHAT_INVITEES} to ${MAX_GROUP_CHAT_INVITEES} other users.`
+        );
+    }
+    const userIds = input.userIds.map(requireLocalServerUserId);
+    if (new Set(userIds).size !== userIds.length) {
+        fail("MATRIX_INVALID_ARGUMENT", "Matrix group-chat invitees must be unique.");
+    }
+    if (userIds.includes(activeCredentials!.userId)) {
+        fail("MATRIX_GROUP_CHAT_SELF", "A Matrix group chat cannot invite your own account.");
+    }
+    return { name, userIds };
+}
+
+function pruneGroupChatDirectoryCandidates(now = Date.now()): void {
+    for (const [userId, expiresAt] of groupChatDirectoryCandidates) {
+        if (expiresAt <= now) groupChatDirectoryCandidates.delete(userId);
+    }
+    while (groupChatDirectoryCandidates.size > MAX_GROUP_CHAT_DIRECTORY_CANDIDATES) {
+        const oldest = groupChatDirectoryCandidates.keys().next().value;
+        if (typeof oldest !== "string") break;
+        groupChatDirectoryCandidates.delete(oldest);
+    }
+}
+
+function rememberGroupChatDirectoryCandidate(userId: string): void {
+    groupChatDirectoryCandidates.delete(userId);
+    groupChatDirectoryCandidates.set(userId, Date.now() + GROUP_CHAT_DIRECTORY_CANDIDATE_TTL_MS);
+    pruneGroupChatDirectoryCandidates();
+}
+
+function requireCurrentGroupChatDirectoryCandidates(userIds: readonly string[]): void {
+    const now = Date.now();
+    pruneGroupChatDirectoryCandidates(now);
+    if (userIds.some(userId => (groupChatDirectoryCandidates.get(userId) ?? 0) <= now)) {
+        fail(
+            "MATRIX_GROUP_CHAT_CANDIDATE_STALE",
+            "Search the Matrix user directory again before creating this group chat. No room was created."
+        );
+    }
 }
 
 type ExactSpaceInviteMembership = MatrixSpaceInviteCandidateDTO["membership"] | "ban";
@@ -4764,7 +4876,9 @@ async function searchSpaceInviteCandidates(
         if (!userId || userId === activeCredentials.userId || unique.has(userId)) continue;
         unique.add(userId);
         const candidate: { userId: string; displayName?: string; avatarUrl?: string; } = { userId };
-        const displayName = publicRoomText(raw.display_name, 256);
+        const displayName = publicRoomText(raw.display_name, 256)
+            ?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+            .trim();
         const avatarUrl = mediaUrl(raw.avatar_url, 96, 96);
         if (displayName) candidate.displayName = displayName;
         if (avatarUrl) candidate.avatarUrl = avatarUrl;
@@ -4774,6 +4888,62 @@ async function searchSpaceInviteCandidates(
     const candidates = memberships.filter((candidate): candidate is MatrixSpaceInviteCandidateDTO => candidate != null);
     return {
         spaceId: space.roomId,
+        query: request.query,
+        scope: "homeserver_user_directory",
+        candidates,
+        limited: directory.limited || locallyLimited,
+        directoryLimited: directory.limited,
+        complete: false,
+        queryRequired: false
+    };
+}
+
+async function searchGroupChatCandidates(
+    command: Extract<MatrixWorkerCommand, { type: "searchGroupChatCandidates"; }>
+): Promise<MatrixGroupChatCandidateSearchResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateGroupChatCandidateSearchRequest(command.request);
+    let directory: Awaited<ReturnType<MatrixClient["searchUserDirectory"]>>;
+    try {
+        directory = await matrixClient.searchUserDirectory({ term: request.query, limit: request.limit });
+    } catch (error) {
+        if (request.query === "" && emptyUserDirectoryQueryUnsupported(error)) {
+            return {
+                query: request.query,
+                scope: "homeserver_user_directory",
+                candidates: [],
+                limited: false,
+                directoryLimited: false,
+                complete: false,
+                queryRequired: true
+            };
+        }
+        throw error;
+    }
+    if (!directory || typeof directory !== "object" || !Array.isArray(directory.results)
+        || typeof directory.limited !== "boolean") {
+        fail("MATRIX_USER_DIRECTORY_INVALID", "Matrix returned an invalid user-directory response.");
+    }
+
+    const locallyLimited = directory.results.length > request.limit;
+    const unique = new Set<string>();
+    const candidates: MatrixGroupChatCandidateDTO[] = [];
+    for (const raw of directory.results.slice(0, request.limit)) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const userId = localServerUserId(raw.user_id);
+        if (!userId || userId === activeCredentials.userId || unique.has(userId)) continue;
+        unique.add(userId);
+        const candidate: MatrixGroupChatCandidateDTO = { userId };
+        const displayName = publicRoomText(raw.display_name, 256)
+            ?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+            .trim();
+        const avatarUrl = mediaUrl(raw.avatar_url, 96, 96);
+        if (displayName) candidate.displayName = displayName;
+        if (avatarUrl) candidate.avatarUrl = avatarUrl;
+        candidates.push(candidate);
+        rememberGroupChatDirectoryCandidate(userId);
+    }
+    return {
         query: request.query,
         scope: "homeserver_user_directory",
         candidates,
@@ -5092,14 +5262,407 @@ function roomCreationPowerLevels(roomVersion: string) {
         redact: 50,
         invite: 50
     };
-    return roomVersion === "12"
-        ? {
-            ...common,
-            // Hydra creators have infinite authority and MUST NOT appear in
-            // `users`. v12 also requires tombstone above state_default.
-            events: { [EventType.RoomTombstone]: 150 }
+    // createRoom applies each supplied top-level key over generated preset
+    // power levels. Replace the generated users/events maps so the state we
+    // attest is deterministic across homeservers. Hydra creators have
+    // infinite authority and MUST NOT appear in `users`; v12 also requires
+    // tombstone above state_default.
+    const users: Record<string, number> = roomVersion === "12"
+        ? {}
+        : { [activeCredentials!.userId]: 100 };
+    const events: Record<string, number> = roomVersion === "12"
+        ? { [EventType.RoomTombstone]: 150 }
+        : {};
+    return { ...common, users, events };
+}
+
+function validateGroupChatCreationMarker(value: unknown): string {
+    const marker = validateString(value, "Group-chat creation marker", 72);
+    if (!GROUP_CHAT_CREATION_MARKER_PATTERN.test(marker)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix group-chat creation marker is invalid.");
+    }
+    return marker;
+}
+
+function groupChatInvitationForMembership(
+    userId: string,
+    membership: ExactSpaceInviteMembership | undefined,
+    fallback: "invited" | "rejected" | "ambiguous"
+): MatrixGroupChatInvitationDTO {
+    return {
+        userId,
+        status: membership === "join" ? "joined" : membership === "invite" ? "invited" : fallback
+    };
+}
+
+async function inviteGroupChatUser(roomId: string, userId: string): Promise<MatrixGroupChatInvitationDTO> {
+    let before: ExactSpaceInviteMembership | undefined;
+    try { before = await exactSpaceInviteMembership(roomId, userId); } catch { }
+    if (before === "invite" || before === "join") {
+        return groupChatInvitationForMembership(userId, before, "invited");
+    }
+    try {
+        await matrixClient!.invite(roomId, userId);
+    } catch (error) {
+        let actual: ExactSpaceInviteMembership | undefined;
+        try { actual = await exactSpaceInviteMembership(roomId, userId); } catch { }
+        if (actual === "invite" || actual === "join") {
+            return groupChatInvitationForMembership(userId, actual, "invited");
         }
-        : { ...common, users: { [activeCredentials!.userId]: 100 } };
+        return groupChatInvitationForMembership(
+            userId,
+            actual,
+            isDefinitiveMatrixMutationRejection(error) ? "rejected" : "ambiguous"
+        );
+    }
+    let actual: ExactSpaceInviteMembership | undefined;
+    try { actual = await exactSpaceInviteMembership(roomId, userId); } catch { }
+    // A successful /invite response proves the invite even when a subsequent
+    // exact state read is temporarily unavailable.
+    return groupChatInvitationForMembership(userId, actual, "invited");
+}
+
+async function inviteGroupChatUsers(
+    roomId: string,
+    userIds: readonly string[]
+): Promise<MatrixGroupChatInvitationDTO[]> {
+    const results = new Array<MatrixGroupChatInvitationDTO>(userIds.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from(
+        { length: Math.min(GROUP_CHAT_INVITE_CONCURRENCY, userIds.length) },
+        async () => {
+            while (nextIndex < userIds.length) {
+                const index = nextIndex++;
+                results[index] = await inviteGroupChatUser(roomId, userIds[index]);
+            }
+        }
+    ));
+    return results;
+}
+
+function matrixRoomStateContent(room: Room, eventType: string): Record<string, unknown> | undefined {
+    const event = room.currentState.getStateEvents(eventType, "");
+    if (!event || Array.isArray(event)) return undefined;
+    const content: unknown = event.getContent();
+    return content && typeof content === "object" && !Array.isArray(content)
+        ? content as Record<string, unknown>
+        : undefined;
+}
+
+function exactGroupChatPowerLevel(
+    content: Record<string, unknown>,
+    key: string,
+    expected: number,
+    roomVersion: string
+): boolean {
+    if (!Object.hasOwn(content, key)) return false;
+    const parsed = parseMatrixPowerLevel(content[key], roomVersion);
+    return parsed.valid && parsed.value === expected;
+}
+
+function exactGroupChatPowerLevelContent(
+    content: Record<string, unknown>,
+    creatorId: string,
+    roomVersion: string
+): boolean {
+    if (!exactGroupChatPowerLevel(content, "users_default", 0, roomVersion)
+        || !exactGroupChatPowerLevel(content, "events_default", 0, roomVersion)
+        || !exactGroupChatPowerLevel(content, "state_default", 50, roomVersion)
+        || !exactGroupChatPowerLevel(content, "invite", 50, roomVersion)
+        || !exactGroupChatPowerLevel(content, "kick", 50, roomVersion)
+        || !exactGroupChatPowerLevel(content, "ban", 50, roomVersion)
+        || !exactGroupChatPowerLevel(content, "redact", 50, roomVersion)) return false;
+
+    const hasUsers = Object.hasOwn(content, "users");
+    const usersValue = content.users;
+    if (hasUsers && (!usersValue || typeof usersValue !== "object" || Array.isArray(usersValue))) return false;
+    const users = hasUsers ? usersValue as Record<string, unknown> : undefined;
+    if (roomVersion === "12") {
+        if (users && Object.hasOwn(users, creatorId)) return false;
+    } else if (!users || !Object.hasOwn(users, creatorId)) {
+        return false;
+    }
+    if (users) {
+        for (const [userIdValue, levelValue] of Object.entries(users)) {
+            let userId: string;
+            try { userId = validateUserId(userIdValue); } catch { return false; }
+            const parsed = parseMatrixPowerLevel(levelValue, roomVersion);
+            if (!parsed.valid || (userId === creatorId
+                ? roomVersion === "12" || parsed.value !== 100
+                : parsed.value > 0)) return false;
+        }
+    }
+
+    const hasEvents = Object.hasOwn(content, "events");
+    const eventsValue = content.events;
+    if (roomVersion === "12") {
+        if (!eventsValue || typeof eventsValue !== "object" || Array.isArray(eventsValue)) return false;
+        const events = eventsValue as Record<string, unknown>;
+        if (Object.keys(events).length !== 1) return false;
+        const tombstone = parseMatrixPowerLevel(events[EventType.RoomTombstone], roomVersion);
+        return tombstone.valid && tombstone.value === 150;
+    }
+    return !hasEvents || (eventsValue != null && typeof eventsValue === "object" && !Array.isArray(eventsValue)
+        && Object.keys(eventsValue as Record<string, unknown>).length === 0);
+}
+
+function exactGroupChatPowerLevels(room: Room, creatorId: string, roomVersion: string): boolean {
+    const event = room.currentState.getStateEvents(EventType.RoomPowerLevels, "");
+    if (!event || Array.isArray(event) || event.getSender() !== creatorId) return false;
+    const rawContent: unknown = event.getContent();
+    return Boolean(rawContent && typeof rawContent === "object" && !Array.isArray(rawContent)
+        && exactGroupChatPowerLevelContent(rawContent as Record<string, unknown>, creatorId, roomVersion));
+}
+
+interface GroupChatRoomContract {
+    creatorId: string;
+    creationMarker: string;
+    roomVersion: string;
+}
+
+function exactGroupChatCreationContent(creation: Record<string, unknown>, roomVersion: string): boolean {
+    if (creation["m.federate"] !== false || Object.hasOwn(creation, "type")) return false;
+    if (!Object.hasOwn(creation, "additional_creators")) return true;
+    return roomVersion === "12" && Array.isArray(creation.additional_creators)
+        && creation.additional_creators.length === 0;
+}
+
+function validGroupChatCreationMarker(value: unknown): string | undefined {
+    return typeof value === "string" && GROUP_CHAT_CREATION_MARKER_PATTERN.test(value)
+        ? value
+        : undefined;
+}
+
+function groupChatStateMarker(room: Room, creatorId: string): string | undefined {
+    const markerEvent = room.currentState.getStateEvents(GROUP_CHAT_CREATION_EVENT_TYPE, "");
+    if (!markerEvent || Array.isArray(markerEvent) || markerEvent.getSender() !== creatorId) return undefined;
+    const rawMarkerContent: unknown = markerEvent.getContent();
+    if (!rawMarkerContent || typeof rawMarkerContent !== "object" || Array.isArray(rawMarkerContent)) return undefined;
+    const { marker } = rawMarkerContent as Record<string, unknown>;
+    return validGroupChatCreationMarker(marker);
+}
+
+function groupChatRoomIdentity(room: Room): GroupChatRoomContract | undefined {
+    if (room.isSpaceRoom()) return undefined;
+    const roomVersion = room.getVersion();
+    if (!(SDK_STANDARD_ROOM_VERSIONS as readonly string[]).includes(roomVersion)) return undefined;
+    const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
+    if (!createEvent || Array.isArray(createEvent)) return undefined;
+    let creatorId: string;
+    try { creatorId = validateUserId(createEvent.getSender()); } catch { return undefined; }
+    const createContent: unknown = createEvent.getContent();
+    if (!createContent || typeof createContent !== "object" || Array.isArray(createContent)) return undefined;
+    const creation = createContent as Record<string, unknown>;
+    if (!exactGroupChatCreationContent(creation, roomVersion)) return undefined;
+    // Custom state is not guaranteed to be present in stripped invite state,
+    // while m.room.create is. New groups carry their marker in the immutable
+    // creator-signed create event; retain the state-event fallback for rooms
+    // created by earlier bridge builds.
+    const hasCreateMarker = Object.hasOwn(creation, GROUP_CHAT_CREATION_CONTENT_KEY);
+    const creationMarker = hasCreateMarker
+        ? validGroupChatCreationMarker(creation[GROUP_CHAT_CREATION_CONTENT_KEY])
+        : groupChatStateMarker(room, creatorId);
+    if (!creationMarker) return undefined;
+    return { creatorId, creationMarker, roomVersion };
+}
+
+function groupChatRoomContract(room: Room): GroupChatRoomContract | undefined {
+    const identity = groupChatRoomIdentity(room);
+    if (!identity) return undefined;
+    const encryption = matrixRoomStateContent(room, EventType.RoomEncryption);
+    const joinRules = matrixRoomStateContent(room, EventType.RoomJoinRules);
+    const history = matrixRoomStateContent(room, EventType.RoomHistoryVisibility);
+    const guest = matrixRoomStateContent(room, EventType.RoomGuestAccess);
+    if (encryption?.algorithm !== "m.megolm.v1.aes-sha2"
+        || joinRules?.join_rule !== JoinRule.Invite
+        || history?.history_visibility !== HistoryVisibility.Joined
+        || guest?.guest_access !== GuestAccess.Forbidden
+        || groupChatStateMarker(room, identity.creatorId) !== identity.creationMarker
+        || !exactGroupChatPowerLevels(room, identity.creatorId, identity.roomVersion)) return undefined;
+    return identity;
+}
+
+function attestedGroupChatRoom(room: Room, creationMarker: string): boolean {
+    if (!activeCredentials || room.getMyMembership() !== "join") return false;
+    const contract = groupChatRoomContract(room);
+    return contract?.creatorId === activeCredentials.userId
+        && contract.creationMarker === creationMarker;
+}
+
+function projectableSpaceChildren(room: Room): MatrixSpaceChildDTO[] {
+    return localSpaceChildren(room).filter(child => {
+        const childRoom = matrixClient?.getRoom(child.roomId);
+        return !childRoom || !groupChatRoomIdentity(childRoom);
+    });
+}
+
+interface RawGroupChatStateEvent {
+    sender: string;
+    content: Record<string, unknown>;
+}
+
+function rawGroupChatStateEvent(
+    state: unknown[],
+    eventType: string,
+    stateKey: string
+): RawGroupChatStateEvent | undefined {
+    const matches = state.filter(value => value && typeof value === "object" && !Array.isArray(value)
+        && (value as Record<string, unknown>).type === eventType
+        && (value as Record<string, unknown>).state_key === stateKey);
+    if (matches.length !== 1) return undefined;
+    const raw = matches[0] as Record<string, unknown>;
+    let sender: string;
+    try { sender = validateUserId(raw.sender); } catch { return undefined; }
+    if (!raw.content || typeof raw.content !== "object" || Array.isArray(raw.content)) return undefined;
+    return { sender, content: raw.content as Record<string, unknown> };
+}
+
+async function attestCreatedGroupChatState(
+    roomId: string,
+    roomVersion: string,
+    creationMarker: string
+): Promise<boolean> {
+    if (!activeCredentials || !matrixClient) return false;
+    let state: unknown;
+    try { state = await matrixClient.roomState(roomId); } catch { return false; }
+    if (!Array.isArray(state) || state.length > 10_000) return false;
+    const create = rawGroupChatStateEvent(state, EventType.RoomCreate, "");
+    if (!create || create.sender !== activeCredentials.userId
+        || !exactGroupChatCreationContent(create.content, roomVersion)
+        || create.content[GROUP_CHAT_CREATION_CONTENT_KEY] !== creationMarker) return false;
+    const marker = rawGroupChatStateEvent(state, GROUP_CHAT_CREATION_EVENT_TYPE, "");
+    const encryption = rawGroupChatStateEvent(state, EventType.RoomEncryption, "");
+    const joinRules = rawGroupChatStateEvent(state, EventType.RoomJoinRules, "");
+    const history = rawGroupChatStateEvent(state, EventType.RoomHistoryVisibility, "");
+    const guest = rawGroupChatStateEvent(state, EventType.RoomGuestAccess, "");
+    const powerLevels = rawGroupChatStateEvent(state, EventType.RoomPowerLevels, "");
+    const ownMembership = rawGroupChatStateEvent(state, EventType.RoomMember, activeCredentials.userId);
+    return marker?.sender === create.sender && marker.content.marker === creationMarker
+        && encryption?.content.algorithm === "m.megolm.v1.aes-sha2"
+        && joinRules?.content.join_rule === JoinRule.Invite
+        && history?.content.history_visibility === HistoryVisibility.Joined
+        && guest?.content.guest_access === GuestAccess.Forbidden
+        && powerLevels?.sender === create.sender
+        && exactGroupChatPowerLevelContent(powerLevels.content, create.sender, roomVersion)
+        && ownMembership?.content.membership === "join";
+}
+
+async function createGroupChat(
+    command: Extract<MatrixWorkerCommand, { type: "createGroupChat"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixCreateGroupChatResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateCreateGroupChatRequest(command.request);
+    requireCurrentGroupChatDirectoryCandidates(request.userIds);
+    const creationMarker = validateGroupChatCreationMarker(command.creationMarker);
+    const roomVersion = await selectCreationRoomVersion(false);
+    let roomId: string;
+    try {
+        mutationDispatched();
+        const created = await matrixClient.createRoom({
+            name: request.name,
+            visibility: Visibility.Private,
+            preset: Preset.PrivateChat,
+            room_version: roomVersion,
+            creation_content: {
+                "m.federate": false,
+                [GROUP_CHAT_CREATION_CONTENT_KEY]: creationMarker
+            },
+            power_level_content_override: roomCreationPowerLevels(roomVersion),
+            initial_state: [{
+                type: EventType.RoomJoinRules,
+                state_key: "",
+                content: { join_rule: JoinRule.Invite }
+            }, {
+                type: EventType.RoomHistoryVisibility,
+                state_key: "",
+                content: { history_visibility: HistoryVisibility.Joined }
+            }, {
+                type: EventType.RoomGuestAccess,
+                state_key: "",
+                content: { guest_access: GuestAccess.Forbidden }
+            }, {
+                type: EventType.RoomEncryption,
+                state_key: "",
+                content: { algorithm: "m.megolm.v1.aes-sha2" }
+            }, {
+                type: GROUP_CHAT_CREATION_EVENT_TYPE,
+                state_key: "",
+                content: { marker: creationMarker }
+            }]
+        });
+        roomId = validateRoomId(created?.room_id);
+        if (!await attestCreatedGroupChatState(roomId, roomVersion, creationMarker)) {
+            fail(
+                "MATRIX_CREATE_GROUP_CHAT_AMBIGUOUS",
+                "Matrix created a group chat, but its locked private-room state could not be confirmed. Reconcile it before trying again."
+            );
+        }
+    } catch (error) {
+        if (isDefinitiveCreateRoomRejection(error)) {
+            fail(
+                "MATRIX_CREATE_GROUP_CHAT_REJECTED",
+                "The Matrix homeserver rejected group-chat creation. No room was created."
+            );
+        }
+        fail(
+            "MATRIX_CREATE_GROUP_CHAT_AMBIGUOUS",
+            "Matrix group-chat creation may have succeeded. Reconcile it before trying again."
+        );
+    }
+
+    const invitations = await inviteGroupChatUsers(roomId, request.userIds);
+    const result: MatrixCreateGroupChatResult = {
+        roomId,
+        name: request.name,
+        invitations,
+        complete: invitations.every(invitation => invitation.status === "invited" || invitation.status === "joined")
+    };
+    const room = matrixClient.getRoom(roomId);
+    if (room) {
+        try { emitRoom(room); } catch { }
+    }
+    return result;
+}
+
+async function reconcileGroupChatCreate(
+    command: Extract<MatrixWorkerCommand, { type: "reconcileGroupChatCreate"; }>
+): Promise<MatrixReconcileGroupChatCreateResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const creationMarker = validateGroupChatCreationMarker(command.creationMarker);
+    const request = validateCreateGroupChatRequest({ name: command.name, userIds: command.userIds });
+    const rooms = matrixClient.getRooms();
+    if (rooms.length > 10_000) {
+        fail("MATRIX_GROUP_CHAT_RECONCILE_INCOMPLETE", "There are too many joined rooms to reconcile safely.");
+    }
+    // A marker is visible to invitees. Count only rooms whose immutable
+    // creator and full locked privacy/PL contract attest this account; foreign
+    // marker copies and unilateral invitations cannot poison reconciliation.
+    const matches = rooms.filter(room => attestedGroupChatRoom(room, creationMarker));
+    if (matches.length > 1) {
+        fail("MATRIX_GROUP_CHAT_RECONCILE_CONFLICT", "Multiple Matrix rooms used the same group-chat creation marker.");
+    }
+    if (!matches.length) return { status: "pending" };
+    const room = matches[0];
+    if (!await exactOwnJoinedRoom(room.roomId)) {
+        fail("MATRIX_GROUP_CHAT_RECONCILE_CONFLICT", "The recovered Matrix room did not match the private group-chat contract.");
+    }
+    const invitations = await Promise.all(request.userIds.map(async userId => {
+        let membership: ExactSpaceInviteMembership | undefined;
+        try { membership = await exactSpaceInviteMembership(room.roomId, userId); } catch { }
+        // An absent membership cannot distinguish an unattempted invite from a
+        // lost response or a recipient who already declined. Never resend here.
+        return groupChatInvitationForMembership(userId, membership, "ambiguous");
+    }));
+    return {
+        status: "resolved",
+        result: {
+            roomId: room.roomId,
+            name: request.name,
+            invitations,
+            complete: invitations.every(invitation => invitation.status === "invited" || invitation.status === "joined")
+        }
+    };
 }
 
 async function createSpace(
@@ -5559,7 +6122,8 @@ async function openDirectMessage(
         .map(room => room.roomId);
     for (const roomId of [...classifiedRoomIds, ...remainingRoomIds].slice(0, MAX_SNAPSHOT_ROOMS)) {
         const room = matrixClient!.getRoom(roomId);
-        if (!room || room.getMyMembership() !== "join" || room.isSpaceRoom()) continue;
+        if (!room || room.getMyMembership() !== "join" || room.isSpaceRoom()
+            || groupChatRoomIdentity(room)) continue;
         // Classified DMs should be fully verified even when lazy member loading
         // is enabled. For unclassified rooms, current state is enough to recover
         // a just-created/joined two-person room after m.direct persistence failed,
@@ -6700,7 +7264,7 @@ function searchScopeRooms(scope: MatrixMessageSearchRequest["scope"]): SearchSco
             roomId: room.roomId,
             space: room.isSpaceRoom(),
             declaredChildIds: room.isSpaceRoom()
-                ? localSpaceChildren(room).map(child => child.roomId)
+                ? projectableSpaceChildren(room).map(child => child.roomId)
                 : [],
             parentIds: localSpaceParents(room)
         })),
@@ -7518,6 +8082,9 @@ async function handleCommand(
         case "resolveSpaceAccessRequest": return await resolveSpaceAccessRequest(command);
         case "searchSpaceInviteCandidates": return await searchSpaceInviteCandidates(command);
         case "inviteUserToSpace": return await inviteUserToSpace(command, mutationDispatched);
+        case "searchGroupChatCandidates": return await searchGroupChatCandidates(command);
+        case "createGroupChat": return await createGroupChat(command, mutationDispatched);
+        case "reconcileGroupChatCreate": return await reconcileGroupChatCreate(command);
         case "createSpaceChild": return await createSpaceChild(command, mutationDispatched);
         case "reconcileSpaceChildCreate": return await reconcileSpaceChildCreate(command);
         case "repairSpaceChildLink": return await repairSpaceChildLink(command);
@@ -7631,7 +8198,7 @@ function lifecycleCommand(command: MatrixWorkerCommand): boolean {
 }
 
 function mutationSignalCommand(command: MatrixWorkerCommand): boolean {
-    return command.type === "createSpace" || command.type === "createSpaceChild"
+    return command.type === "createSpace" || command.type === "createSpaceChild" || command.type === "createGroupChat"
         || command.type === "inviteUserToSpace" || command.type === "acceptInvite"
         || command.type === "rejectInvite" || command.type === "joinSuggestedSpaceChannels"
         || command.type === "joinRoom" || command.type === "joinRoomAddress";
@@ -7645,6 +8212,7 @@ function concurrentLane(command: MatrixWorkerCommand): BoundedLane | undefined {
         case "messageContext":
         case "searchMessages":
         case "searchSpaceInviteCandidates":
+        case "searchGroupChatCandidates":
         case "urlPreview": return metadataLane;
         default: return undefined;
     }

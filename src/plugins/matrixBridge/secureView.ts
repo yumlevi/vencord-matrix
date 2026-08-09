@@ -22,6 +22,9 @@ import type {
     MatrixBridgeEvent,
     MatrixBridgeStatus,
     MatrixConfigureSpaceAccessResult,
+    MatrixCreateGroupChatResult,
+    MatrixGroupChatCandidateDTO,
+    MatrixGroupChatInvitationStatus,
     MatrixHistoryPageDTO,
     MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMessageDTO,
@@ -40,7 +43,7 @@ import type {
 } from "./types";
 
 type Child = Node | string | number | false | null | undefined;
-type Overlay = "createSpace" | "directMessage" | "search" | "suggestedChannels" | null;
+type Overlay = "createSpace" | "directMessage" | "groupChat" | "search" | "suggestedChannels" | null;
 type AuthMode = "login" | "register" | "token";
 type MediaState = "loading" | "ready" | "error";
 type MediaTombstone = "error" | "evicted" | "deferred";
@@ -105,6 +108,12 @@ interface SpaceAccessDraft {
     joinName: string;
 }
 
+interface SecureGroupChatCandidate extends MatrixGroupChatCandidateDTO {
+    provenanceAt: number;
+}
+
+type GroupChatPhase = "checking" | "pick" | "review" | "unconfirmed" | "result";
+
 interface PendingUploadItem {
     file: File;
     txnId: string;
@@ -132,6 +141,10 @@ const JOIN_NAME_MAX_LENGTH = 64;
 const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
 const MATRIX_ROOM_ADDRESS_PATTERN = /^(?:#[^\s:]+:[^\s]+|![^\s:]+(?::[^\s]+)?)$/u;
 const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const UNSAFE_GROUP_CHAT_TEXT_PATTERN = /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const GROUP_CHAT_PROVENANCE_REFRESH_MS = 4 * 60_000 + 45_000;
+const MAX_GROUP_CHAT_RECIPIENTS = 9;
+const MIN_GROUP_CHAT_RECIPIENTS = 2;
 const host = window.MatrixSecureViewHost;
 function requireRoot() {
     const result = document.getElementById("matrix-secure-view-root");
@@ -184,6 +197,25 @@ let spaceCreationInFlight = false;
 let joinAddressBusy = false;
 let joinNameBusy = false;
 let directMessageBusy = false;
+let groupChatPhase: GroupChatPhase = "checking";
+let groupChatExpectedUserId: string | undefined;
+let groupChatName = "";
+let groupChatQuery = "";
+let groupChatCandidates: SecureGroupChatCandidate[] = [];
+let groupChatSelected = new Map<string, SecureGroupChatCandidate>();
+let groupChatSearchBusy = false;
+let groupChatCreateBusy = false;
+let groupChatReconcileBusy = false;
+let groupChatAckBusy = false;
+let groupChatSearched = false;
+let groupChatLimited = false;
+let groupChatError = "";
+let groupChatResult: MatrixCreateGroupChatResult | undefined;
+let groupChatResultAcknowledged = false;
+let groupChatAmbiguityLocked = false;
+let groupChatOverlayGeneration = 0;
+let groupChatSearchSerial = 0;
+let groupChatExpiryTimer: ReturnType<typeof setTimeout> | undefined;
 let suggestedChannelsLoading: string | undefined;
 let suggestedChannelPlan: MatrixSuggestedSpaceChannelPlanDTO | undefined;
 let suggestedChannelExpectedUserId: string | undefined;
@@ -373,6 +405,111 @@ function visibleRequesterUserId(value: string) {
         `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
 }
 
+function cleanGroupChatText(value: string, limit: number) {
+    return value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").trim().slice(0, limit);
+}
+
+function groupChatDisplayName(candidate: MatrixGroupChatCandidateDTO) {
+    return cleanGroupChatText(candidate.displayName ?? "", 100) || "Account";
+}
+
+function clearGroupChatOverlayState() {
+    groupChatOverlayGeneration++;
+    groupChatSearchSerial++;
+    if (groupChatExpiryTimer) clearTimeout(groupChatExpiryTimer);
+    groupChatExpiryTimer = undefined;
+    groupChatPhase = "checking";
+    groupChatExpectedUserId = undefined;
+    groupChatName = "";
+    groupChatQuery = "";
+    groupChatCandidates = [];
+    groupChatSelected = new Map();
+    groupChatSearchBusy = false;
+    groupChatCreateBusy = false;
+    groupChatReconcileBusy = false;
+    groupChatAckBusy = false;
+    groupChatSearched = false;
+    groupChatLimited = false;
+    groupChatError = "";
+    groupChatResult = undefined;
+    groupChatResultAcknowledged = false;
+    groupChatAmbiguityLocked = false;
+}
+
+function groupChatOperationCurrent(generation: number, expectedUserId: string) {
+    return generation === groupChatOverlayGeneration
+        && overlay === "groupChat"
+        && groupChatExpectedUserId === expectedUserId
+        && isCurrentSecureAccount(expectedUserId);
+}
+
+function groupChatCreateError(error: unknown) {
+    const code = errorCode(error);
+    if (code === "MATRIX_GROUP_CHAT_CANDIDATE_STALE") {
+        return "Those search results expired. Search again and reselect people. No group chat was created.";
+    }
+    if (code === "MATRIX_CREATE_GROUP_CHAT_REJECTED") {
+        return "The account provider rejected this group chat. No group chat was created.";
+    }
+    if (code === "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED") {
+        return "The account provider cannot create a compatible group chat. No group chat was created.";
+    }
+    if (code === "MATRIX_REMOTE_USER_REJECTED" || code === "MATRIX_GROUP_CHAT_SELF"
+        || code === "MATRIX_INVALID_ARGUMENT") {
+        return "One or more selected accounts are not eligible for this group. Search again and reselect people. No group chat was created.";
+    }
+    if (code === "MATRIX_CREATE_GROUP_CHAT_AMBIGUOUS"
+        || code === "MATRIX_CREATE_GROUP_CHAT_RECONCILE_REQUIRED") {
+        return "The provider could not confirm whether the group chat was created. Check its status before doing anything else.";
+    }
+    if (code === "MATRIX_CREATE_GROUP_CHAT_IN_PROGRESS"
+        || code === "MATRIX_CREATE_GROUP_CHAT_RECONCILE_IN_PROGRESS") {
+        return "Another window is handling group chat creation. Check its status and your chat list before any new attempt.";
+    }
+    if (code === "MATRIX_CREATE_GROUP_CHAT_STATE_CORRUPT"
+        || code === "MATRIX_CREATE_GROUP_CHAT_STATE_WRITE_FAILED") {
+        return "Creation safety state could not be verified. Inspect your chat list and check status before any new attempt.";
+    }
+    return "The account provider could not create this group chat. Try again.";
+}
+
+function groupChatInvitationLabel(status: MatrixGroupChatInvitationStatus) {
+    switch (status) {
+        case "invited": return "Invitation requested";
+        case "joined": return "Joined";
+        case "rejected": return "Invitation rejected";
+        case "ambiguous": return "Invitation unconfirmed";
+    }
+}
+
+function scheduleGroupChatExpiry(generation: number, expectedUserId: string) {
+    if (groupChatExpiryTimer) clearTimeout(groupChatExpiryTimer);
+    const candidates = [...groupChatCandidates, ...groupChatSelected.values()];
+    if (!candidates.length) {
+        groupChatExpiryTimer = undefined;
+        return;
+    }
+    const earliest = Math.min(...candidates.map(candidate =>
+        candidate.provenanceAt + GROUP_CHAT_PROVENANCE_REFRESH_MS));
+    groupChatExpiryTimer = setTimeout(() => {
+        groupChatExpiryTimer = undefined;
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        const now = Date.now();
+        const previousCandidates = groupChatCandidates.length;
+        const previousSelected = groupChatSelected.size;
+        groupChatCandidates = groupChatCandidates.filter(candidate =>
+            now - candidate.provenanceAt < GROUP_CHAT_PROVENANCE_REFRESH_MS);
+        groupChatSelected = new Map([...groupChatSelected].filter(([, candidate]) =>
+            now - candidate.provenanceAt < GROUP_CHAT_PROVENANCE_REFRESH_MS));
+        if (groupChatCandidates.length !== previousCandidates || groupChatSelected.size !== previousSelected) {
+            groupChatPhase = "pick";
+            groupChatError = "Search results expired. Search again and reselect people before creating the group.";
+            scheduleRender();
+        }
+        scheduleGroupChatExpiry(generation, expectedUserId);
+    }, Math.max(0, earliest - Date.now()));
+}
+
 function actualAccessLabel(access: MatrixSpaceAccessSummaryDTO) {
     const listed = access.directoryVisibility === "public" ? "listed" : "unlisted";
     const admission = access.joinRule === "public"
@@ -462,8 +599,8 @@ function isSpace(room: Pick<MatrixRoomDTO, "kind" | "roomType">) {
     return room.kind === "space" || room.roomType === "m.space";
 }
 
-function isDirect(room: Pick<MatrixRoomDTO, "kind" | "directUserId">) {
-    return room.kind === "dm" || Boolean(room.directUserId);
+function isDirect(room: Pick<MatrixRoomDTO, "kind" | "directUserId" | "groupChat">) {
+    return room.groupChat !== true && (room.kind === "dm" || Boolean(room.directUserId));
 }
 
 function selectedRoom() {
@@ -600,6 +737,7 @@ function clearSensitiveUiState() {
     joinAddressBusy = false;
     joinNameBusy = false;
     directMessageBusy = false;
+    clearGroupChatOverlayState();
     suggestedChannelsLoading = undefined;
     suggestedChannelPlan = undefined;
     suggestedChannelExpectedUserId = undefined;
@@ -2118,6 +2256,236 @@ function queuePreview(message: MatrixMessageDTO, force = false) {
     });
 }
 
+function setSecureGroupChatResult(result: MatrixCreateGroupChatResult) {
+    groupChatResult = result;
+    groupChatResultAcknowledged = false;
+    groupChatPhase = "result";
+    groupChatError = "";
+    groupChatAmbiguityLocked = false;
+}
+
+async function acknowledgeSecureGroupChat(openAfter: boolean) {
+    const expectedUserId = groupChatExpectedUserId;
+    const result = groupChatResult;
+    const generation = groupChatOverlayGeneration;
+    if (!host || !expectedUserId || !result || !groupChatOperationCurrent(generation, expectedUserId)
+        || !roomById(result.roomId) || groupChatAckBusy || groupChatCreateBusy || groupChatReconcileBusy) return;
+    if (groupChatResultAcknowledged) {
+        if (openAfter && !roomById(result.roomId)) {
+            groupChatError = "The group chat was created and confirmed, but it has not appeared yet. Refresh Chats later.";
+            scheduleRender();
+            return;
+        }
+        overlay = null;
+        clearGroupChatOverlayState();
+        if (openAfter) setRoute({ kind: "room", roomId: result.roomId });
+        scheduleRender();
+        return;
+    }
+    groupChatAckBusy = true;
+    groupChatError = "";
+    scheduleRender();
+    try {
+        await host.request({ type: "acknowledgeGroupChatCreate", roomId: result.roomId });
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        groupChatResultAcknowledged = true;
+        if (openAfter && !roomById(result.roomId)) {
+            showToast("Group chat created and confirmed. Refresh Chats to open it.", "info");
+            overlay = null;
+            clearGroupChatOverlayState();
+            return;
+        }
+        overlay = null;
+        clearGroupChatOverlayState();
+        if (openAfter) setRoute({ kind: "room", roomId: result.roomId });
+    } catch {
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        groupChatError = "The group chat was created, but its local creation receipt could not be confirmed as cleared. Keep this result open and try Done or Open Group Chat again. Do not create another group chat.";
+    } finally {
+        if (groupChatOperationCurrent(generation, expectedUserId)) groupChatAckBusy = false;
+        scheduleRender();
+    }
+}
+
+async function reconcileSecureGroupChat(
+    generation: number,
+    expectedUserId: string,
+    afterAmbiguity: boolean
+) {
+    if (!host || !groupChatOperationCurrent(generation, expectedUserId) || groupChatReconcileBusy) return;
+    groupChatReconcileBusy = true;
+    groupChatError = "";
+    scheduleRender();
+    try {
+        const result = await host.request({ type: "reconcileGroupChatCreate" });
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        if (result.status === "resolved") {
+            setSecureGroupChatResult(result.result);
+        } else if (result.status === "pending" || afterAmbiguity || groupChatAmbiguityLocked) {
+            groupChatAmbiguityLocked = true;
+            groupChatPhase = "unconfirmed";
+            groupChatError = "Creation is still unconfirmed. Check again later and inspect your chat list before any new attempt.";
+        } else {
+            groupChatPhase = "pick";
+        }
+    } catch {
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        if (afterAmbiguity) groupChatAmbiguityLocked = true;
+        groupChatPhase = "unconfirmed";
+        groupChatError = afterAmbiguity
+            ? "Creation is unconfirmed and its status could not be checked. Inspect your chat list and check again later."
+            : "The provider could not verify whether an earlier group chat creation is pending. Check again before creating one.";
+    } finally {
+        if (groupChatOperationCurrent(generation, expectedUserId)) {
+            groupChatReconcileBusy = false;
+            scheduleRender();
+        }
+    }
+}
+
+function openGroupChatOverlay() {
+    const expectedUserId = config?.userId;
+    if (!expectedUserId || !isCurrentSecureAccount(expectedUserId)) {
+        showToast("The signed-in account changed. Refresh and try again.", "error");
+        return;
+    }
+    clearGroupChatOverlayState();
+    overlay = "groupChat";
+    groupChatExpectedUserId = expectedUserId;
+    groupChatPhase = "checking";
+    const generation = groupChatOverlayGeneration;
+    scheduleRender();
+    void reconcileSecureGroupChat(generation, expectedUserId, false);
+}
+
+function searchSecureGroupChatCandidates() {
+    const expectedUserId = groupChatExpectedUserId;
+    const generation = groupChatOverlayGeneration;
+    const query = cleanGroupChatText(groupChatQuery, 256);
+    if (!host || !expectedUserId || !groupChatOperationCurrent(generation, expectedUserId)
+        || groupChatSearchBusy || groupChatCreateBusy) return;
+    if (!query) {
+        groupChatError = "Enter a name or full account ID to search.";
+        scheduleRender();
+        return;
+    }
+    const serial = ++groupChatSearchSerial;
+    groupChatQuery = query;
+    groupChatSearchBusy = true;
+    groupChatSearched = true;
+    groupChatError = "";
+    scheduleRender();
+    void host.request({
+        type: "searchGroupChatCandidates",
+        request: { query, limit: 25 },
+    }).then(result => {
+        if (!groupChatOperationCurrent(generation, expectedUserId)
+            || serial !== groupChatSearchSerial || result.query !== query) return;
+        const provenanceAt = Date.now();
+        groupChatCandidates = result.candidates.map(candidate => ({ ...candidate, provenanceAt }));
+        groupChatLimited = result.limited || result.directoryLimited;
+        const byUserId = new Map(groupChatCandidates.map(candidate => [candidate.userId, candidate]));
+        groupChatSelected = new Map([...groupChatSelected].map(([userId, candidate]) =>
+            [userId, byUserId.get(userId) ?? candidate]));
+        scheduleGroupChatExpiry(generation, expectedUserId);
+    }).catch(error => {
+        if (!groupChatOperationCurrent(generation, expectedUserId) || serial !== groupChatSearchSerial) return;
+        groupChatCandidates = [];
+        groupChatLimited = false;
+        groupChatError = errorCode(error) === "MATRIX_GROUP_CHAT_SEARCH_BUSY"
+            ? "Another account search is still running. Wait for it to finish, then search again."
+            : "Your account provider could not search its user directory. Try again.";
+    }).finally(() => {
+        if (groupChatOperationCurrent(generation, expectedUserId) && serial === groupChatSearchSerial) {
+            groupChatSearchBusy = false;
+            scheduleRender();
+        }
+    });
+}
+
+function reviewSecureGroupChat() {
+    const expectedUserId = groupChatExpectedUserId;
+    if (!expectedUserId || !groupChatOperationCurrent(groupChatOverlayGeneration, expectedUserId)) return;
+    const name = cleanGroupChatText(groupChatName, 100);
+    if (!name) {
+        groupChatError = "Enter a group chat name.";
+    } else if (groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS) {
+        groupChatError = "Select at least two people.";
+    } else if ([...groupChatSelected.values()].some(candidate =>
+        Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS)) {
+        groupChatPhase = "pick";
+        groupChatError = "Some selected search results expired. Search again and reselect those people.";
+    } else {
+        groupChatName = name;
+        groupChatError = "";
+        groupChatPhase = "review";
+    }
+    scheduleRender();
+}
+
+async function createSecureGroupChat() {
+    const expectedUserId = groupChatExpectedUserId;
+    const generation = groupChatOverlayGeneration;
+    if (!host || !expectedUserId || !groupChatOperationCurrent(generation, expectedUserId)
+        || groupChatCreateBusy || groupChatAmbiguityLocked
+        || groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS) return;
+    if ([...groupChatSelected.values()].some(candidate =>
+        Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS)) {
+        groupChatPhase = "pick";
+        groupChatError = "Those search results expired. Search again and reselect people.";
+        scheduleRender();
+        return;
+    }
+    const request = {
+        name: cleanGroupChatText(groupChatName, 100),
+        userIds: [...groupChatSelected.keys()],
+    };
+    Object.freeze(request.userIds);
+    Object.freeze(request);
+    groupChatCreateBusy = true;
+    groupChatError = "";
+    let shouldReconcile = false;
+    scheduleRender();
+    try {
+        const result = await host.request({ type: "createGroupChat", request });
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        setSecureGroupChatResult(result);
+    } catch (error) {
+        if (!groupChatOperationCurrent(generation, expectedUserId)) return;
+        const code = errorCode(error);
+        if (code === "MATRIX_CREATE_GROUP_CHAT_AMBIGUOUS"
+            || code === "MATRIX_CREATE_GROUP_CHAT_RECONCILE_REQUIRED"
+            || code === "MATRIX_CREATE_GROUP_CHAT_IN_PROGRESS"
+            || code === "MATRIX_CREATE_GROUP_CHAT_RECONCILE_IN_PROGRESS"
+            || code === "MATRIX_CREATE_GROUP_CHAT_STATE_CORRUPT"
+            || code === "MATRIX_CREATE_GROUP_CHAT_STATE_WRITE_FAILED") {
+            groupChatAmbiguityLocked = true;
+            groupChatPhase = "unconfirmed";
+            groupChatError = groupChatCreateError(error);
+            shouldReconcile = true;
+        } else if (code === "MATRIX_GROUP_CHAT_CANDIDATE_STALE"
+            || code === "MATRIX_REMOTE_USER_REJECTED"
+            || code === "MATRIX_GROUP_CHAT_SELF"
+            || code === "MATRIX_INVALID_ARGUMENT") {
+            groupChatCandidates = [];
+            groupChatSelected = new Map();
+            groupChatSearched = false;
+            groupChatPhase = "pick";
+            groupChatError = groupChatCreateError(error);
+        } else {
+            groupChatError = groupChatCreateError(error);
+        }
+    } finally {
+        if (groupChatOperationCurrent(generation, expectedUserId)) {
+            groupChatCreateBusy = false;
+            scheduleRender();
+        }
+    }
+    if (shouldReconcile && groupChatOperationCurrent(generation, expectedUserId)) {
+        void reconcileSecureGroupChat(generation, expectedUserId, true);
+    }
+}
+
 function openSearch() {
     if (!config?.configured) return;
     overlay = "search";
@@ -3032,7 +3400,11 @@ function roomCard(room: MatrixRoomDTO, actions: HTMLElement[] = []) {
     const copy = element("div", "matrix-card-copy",
         textElement("h3", "", roomName(room)),
         room.topic ? textElement("p", "matrix-subtle", room.topic) : null,
-        textElement("div", "matrix-subtle", isSpace(room) ? "Server" : isDirect(room) ? "Direct message" : "Chat"),
+        textElement(
+            "div",
+            "matrix-subtle",
+            isSpace(room) ? "Server" : room.groupChat === true ? "Group chat" : isDirect(room) ? "Direct message" : "Chat"
+        ),
     );
     const card = element("article", "matrix-card", element("div", "matrix-card-row", copy));
     if (actions.length) card.append(element("div", "matrix-card-actions", ...actions));
@@ -3081,7 +3453,12 @@ function renderHomeMain() {
     narrow.append(spaceGrid);
 
     const chats = joinedRooms().filter(room => !isSpace(room));
-    narrow.append(textElement("h2", "", "Recent chats"));
+    narrow.append(element(
+        "div",
+        "matrix-card-actions",
+        textElement("h2", "", "Recent chats"),
+        makeButton("Create Group Chat", "matrix-button matrix-button-primary", openGroupChatOverlay),
+    ));
     const chatGrid = element("div", "matrix-grid");
     for (const room of chats.slice(0, 12)) {
         chatGrid.append(roomCard(room, [
@@ -3440,7 +3817,10 @@ function renderDiscoverMain() {
 }
 
 async function logout() {
-    if (!host || accountTransition || !window.confirm("Sign out of Matrix and erase this device's local Matrix session?")) return;
+    if (!host || accountTransition || !window.confirm(
+        "Clearing local Matrix data erases this device's session and abandons any unacknowledged room or server creation receipt. "
+        + "The remote room and invitations may still exist and can no longer be reconciled. Continue?"
+    )) return;
     const current = route();
     void stopTyping("roomId" in current ? current.roomId : undefined);
     const transition = beginAccountTransition("logout", "Signing out of Matrix...");
@@ -3821,10 +4201,302 @@ function renderDirectMessageOverlay() {
     return renderModal("Start a private Matrix chat", body, [submit]);
 }
 
+function secureGroupChatCandidateRow(
+    candidate: MatrixGroupChatCandidateDTO,
+    action?: { label: string; disabled?: boolean; run: () => void; },
+    status?: string
+) {
+    const displayName = groupChatDisplayName(candidate);
+    const copy = element(
+        "div",
+        "matrix-card-copy matrix-group-chat-identity",
+        textElement("strong", "", displayName),
+        textElement("code", "matrix-group-chat-user-id", visibleRequesterUserId(candidate.userId)),
+    );
+    const actions = element("div", "matrix-card-actions");
+    if (status) actions.append(textElement("span", "matrix-subtle", status));
+    if (action) {
+        actions.append(makeButton(action.label, "matrix-button", action.run, { disabled: action.disabled }));
+    }
+    const row = element("article", "matrix-card matrix-card-row", copy, actions);
+    row.setAttribute("role", "listitem");
+    return row;
+}
+
+function renderSecureGroupChatResult(body: HTMLElement, result: MatrixCreateGroupChatResult) {
+    const summary = result.invitations.map(invitation => groupChatInvitationLabel(invitation.status));
+    const counts = new Map<string, number>();
+    for (const label of summary) counts.set(label, (counts.get(label) ?? 0) + 1);
+    body.append(textElement(
+        "p",
+        "matrix-subtle",
+        `Group chat created. ${[...counts].map(([label, count]) => `${count} ${label.toLocaleLowerCase()}`).join(", ")}.`
+    ));
+    if (!result.complete) {
+        body.append(textElement(
+            "p",
+            "matrix-access-warning",
+            "Some invitations were rejected or could not be confirmed. Do not assume those people received an invitation."
+        ));
+    }
+    const list = element("div", "matrix-form");
+    list.setAttribute("role", "list");
+    list.setAttribute("aria-label", "Invitation results");
+    for (const invitation of result.invitations) {
+        const candidate = groupChatSelected.get(invitation.userId) ?? {
+            userId: invitation.userId,
+            displayName: "Account",
+        };
+        list.append(secureGroupChatCandidateRow(
+            candidate,
+            undefined,
+            groupChatInvitationLabel(invitation.status)
+        ));
+    }
+    body.append(list);
+}
+
+function renderGroupChatOverlay() {
+    const body = element("div", "matrix-modal-body matrix-group-chat-create");
+    const expectedUserId = groupChatExpectedUserId;
+    const current = Boolean(expectedUserId && isCurrentSecureAccount(expectedUserId));
+    const homeserver = serverLabel(config?.homeserver).replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "") || "your account provider";
+    const accountDomain = accountServerName()?.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "") || "your account domain";
+    if (!current) {
+        body.append(textElement("p", "matrix-access-error", "The signed-in account changed. Close this window and try again."));
+    }
+    if (groupChatError) {
+        const error = textElement("p", "matrix-access-error", groupChatError);
+        error.setAttribute("role", "alert");
+        body.append(error);
+    }
+
+    const footer: HTMLElement[] = [];
+    if (groupChatPhase === "checking") {
+        body.append(textElement("p", "matrix-subtle", "Checking for an unfinished group chat..."));
+    } else if (groupChatPhase === "pick") {
+        const name = input("text", "groupName", "New group", groupChatName);
+        name.maxLength = 100;
+        name.disabled = !current || groupChatSearchBusy || groupChatCreateBusy;
+        name.dataset.focusKey = "matrix-group-chat-name";
+        name.addEventListener("input", () => {
+            groupChatName = name.value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").slice(0, 100);
+            groupChatError = "";
+        });
+        body.append(labelledField("Group name", name));
+
+        const searchForm = element("form", "matrix-form matrix-group-chat-search");
+        const search = input("search", "groupQuery", "Search by name or full account ID", groupChatQuery);
+        search.maxLength = 256;
+        search.disabled = !current || groupChatSearchBusy || groupChatCreateBusy;
+        search.dataset.focusKey = "matrix-group-chat-search";
+        search.addEventListener("input", () => {
+            groupChatQuery = search.value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").slice(0, 256);
+            groupChatError = "";
+        });
+        const searchButton = makeButton(
+            groupChatSearchBusy ? "Searching..." : "Search",
+            "matrix-button matrix-button-primary",
+            () => searchForm.requestSubmit(),
+            { disabled: !current || groupChatSearchBusy || groupChatCreateBusy }
+        );
+        searchButton.type = "submit";
+        searchForm.append(labelledField("Search accounts", search), searchButton);
+        searchForm.addEventListener("submit", event => {
+            event.preventDefault();
+            groupChatQuery = search.value.replace(UNSAFE_GROUP_CHAT_TEXT_PATTERN, "").slice(0, 256);
+            searchSecureGroupChatCandidates();
+        });
+        body.append(
+            searchForm,
+            textElement(
+                "p",
+                "matrix-subtle",
+                `Results come from the account directory hosted by ${homeserver} and may be incomplete. That homeserver can observe searches.`
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                "Search text and results are displayed inside Discord, where Discord and installed client plugins can read them."
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                `This private group does not federate; everyone's full account ID must use the ${accountDomain} domain. Search results expire after five minutes.`
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                "Message contents and media are end-to-end encrypted. The provider can still see the group name, participant accounts, membership, and traffic timing and size. Participants can see one another's full account IDs."
+            ),
+            textElement("h3", "", `Selected people (${groupChatSelected.size} of ${MAX_GROUP_CHAT_RECIPIENTS})`),
+        );
+        const selected = element("div", "matrix-form");
+        selected.setAttribute("role", "list");
+        selected.setAttribute("aria-label", "Selected people");
+        for (const candidate of groupChatSelected.values()) {
+            selected.append(secureGroupChatCandidateRow(candidate, {
+                label: "Remove",
+                disabled: !current || groupChatSearchBusy || groupChatCreateBusy,
+                run: () => {
+                    groupChatSelected.delete(candidate.userId);
+                    groupChatError = "";
+                    scheduleRender();
+                },
+            }));
+        }
+        if (!groupChatSelected.size) selected.append(textElement("p", "matrix-subtle", "Select at least two people."));
+        body.append(selected);
+        if (groupChatLimited) {
+            body.append(textElement("p", "matrix-subtle", "More accounts may match. Refine your search to narrow the results."));
+        }
+        if (groupChatSearched && !groupChatSearchBusy && !groupChatCandidates.length && !groupChatError) {
+            body.append(textElement("p", "matrix-subtle", "No matching accounts were found."));
+        }
+        if (groupChatCandidates.length) {
+            const results = element("div", "matrix-form");
+            results.setAttribute("role", "list");
+            results.setAttribute("aria-label", "Account search results");
+            for (const candidate of groupChatCandidates) {
+                const selectedCandidate = groupChatSelected.has(candidate.userId);
+                results.append(secureGroupChatCandidateRow(candidate, {
+                    label: selectedCandidate ? "Remove" : "Add",
+                    disabled: !current || groupChatCreateBusy
+                        || !selectedCandidate && groupChatSelected.size >= MAX_GROUP_CHAT_RECIPIENTS,
+                    run: () => {
+                        if (groupChatSelected.has(candidate.userId)) {
+                            groupChatSelected.delete(candidate.userId);
+                        } else if (Date.now() - candidate.provenanceAt >= GROUP_CHAT_PROVENANCE_REFRESH_MS) {
+                            groupChatCandidates = [];
+                            groupChatError = "Those search results expired. Search again before selecting people.";
+                        } else if (groupChatSelected.size < MAX_GROUP_CHAT_RECIPIENTS) {
+                            groupChatSelected.set(candidate.userId, candidate);
+                        }
+                        scheduleRender();
+                    },
+                }));
+            }
+            body.append(results);
+        }
+        footer.push(
+            makeButton("Cancel", "matrix-button", dismissOverlay),
+            makeButton("Review", "matrix-button matrix-button-primary", reviewSecureGroupChat, {
+                disabled: !current || groupChatSearchBusy || !cleanGroupChatText(groupChatName, 100)
+                    || groupChatSelected.size < MIN_GROUP_CHAT_RECIPIENTS,
+            }),
+        );
+    } else if (groupChatPhase === "review") {
+        body.append(
+            textElement("h3", "", cleanGroupChatText(groupChatName, 100)),
+            textElement(
+                "p",
+                "matrix-subtle",
+                "Review the exact people below. Creating the group requests an invitation for each account; it does not mean they have joined or received it."
+            ),
+            textElement(
+                "p",
+                "matrix-subtle",
+                "Message contents and media are end-to-end encrypted. The provider still sees the group name, participant accounts, membership, and traffic metadata; participants see one another's full account IDs."
+            ),
+        );
+        const list = element("div", "matrix-form");
+        list.setAttribute("role", "list");
+        list.setAttribute("aria-label", "People to invite");
+        for (const candidate of groupChatSelected.values()) {
+            list.append(secureGroupChatCandidateRow(candidate, undefined, "Will be invited"));
+        }
+        body.append(list);
+        footer.push(
+            makeButton("Back", "matrix-button", () => {
+                groupChatPhase = "pick";
+                scheduleRender();
+            }, { disabled: groupChatCreateBusy }),
+            makeButton(
+                groupChatCreateBusy ? "Creating..." : "Create Group Chat",
+                "matrix-button matrix-button-primary",
+                () => void createSecureGroupChat(),
+                { disabled: !current || groupChatCreateBusy || groupChatAmbiguityLocked }
+            ),
+        );
+    } else if (groupChatPhase === "unconfirmed") {
+        body.append(textElement(
+            "p",
+            "matrix-access-warning",
+            "Do not submit another group chat while this result is unconfirmed. Checking status never creates a new group."
+        ));
+        footer.push(makeButton(
+            groupChatReconcileBusy ? "Checking..." : "Check Status",
+            "matrix-button matrix-button-primary",
+            () => {
+                if (expectedUserId) void reconcileSecureGroupChat(
+                    groupChatOverlayGeneration,
+                    expectedUserId,
+                    groupChatAmbiguityLocked
+                );
+            },
+            { disabled: !current || groupChatReconcileBusy || groupChatCreateBusy }
+        ));
+    } else if (groupChatResult) {
+        renderSecureGroupChatResult(body, groupChatResult);
+        const resultRoomId = groupChatResult.roomId;
+        const projected = roomById(resultRoomId);
+        if (projected) {
+            footer.push(
+                makeButton(
+                    groupChatAckBusy ? "Confirming..." : "Done",
+                    "matrix-button",
+                    () => void acknowledgeSecureGroupChat(false),
+                    { disabled: !current || groupChatAckBusy }
+                ),
+                makeButton(
+                    groupChatAckBusy ? "Confirming..." : "Open Group Chat",
+                    "matrix-button matrix-button-primary",
+                    () => void acknowledgeSecureGroupChat(true),
+                    { disabled: !current || groupChatAckBusy }
+                )
+            );
+        } else {
+            footer.push(
+                makeButton("Close for now", "matrix-button", () => {
+                    if (groupChatAckBusy) return;
+                    overlay = null;
+                    clearGroupChatOverlayState();
+                    scheduleRender();
+                }, { disabled: groupChatAckBusy }),
+                makeButton(
+                    "Refresh Chats",
+                    "matrix-button matrix-button-primary",
+                    () => void refresh(false, false, false),
+                    { disabled: groupChatAckBusy }
+                )
+            );
+        }
+        if (!projected) {
+            body.append(textElement(
+                "p",
+                "matrix-subtle",
+                "The new chat has not appeared yet. Close for now keeps its recovery receipt; reopen Create Group Chat or refresh Chats later. Do not create it again."
+            ));
+        }
+    }
+    const receiptLocked = Boolean(groupChatResult) && !groupChatResultAcknowledged;
+    return renderModal(
+        "Create Group Chat",
+        body,
+        footer,
+        groupChatCreateBusy || groupChatReconcileBusy || groupChatAckBusy || receiptLocked
+    );
+}
+
 function dismissOverlay() {
     if (overlay === "suggestedChannels") {
         if (suggestedChannelJoinBusy) return;
         clearSuggestedChannelOverlayState();
+    }
+    if (overlay === "groupChat") {
+        if (groupChatCreateBusy || groupChatReconcileBusy || groupChatAckBusy
+            || groupChatResult && !groupChatResultAcknowledged) return;
+        clearGroupChatOverlayState();
     }
     overlay = null;
     scheduleRender();
@@ -4060,7 +4732,9 @@ function render() {
             ? renderSearchOverlay()
             : overlay === "createSpace"
                 ? renderCreateSpaceOverlay()
-                : overlay === "directMessage" ? renderDirectMessageOverlay() : renderSuggestedChannelsOverlay());
+                : overlay === "directMessage"
+                    ? renderDirectMessageOverlay()
+                    : overlay === "groupChat" ? renderGroupChatOverlay() : renderSuggestedChannelsOverlay());
     }
     if (config?.configured && !fatalMessage && (status?.state === "error" || status?.state === "stopped")) {
         const connectionProblem = element(

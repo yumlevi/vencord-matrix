@@ -13,11 +13,15 @@ import type {
     MatrixBridgeStatus,
     MatrixConfigureSpaceAccessRequest,
     MatrixConfigureSpaceAccessResult,
+    MatrixCreateGroupChatRequest,
+    MatrixCreateGroupChatResult,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
+    MatrixGroupChatCandidateSearchRequest,
+    MatrixGroupChatCandidateSearchResult,
     MatrixHistoryPageDTO,
     MatrixJoinRoomResult,
     MatrixJoinSuggestedSpaceChannelsRequest,
@@ -28,6 +32,7 @@ import type {
     MatrixMessageSearchRequest,
     MatrixMessageSearchResponse,
     MatrixPublicRoomDirectoryDTO,
+    MatrixReconcileGroupChatCreateResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
     MatrixRequestSpaceAccessResult,
@@ -83,6 +88,8 @@ export interface MatrixShellRoom {
     membership: MatrixRoomMembership;
     kind: MatrixRoomKind;
     roomType?: string;
+    /** Creator-signed bridge group identity; takes precedence over Space and m.direct classification. */
+    groupChat?: true;
     canConfigureSpaceAccess?: boolean;
     accessRequestCount?: number;
     accessRequestCountComplete?: boolean;
@@ -223,6 +230,13 @@ export interface MatrixSecureViewRequestMap {
     };
     leaveRoom: { input: { roomId: string; }; output: MatrixRoomActionResult; };
     createSpace: { input: { request: MatrixCreateSpaceRequest; }; output: MatrixCreateSpaceResult; };
+    searchGroupChatCandidates: {
+        input: { request: MatrixGroupChatCandidateSearchRequest; };
+        output: MatrixGroupChatCandidateSearchResult;
+    };
+    createGroupChat: { input: { request: MatrixCreateGroupChatRequest; }; output: MatrixCreateGroupChatResult; };
+    reconcileGroupChatCreate: { input: {}; output: MatrixReconcileGroupChatCreateResult; };
+    acknowledgeGroupChatCreate: { input: { roomId: string; }; output: void; };
     getSpaceAccess: { input: { spaceId: string; }; output: MatrixSpaceAccessSummaryDTO; };
     configureSpaceAccess: {
         input: { request: MatrixConfigureSpaceAccessRequest; };

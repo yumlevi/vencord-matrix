@@ -37,6 +37,7 @@ import {
     unregisterMatrixManagementModal,
 } from "./bridge";
 import { matrixErrorCode } from "./errorCode";
+import { openMatrixGroupChatCreate } from "./groupCreate";
 import {
     suggestedChannelConsentRows,
     suggestedChannelJoinSummary,
@@ -1119,6 +1120,24 @@ export function MatrixSettings() {
         });
     }
 
+    function confirmLogout() {
+        openModal(modalProps => (
+            <ConfirmModal
+                {...modalProps}
+                title="Disconnect this account?"
+                confirmText="Disconnect"
+                cancelText="Cancel"
+                variant="danger"
+                onConfirm={() => void logout()}
+            >
+                <Paragraph>
+                    Clearing local Matrix data erases this device&apos;s session and abandons any unacknowledged room or
+                    server creation receipt. The remote room and invitations may still exist and can no longer be reconciled.
+                </Paragraph>
+            </ConfirmModal>
+        ));
+    }
+
     async function joinPublicRoom(room: MatrixPublicRoomDTO) {
         const expectedUserId = config?.userId;
         if (!expectedUserId || !isCurrentAccount(expectedUserId)) return;
@@ -2000,7 +2019,7 @@ export function MatrixSettings() {
                         <Button
                             disabled={busy}
                             variant="secondary"
-                            onClick={() => void logout()}
+                            onClick={confirmLogout}
                         >
                             Clear local Matrix data
                         </Button>
@@ -2013,7 +2032,7 @@ export function MatrixSettings() {
                                 <Paragraph>{config.userId}</Paragraph>
                                 <Paragraph>{config.homeserver}</Paragraph>
                             </div>
-                            <Button disabled={busy || addressBusy} variant="dangerSecondary" onClick={() => void logout()}>
+                            <Button disabled={busy || addressBusy} variant="dangerSecondary" onClick={confirmLogout}>
                                 Disconnect
                             </Button>
                         </div>
@@ -2423,6 +2442,28 @@ export function MatrixSettings() {
                         {!visibleChats.length && (
                             <Paragraph>{joinedChats.length ? "No chats match that search." : "No joined chats."}</Paragraph>
                         )}
+                    </div>
+                </section>
+
+                <section className="vc-matrix-card vc-matrix-dm-card">
+                    <div className="vc-matrix-section-heading vc-matrix-heading-with-actions">
+                        <div>
+                            <Heading tag="h3">Create a group chat</Heading>
+                            <Paragraph>
+                                Search your account provider for two to nine people, then review the exact invitation list.
+                            </Paragraph>
+                        </div>
+                        <Button
+                            disabled={busy}
+                            variant="positive"
+                            onClick={() => {
+                                if (!openMatrixGroupChatCreate()) {
+                                    setError("The signed-in account changed. Refresh settings and try again.");
+                                }
+                            }}
+                        >
+                            Create Group Chat
+                        </Button>
                     </div>
                 </section>
 

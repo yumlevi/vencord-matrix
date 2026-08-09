@@ -180,6 +180,8 @@ export interface MatrixRoomDTO {
     kind: MatrixRoomKind;
     /** Matrix room type, including m.space for spaces. */
     roomType?: string;
+    /** Creator-signed bridge group identity; it always outranks mutable m.direct and Space relations. */
+    groupChat?: true;
     /** Whether the current account may add m.space.child state in this Space. */
     canManageSpaceChildren?: boolean;
     /** Exact power-level comparison underlying canManageSpaceChildren. */
@@ -197,6 +199,8 @@ export interface MatrixRoomDTO {
     /** Whether the current account meets this Space's exact kick threshold. */
     canDenyAccessRequests?: boolean;
     joinRule: MatrixRoomJoinRule;
+    /** Sender of the immutable m.room.create event (the creator in every room version). */
+    creatorId?: string;
     /** The other user for rooms listed in the account's m.direct map. */
     directUserId?: string;
     /** The inviter for an invite, when it can be determined from stripped state. */
@@ -378,6 +382,61 @@ export interface MatrixSpaceInviteCandidateSearchResult {
     /** Empty search was rejected; issue a non-empty query before searching again. */
     queryRequired: boolean;
 }
+
+/** A bounded query against the active homeserver's user directory for a new group chat. */
+export interface MatrixGroupChatCandidateSearchRequest {
+    /** Empty is a best-effort initial directory query; servers need not support it. */
+    query: string;
+    /** Defaults to 25 and is capped at 100. */
+    limit?: number;
+}
+
+export interface MatrixGroupChatCandidateDTO {
+    userId: string;
+    displayName?: string;
+    avatarUrl?: string;
+}
+
+export interface MatrixGroupChatCandidateSearchResult {
+    query: string;
+    /** Results are a same-provider filter over the homeserver's standard user directory. */
+    scope: "homeserver_user_directory";
+    candidates: MatrixGroupChatCandidateDTO[];
+    /** True when either the homeserver or the local response bound truncated results. */
+    limited: boolean;
+    /** The homeserver's own `limited` value. There is no cursor in this API. */
+    directoryLimited: boolean;
+    /** Always false: Matrix user-directory search never proves account completeness. */
+    complete: false;
+    /** Empty search was rejected; issue a non-empty query before searching again. */
+    queryRequired: boolean;
+}
+
+/** Create an ordinary encrypted room projected as a Discord group DM. */
+export interface MatrixCreateGroupChatRequest {
+    name: string;
+    /** Two to nine unique same-provider users; the creator is the tenth possible member. */
+    userIds: string[];
+}
+
+export type MatrixGroupChatInvitationStatus = "invited" | "joined" | "rejected" | "ambiguous";
+
+export interface MatrixGroupChatInvitationDTO {
+    userId: string;
+    status: MatrixGroupChatInvitationStatus;
+}
+
+export interface MatrixCreateGroupChatResult extends MatrixRoomActionResult {
+    name: string;
+    invitations: MatrixGroupChatInvitationDTO[];
+    /** True only when every selected user is authoritatively invited or joined. */
+    complete: boolean;
+}
+
+export type MatrixReconcileGroupChatCreateResult =
+    | { status: "none"; }
+    | { status: "pending"; }
+    | { status: "resolved"; result: MatrixCreateGroupChatResult; };
 
 export interface MatrixInviteUserToSpaceRequest {
     spaceId: string;

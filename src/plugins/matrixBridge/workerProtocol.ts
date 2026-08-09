@@ -12,11 +12,15 @@ import type {
     MatrixBridgeEvent,
     MatrixConfigureSpaceAccessRequest,
     MatrixConfigureSpaceAccessResult,
+    MatrixCreateGroupChatRequest,
+    MatrixCreateGroupChatResult,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
+    MatrixGroupChatCandidateSearchRequest,
+    MatrixGroupChatCandidateSearchResult,
     MatrixHistoryPageDTO,
     MatrixInviteUserToSpaceRequest,
     MatrixInviteUserToSpaceResult,
@@ -30,6 +34,7 @@ import type {
     MatrixMessageSearchResponse,
     MatrixPublicRoomDirectoryDTO,
     MatrixReauthenticationRequest,
+    MatrixReconcileGroupChatCreateResult,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
     MatrixRequestSpaceAccessResult,
@@ -92,6 +97,14 @@ export type MatrixWorkerCommand =
     | { type: "resolveSpaceAccessRequest"; request: MatrixResolveSpaceAccessRequest; }
     | { type: "searchSpaceInviteCandidates"; request: MatrixSpaceInviteCandidateSearchRequest; }
     | { type: "inviteUserToSpace"; request: MatrixInviteUserToSpaceRequest; }
+    | { type: "searchGroupChatCandidates"; request: MatrixGroupChatCandidateSearchRequest; }
+    | { type: "createGroupChat"; request: MatrixCreateGroupChatRequest; creationMarker: string; }
+    | {
+        type: "reconcileGroupChatCreate";
+        creationMarker: string;
+        name: string;
+        userIds: string[];
+    }
     | { type: "createSpaceChild"; request: MatrixCreateSpaceChildRequest; creationMarker: string; }
     | { type: "reconcileSpaceChildCreate"; parentSpaceId: string; creationMarker: string; }
     | {
@@ -123,6 +136,7 @@ export type MatrixWorkerResult =
     | undefined
     | MatrixActionResult
     | MatrixConfigureSpaceAccessResult
+    | MatrixCreateGroupChatResult
     | MatrixCreateSpaceResult
     | MatrixCreateSpaceChildResult
     | MatrixJoinRoomResult
@@ -137,6 +151,7 @@ export type MatrixWorkerResult =
     | MatrixMessageContextDTO
     | MatrixMessageSearchResponse
     | MatrixPublicRoomDirectoryDTO
+    | MatrixReconcileGroupChatCreateResult
     | MatrixReconcileSpaceChildCreateResult
     | MatrixRoomDTO
     | MatrixSnapshot
@@ -144,6 +159,7 @@ export type MatrixWorkerResult =
     | MatrixSpaceAccessSummaryDTO
     | MatrixSpaceHierarchyDTO
     | MatrixSpaceInviteCandidateSearchResult
+    | MatrixGroupChatCandidateSearchResult
     | MatrixSuggestedSpaceChannelPlanDTO
     | MatrixStickerSendResult
     | MatrixAttachmentSendResult

@@ -239,6 +239,7 @@
     padding: 24px;
 }
 
+.vc-matrix-group-chat-header-button,
 .vc-matrix-search-button {
     align-items: center;
     background: none;
@@ -252,10 +253,12 @@
     width: 32px;
 }
 
+.vc-matrix-group-chat-header-button:hover,
 .vc-matrix-search-button:hover {
     color: var(--interactive-hover);
 }
 
+.vc-matrix-group-chat-header-button:focus-visible,
 .vc-matrix-search-button:focus-visible {
     border-radius: 4px;
     box-shadow: 0 0 0 2px var(--focus-primary);
@@ -556,6 +559,106 @@
     text-align: center;
 }
 
+.vc-matrix-group-chat-create {
+    display: grid;
+    gap: 12px;
+}
+
+.vc-matrix-group-chat-create > label {
+    display: grid;
+    gap: 6px;
+}
+
+.vc-matrix-group-chat-search {
+    align-items: stretch;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.vc-matrix-group-chat-scope,
+.vc-matrix-group-chat-notice {
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.vc-matrix-group-chat-notice {
+    background: var(--background-secondary);
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.vc-matrix-group-chat-section-heading {
+    color: var(--header-secondary);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+}
+
+.vc-matrix-group-chat-list {
+    display: grid;
+    gap: 4px;
+    max-height: min(45vh, 440px);
+    overflow-y: auto;
+}
+
+.vc-matrix-group-chat-candidate {
+    align-items: center;
+    background: var(--background-secondary);
+    border-radius: 8px;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    padding: 10px 12px;
+}
+
+.vc-matrix-group-chat-avatar {
+    align-items: center;
+    background: var(--brand-500);
+    border-radius: 50%;
+    color: var(--white-500);
+    display: flex;
+    font-size: 16px;
+    font-weight: 700;
+    height: 40px;
+    justify-content: center;
+    overflow: hidden;
+    text-transform: uppercase;
+    width: 40px;
+}
+
+.vc-matrix-group-chat-identity {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.vc-matrix-group-chat-identity > strong,
+.vc-matrix-group-chat-identity > code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vc-matrix-group-chat-identity > strong {
+    unicode-bidi: plaintext;
+}
+
+.vc-matrix-group-chat-identity > code {
+    color: var(--text-muted);
+    direction: ltr;
+    font-family: var(--font-code);
+    font-size: 12px;
+    unicode-bidi: isolate;
+}
+
+.vc-matrix-group-chat-empty {
+    color: var(--text-muted);
+    padding: 18px 12px;
+    text-align: center;
+}
+
 @media (width <= 720px) {
     .vc-matrix-settings-header,
     .vc-matrix-heading-with-actions,
@@ -590,6 +693,11 @@
         grid-template-columns: 40px minmax(0, 1fr);
     }
 
+    .vc-matrix-group-chat-candidate {
+        align-items: start;
+        grid-template-columns: 40px minmax(0, 1fr);
+    }
+
     .vc-matrix-access-request-actions {
         grid-column: 1 / -1;
         justify-content: stretch;
@@ -604,7 +712,17 @@
         width: 100%;
     }
 
+    .vc-matrix-group-chat-candidate > button,
+    .vc-matrix-group-chat-candidate > span {
+        grid-column: 1 / -1;
+        width: 100%;
+    }
+
     .vc-matrix-invite-search {
+        grid-template-columns: 1fr;
+    }
+
+    .vc-matrix-group-chat-search {
         grid-template-columns: 1fr;
     }
 }

@@ -342,7 +342,7 @@ assert.doesNotMatch(repairChild, /maySendStateEvent/u);
 assert.doesNotMatch(backend, /maySendStateEvent\(EventType\.SpaceChild/u);
 assert.match(backend, /selectCreationRoomVersion\(!isPublic\)/u);
 assert.match(backend, /room_version: roomVersion/u);
-assert.match(backend, /events: \{ \[EventType\.RoomTombstone\]: 150 \}/u);
+assert.match(backend, /const events: Record<string, number> = roomVersion === "12"[\s\S]*\[EventType\.RoomTombstone\]: 150[\s\S]*: \{\}/u);
 assert.match(backend, /mutationDispatched\(\);\s*const created = await matrixClient\.createRoom/u);
 assert.match(backend, /mutationDispatched\(\);\s*await matrixClient\.invite/u);
 const createSpaceBackend = backend.slice(
