@@ -19,7 +19,7 @@
 
 // @ts-check
 
-import { copyFile, mkdir, readdir } from "fs/promises";
+import { copyFile, mkdir, readdir, writeFile } from "fs/promises";
 import { createRequire } from "module";
 import { dirname, join, resolve } from "path";
 
@@ -77,6 +77,7 @@ const require = createRequire(import.meta.url);
 const matrixCryptoEntry = require.resolve("@matrix-org/matrix-sdk-crypto-wasm");
 const matrixCryptoWasm = join(dirname(matrixCryptoEntry), "pkg", "matrix_sdk_crypto_wasm_bg.wasm");
 await mkdir("dist", { recursive: true });
+await writeFile("dist/package.json", "{}\n", "utf8");
 await copyFile(matrixCryptoWasm, "dist/matrix_sdk_crypto_wasm_bg.wasm");
 
 /**
