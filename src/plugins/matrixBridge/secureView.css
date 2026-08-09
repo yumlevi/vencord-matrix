@@ -391,6 +391,44 @@ textarea:focus-visible,
     gap: 16px;
 }
 
+.matrix-access-panel {
+    display: grid;
+    gap: 16px;
+    margin-top: 16px;
+}
+
+.matrix-access-panel > :where(p, .matrix-grid),
+.matrix-access-panel .matrix-card-actions {
+    margin-top: 0;
+}
+
+.matrix-access-requests-heading {
+    margin-top: 4px !important;
+}
+
+.matrix-access-error {
+    margin: 0;
+    color: var(--matrix-danger);
+}
+
+.matrix-access-warning {
+    margin: 0;
+    color: var(--matrix-warning);
+}
+
+.matrix-advanced-join {
+    margin-top: 16px;
+}
+
+.matrix-advanced-join > summary {
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.matrix-advanced-join[open] > summary {
+    margin-bottom: 16px;
+}
+
 .matrix-field {
     display: grid;
     gap: 6px;

@@ -15,13 +15,18 @@ import type {
     MatrixAttachmentDTO,
     MatrixBridgeEvent,
     MatrixBridgeStatus,
+    MatrixConfigureSpaceAccessResult,
     MatrixHistoryPageDTO,
     MatrixMessageDTO,
     MatrixMessageSearchResultDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixReactionDTO,
+    MatrixRequestSpaceAccessResult,
     MatrixRoomDTO,
     MatrixSnapshot,
+    MatrixSpaceAccessMode,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
     MatrixUrlPreviewDTO,
 } from "./types";
@@ -87,6 +92,11 @@ interface CreateSpaceFormState {
     createGeneral: boolean;
 }
 
+interface SpaceAccessDraft {
+    mode: MatrixSpaceAccessMode;
+    joinName: string;
+}
+
 interface PendingUploadItem {
     file: File;
     txnId: string;
@@ -110,6 +120,9 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const MAX_UPLOAD_BATCH_BYTES = 100 * 1024 * 1024;
 const MEDIA_DOWNLOAD_CONCURRENCY = 3;
 const URL_PATTERN = /https?:\/\/[^\s<>]+/iu;
+const JOIN_NAME_MAX_LENGTH = 64;
+const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const host = window.MatrixSecureViewHost;
 function requireRoot() {
     const result = document.getElementById("matrix-secure-view-root");
@@ -160,8 +173,11 @@ let lastTimelineRoomId: string | undefined;
 let spaceCreationBlocked = false;
 let spaceCreationInFlight = false;
 let joinAddressBusy = false;
+let joinNameBusy = false;
 let directMessageBusy = false;
 let joinAddressValue = "";
+let joinNameValue = "";
+let joinNameError = "";
 let directMessageSpaceId = "";
 let directMessageUserId = "";
 let accountTransition: AccountTransition | undefined;
@@ -195,6 +211,14 @@ const timelineWindows = new Map<string, TimelineWindow>();
 const timelineAtBottomByRoom = new Map<string, boolean>();
 const renderedReceiptTargetByRoom = new Map<string, string>();
 const hierarchies = new Map<string, MatrixSpaceHierarchyDTO>();
+const spaceAccess = new Map<string, MatrixSpaceAccessSummaryDTO>();
+const spaceAccessConfirmed = new Map<string, boolean>();
+const spaceAccessDrafts = new Map<string, SpaceAccessDraft>();
+const spaceAccessRequests = new Map<string, MatrixSpaceAccessRequestListDTO>();
+const expandedSpaceAccess = new Set<string>();
+const spaceAccessErrors = new Map<string, string>();
+let spaceAccessLoading: string | undefined;
+let spaceAccessAction: string | undefined;
 const typingByRoom = new Map<string, string[]>();
 const replyByRoom = new Map<string, MatrixMessageDTO>();
 const editByRoom = new Map<string, MatrixMessageDTO>();
@@ -279,11 +303,97 @@ function errorText(error: unknown) {
     return "The Matrix operation failed.";
 }
 
+function cleanJoinName(value: string) {
+    return value.trim().toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
+}
+
+function validJoinName(value: string) {
+    return JOIN_NAME_PATTERN.test(value);
+}
+
+function accountServerName() {
+    const userId = config?.userId;
+    if (!userId) return undefined;
+    const separator = userId.indexOf(":");
+    return separator > 0 && separator < userId.length - 1 ? userId.slice(separator + 1) : undefined;
+}
+
+function isCurrentSecureAccount(expectedUserId: string) {
+    return config?.userId === expectedUserId && snapshot?.account?.userId === expectedUserId;
+}
+
+function joinNameFromAlias(alias: string | undefined) {
+    if (!alias?.startsWith("#")) return undefined;
+    const separator = alias.indexOf(":");
+    if (separator < 2 || separator === alias.length - 1) return undefined;
+    const serverName = accountServerName();
+    if (serverName && alias.slice(separator + 1) !== serverName) return undefined;
+    const joinName = alias.slice(1, separator);
+    return validJoinName(joinName) ? joinName : undefined;
+}
+
+function accessModeLabel(mode: MatrixSpaceAccessMode) {
+    switch (mode) {
+        case "public": return "Public and listed";
+        case "request": return "Unlisted; requests require approval";
+        case "invite": return "Unlisted; invitation only";
+    }
+}
+
+function simplifiedAccessModeLabel(mode: MatrixSpaceAccessMode) {
+    switch (mode) {
+        case "public": return "Public access";
+        case "request": return "Request approval";
+        case "invite": return "Invitation only";
+    }
+}
+
+function safeRequesterDisplayName(value: string | undefined) {
+    return value?.replace(BIDI_FORMATTING_CONTROL_PATTERN, "").trim() || undefined;
+}
+
+function visibleRequesterUserId(value: string) {
+    return value.replace(BIDI_FORMATTING_CONTROL_PATTERN, character =>
+        `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+}
+
+function actualAccessLabel(access: MatrixSpaceAccessSummaryDTO) {
+    const listed = access.directoryVisibility === "public" ? "listed" : "unlisted";
+    const admission = access.joinRule === "public"
+        ? "open to everyone"
+        : access.joinRule === "knock"
+            ? "requests require approval"
+            : access.joinRule === "restricted"
+                ? "restricted by linked-server membership"
+                : access.joinRule === "knock_restricted"
+                    ? "linked-server members can join; others can request approval"
+                    : "invitation only";
+    return `${listed}; ${admission}`;
+}
+
+function accessConfirmationText(result: MatrixConfigureSpaceAccessResult) {
+    const access = actualAccessLabel(result.access);
+    return result.accessConfirmed
+        ? `Current access is ${access}.`
+        : `Could not verify current access. Last confirmed state: ${access}.`;
+}
+
+function accessResultText(result: MatrixRequestSpaceAccessResult) {
+    switch (result.membership) {
+        case "knock": return "Your access request is pending approval.";
+        case "invite": return "Access was approved. Accept the server invitation from Home.";
+        case "join": return "You already have access to this server.";
+    }
+}
+
 function errorCode(error: unknown) {
     if (!error || typeof error !== "object") return "";
-    const candidate = error as { code?: unknown; name?: unknown; };
-    if (typeof candidate.code === "string") return candidate.code;
-    return typeof candidate.name === "string" ? candidate.name : "";
+    const candidate = error as { code?: unknown; name?: unknown; message?: unknown; };
+    for (const value of [candidate.code, candidate.name]) {
+        if (typeof value === "string" && /^(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/u.test(value)) return value;
+    }
+    const message = typeof candidate.message === "string" ? candidate.message : "";
+    return message.match(/(?:^|:\s)((?:MATRIX_|M_|ORG[._])[A-Z0-9._]+)(?=:)/u)?.[1] ?? "";
 }
 
 function statusText(value = status) {
@@ -439,6 +549,14 @@ function clearSensitiveUiState() {
     timelineAtBottomByRoom.clear();
     renderedReceiptTargetByRoom.clear();
     hierarchies.clear();
+    spaceAccess.clear();
+    spaceAccessConfirmed.clear();
+    spaceAccessDrafts.clear();
+    spaceAccessRequests.clear();
+    expandedSpaceAccess.clear();
+    spaceAccessErrors.clear();
+    spaceAccessLoading = undefined;
+    spaceAccessAction = undefined;
     typingByRoom.clear();
     replyByRoom.clear();
     editByRoom.clear();
@@ -464,8 +582,11 @@ function clearSensitiveUiState() {
     spaceCreationBlocked = false;
     spaceCreationInFlight = false;
     joinAddressBusy = false;
+    joinNameBusy = false;
     directMessageBusy = false;
     joinAddressValue = "";
+    joinNameValue = "";
+    joinNameError = "";
     directMessageSpaceId = "";
     directMessageUserId = "";
     authBusy = false;
@@ -511,11 +632,21 @@ function setRoute(next: MatrixSecureViewRoute, local = true) {
     }
     const nextRoomId = "roomId" in next ? next.roomId : undefined;
     if (searchScopeForRoute(previousRoute) !== searchScopeForRoute(next)) invalidateSearch();
+    if (next.kind !== "settings") {
+        joinNameValue = "";
+        joinNameError = "";
+        joinAddressValue = "";
+    }
     if (nextRoomId !== previousRoomId) {
         clearMedia();
         lastTimelineRoomId = undefined;
         highlightedEventId = undefined;
         void stopTyping(previousRoomId);
+        if (previousRoomId) {
+            spaceAccessDrafts.delete(previousRoomId);
+            expandedSpaceAccess.delete(previousRoomId);
+            spaceAccessErrors.delete(previousRoomId);
+        }
         if (nextRoomId) {
             isolatedContexts.delete(nextRoomId);
             timelineWindows.delete(nextRoomId);
@@ -1089,15 +1220,15 @@ function mergeHistory(roomId: string, messages: MatrixMessageDTO[], page?: Matri
     });
 }
 
-async function refresh(allowSpaceRetry = false) {
-    if (!host) return;
+async function refresh(allowSpaceRetry = false, announce = true, reportErrors = true) {
+    if (!host) return false;
     const generation = uiGeneration;
     const expectedAccount = config?.configured ? config.userId ?? null : null;
     try {
         loadingLabel = "Refreshing Matrix...";
         scheduleRender();
         const next = await host.request({ type: "refresh" });
-        if (generation !== uiGeneration || accountTransition) return;
+        if (generation !== uiGeneration || accountTransition) return false;
         validateSnapshotIdentity(next, expectedAccount);
         // A delta delivered while refresh was in flight is newer than this
         // snapshot cut. Never replace it with the older response.
@@ -1106,15 +1237,17 @@ async function refresh(allowSpaceRetry = false) {
             lastAppliedMatrixSeq = next.seq;
         }
         if (allowSpaceRetry) spaceCreationBlocked = false;
-        showToast("Matrix is up to date.", "success");
+        if (announce) showToast("Matrix is up to date.", "success");
+        return true;
     } catch (error) {
         if (generation === uiGeneration) {
             if (errorText(error).includes("different account") || errorText(error).includes("conflicting account")) {
                 void recoverAccountBoundary();
-            } else {
+            } else if (reportErrors) {
                 showToast(errorText(error), "error");
             }
         }
+        return false;
     } finally {
         if (generation === uiGeneration) loadingLabel = "";
         scheduleRender();
@@ -1151,6 +1284,260 @@ async function loadDirectory() {
         if (generation === uiGeneration) showToast(`Directory refresh failed: ${errorText(error)}`, "error");
     } finally {
         if (generation === uiGeneration) directoryLoading = false;
+        scheduleRender();
+    }
+}
+
+async function requestServerAccess(joinName: string, inlineError = true) {
+    const normalized = cleanJoinName(joinName);
+    if (!validJoinName(normalized)) {
+        const message = "Use 1-64 lowercase letters or numbers. Dots, underscores, and hyphens may appear between them.";
+        if (inlineError) {
+            joinNameError = message;
+            scheduleRender();
+        } else showToast(message, "error");
+        return;
+    }
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || joinNameBusy) return;
+    const generation = uiGeneration;
+    joinNameBusy = true;
+    joinNameError = "";
+    scheduleRender();
+    try {
+        const result = await host.request({ type: "requestSpaceAccess", joinName: normalized });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        joinNameValue = "";
+        joinNameError = "";
+        showToast(accessResultText(result), "success");
+        if (result.membership === "invite" || result.membership === "join") {
+            const refreshed = await refresh(false, false, false);
+            if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+            if (!refreshed) {
+                showToast("The access request succeeded, but the server list could not be refreshed yet.", "info");
+                return;
+            }
+        }
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (result.membership === "join") {
+            const joined = roomById(result.roomId);
+            if (joined?.membership === "join") {
+                setRoute({ kind: isSpace(joined) ? "space" : "room", roomId: result.roomId });
+            }
+        }
+    } catch (error) {
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (errorCode(error) === "MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS") {
+            joinNameValue = "";
+            joinNameError = "";
+            showToast(`The access request may have succeeded, but its response could not be confirmed: ${errorText(error)}`, "info");
+            const refreshed = await refresh(false, false, false);
+            if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId) && !refreshed) {
+                showToast("The access request may have succeeded, but the server list could not be refreshed yet.", "info");
+            }
+            return;
+        }
+        if (inlineError) joinNameError = errorText(error);
+        else showToast(errorText(error), "error");
+    } finally {
+        if (generation === uiGeneration) joinNameBusy = false;
+        scheduleRender();
+    }
+}
+
+async function loadSpaceAccess(space: MatrixRoomDTO, force = false) {
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || spaceAccessLoading === space.roomId || !force && spaceAccess.has(space.roomId)) return;
+    const generation = uiGeneration;
+    spaceAccessLoading = space.roomId;
+    spaceAccessErrors.delete(space.roomId);
+    scheduleRender();
+    try {
+        const access = await host.request({ type: "getSpaceAccess", spaceId: space.roomId });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        spaceAccess.set(space.roomId, access);
+        spaceAccessConfirmed.set(space.roomId, true);
+        spaceAccessDrafts.set(space.roomId, { mode: access.mode, joinName: access.joinName ?? "" });
+        if (space.canApproveAccessRequests || space.canDenyAccessRequests) {
+            try {
+                const requests = await host.request({ type: "getSpaceAccessRequests", spaceId: space.roomId });
+                if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+                    spaceAccessRequests.set(space.roomId, requests);
+                }
+            } catch (error) {
+                if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+                    spaceAccessErrors.set(space.roomId, `Could not load access requests: ${errorText(error)}`);
+                }
+            }
+        }
+    } catch (error) {
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+            spaceAccessErrors.set(space.roomId, errorText(error));
+        }
+    } finally {
+        if (generation === uiGeneration && spaceAccessLoading === space.roomId) spaceAccessLoading = undefined;
+        scheduleRender();
+    }
+}
+
+function toggleSpaceAccess(space: MatrixRoomDTO) {
+    if (expandedSpaceAccess.delete(space.roomId)) {
+        spaceAccessDrafts.delete(space.roomId);
+        spaceAccessErrors.delete(space.roomId);
+        scheduleRender();
+        return;
+    }
+    expandedSpaceAccess.add(space.roomId);
+    void loadSpaceAccess(space, true);
+    scheduleRender();
+}
+
+function applySpaceAccessResult(result: MatrixConfigureSpaceAccessResult) {
+    spaceAccess.set(result.spaceId, result.access);
+    spaceAccessConfirmed.set(result.spaceId, result.accessConfirmed);
+    spaceAccessDrafts.set(result.spaceId, {
+        mode: result.access.mode,
+        joinName: result.access.joinName ?? "",
+    });
+    const confirmation = accessConfirmationText(result);
+    if (result.complete) showToast(`Access settings saved. ${confirmation}`, "success");
+    else showToast(`Access settings were only partly applied. ${result.partial?.message ?? "Review the settings."} ${confirmation}`, "info");
+}
+
+async function saveSpaceAccess(spaceId: string) {
+    const draft = spaceAccessDrafts.get(spaceId);
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || !draft || spaceAccessAction) return;
+    const normalizedJoinName = cleanJoinName(draft.joinName);
+    if (draft.mode === "request" && !validJoinName(normalizedJoinName)) {
+        spaceAccessErrors.set(
+            spaceId,
+            "Request approval needs a unique join name using 1-64 lowercase letters or numbers. Dots, underscores, and hyphens may appear between them."
+        );
+        scheduleRender();
+        return;
+    }
+    const generation = uiGeneration;
+    spaceAccessAction = `save:${spaceId}`;
+    spaceAccessErrors.delete(spaceId);
+    scheduleRender();
+    try {
+        const result = await host.request({
+            type: "configureSpaceAccess",
+            request: {
+                spaceId,
+                mode: draft.mode,
+                ...(draft.mode === "request" ? { joinName: normalizedJoinName } : {}),
+            },
+        });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        applySpaceAccessResult(result);
+        const refreshed = await refresh(false, false, false);
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (!refreshed) {
+            showToast(`${result.complete ? "Access settings were saved" : "Access settings were partly applied"}, but the server list could not be refreshed yet. ${accessConfirmationText(result)}`, "info");
+        }
+    } catch (error) {
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+            if (errorCode(error) === "MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS") {
+                let refreshedAccess: MatrixSpaceAccessSummaryDTO | undefined;
+                try {
+                    const access = await host.request({ type: "getSpaceAccess", spaceId });
+                    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+                    refreshedAccess = access;
+                    spaceAccess.set(spaceId, access);
+                    spaceAccessConfirmed.set(spaceId, true);
+                    spaceAccessDrafts.set(spaceId, {
+                        mode: access.mode,
+                        joinName: access.joinName ?? ""
+                    });
+                } catch {
+                    spaceAccessConfirmed.set(spaceId, false);
+                }
+                await refresh(false, false, false);
+                if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+                showToast(refreshedAccess
+                    ? `The save response could not be confirmed. Current access was refreshed: ${actualAccessLabel(refreshedAccess)}.`
+                    : "Access settings may have changed, but current access could not be verified. Refresh before saving again.", "info");
+            } else {
+                spaceAccessErrors.set(spaceId, errorText(error));
+            }
+        }
+    } finally {
+        if (generation === uiGeneration && spaceAccessAction === `save:${spaceId}`) spaceAccessAction = undefined;
+        scheduleRender();
+    }
+}
+
+async function resolveSpaceAccessRequest(spaceId: string, userId: string, decision: "approve" | "deny") {
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || spaceAccessAction) return;
+    const generation = uiGeneration;
+    const action = `${decision}:${spaceId}:${userId}`;
+    spaceAccessAction = action;
+    spaceAccessErrors.delete(spaceId);
+    scheduleRender();
+    try {
+        const result = await host.request({
+            type: "resolveSpaceAccessRequest",
+            request: { spaceId, userId, decision },
+        });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        const existing = spaceAccessRequests.get(spaceId);
+        if (existing) {
+            spaceAccessRequests.set(spaceId, {
+                ...existing,
+                requests: existing.requests.filter(request => request.userId !== userId),
+            });
+        }
+        const approved = result.membership === "invite" || result.membership === "join";
+        showToast(approved
+            ? result.membership === "join"
+                ? "Access approved. The requester has joined the server."
+                : "Access approved. The server invitation is ready."
+            : "Access request denied.", "success");
+        const refreshed = await refresh(false, false, false);
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        let requestsRefreshed = false;
+        try {
+            const requests = await host.request({ type: "getSpaceAccessRequests", spaceId });
+            if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+                spaceAccessRequests.set(spaceId, requests);
+                requestsRefreshed = true;
+            }
+        } catch {
+            // The mutation result remains authoritative; the next open/refresh retries the list.
+        }
+        if (!refreshed || !requestsRefreshed) {
+            showToast(approved
+                ? "Access was approved, but the server or request list could not be refreshed yet."
+                : "Access was denied, but the server or request list could not be refreshed yet.", "info");
+        }
+    } catch (error) {
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+            if (errorCode(error) === "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS") {
+                showToast(`This access decision may have succeeded, but its response could not be confirmed: ${errorText(error)}`, "info");
+                const refreshed = await refresh(false, false, false);
+                if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+                let requestsRefreshed = false;
+                try {
+                    const requests = await host.request({ type: "getSpaceAccessRequests", spaceId });
+                    if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+                        spaceAccessRequests.set(spaceId, requests);
+                        requestsRefreshed = true;
+                    }
+                } catch {
+                    // Keep the may-have-succeeded notice; reopening retries this list.
+                }
+                if (!refreshed || !requestsRefreshed) {
+                    showToast("This access decision may have succeeded, but the server or request list could not be refreshed yet.", "info");
+                }
+            } else {
+                spaceAccessErrors.set(spaceId, errorText(error));
+            }
+        }
+    } finally {
+        if (generation === uiGeneration && spaceAccessAction === action) spaceAccessAction = undefined;
         scheduleRender();
     }
 }
@@ -2412,7 +2799,7 @@ function roomCard(room: MatrixRoomDTO, actions: HTMLElement[] = []) {
     const copy = element("div", "matrix-card-copy",
         textElement("h3", "", roomName(room)),
         room.topic ? textElement("p", "matrix-subtle", room.topic) : null,
-        textElement("div", "matrix-subtle", isSpace(room) ? "Matrix server" : isDirect(room) ? "Direct message" : "Matrix chat"),
+        textElement("div", "matrix-subtle", isSpace(room) ? "Server" : isDirect(room) ? "Direct message" : "Chat"),
     );
     const card = element("article", "matrix-card", element("div", "matrix-card-row", copy));
     if (actions.length) card.append(element("div", "matrix-card-actions", ...actions));
@@ -2457,7 +2844,7 @@ function renderHomeMain() {
             makeButton("Open", "matrix-button matrix-button-primary", () => setRoute({ kind: "space", roomId: space.roomId })),
         ]));
     }
-    if (!spaces.length) spaceGrid.append(textElement("div", "matrix-subtle", "No joined Matrix servers yet."));
+    if (!spaces.length) spaceGrid.append(textElement("div", "matrix-subtle", "No joined servers yet."));
     narrow.append(spaceGrid);
 
     const chats = joinedRooms().filter(room => !isSpace(room));
@@ -2478,10 +2865,135 @@ function renderHomeMain() {
     return main;
 }
 
+function renderSpaceAccessPanel(space: MatrixRoomDTO) {
+    const spaceId = space.roomId;
+    const access = spaceAccess.get(spaceId);
+    const draft = spaceAccessDrafts.get(spaceId);
+    const requests = spaceAccessRequests.get(spaceId);
+    const saving = spaceAccessAction === `save:${spaceId}`;
+    const accessActionBusy = spaceAccessAction != null;
+    const card = element(
+        "section",
+        "matrix-card matrix-access-panel",
+        textElement("h2", "", "Access settings"),
+        textElement(
+            "p",
+            "matrix-subtle",
+            "Unlisted means not listed in your provider's public directory; links, aliases, or parent servers may still reveal the server. Admission is controlled by invitation or request; a join name is not a password."
+        ),
+        access ? textElement(
+            "p",
+            "matrix-subtle",
+            spaceAccessConfirmed.get(spaceId) === false
+                ? `Could not verify current access. Last confirmed state: ${actualAccessLabel(access)}.`
+                : `Current access: ${actualAccessLabel(access)}.`
+        ) : null,
+    );
+    if (spaceAccessLoading === spaceId) card.append(textElement("p", "matrix-subtle", "Loading access settings..."));
+
+    if (space.canConfigureSpaceAccess === true && draft) {
+        if (access && (access.joinRule === "restricted" || access.joinRule === "knock_restricted")) {
+            card.append(textElement(
+                "p",
+                "matrix-access-warning",
+                `Saving will replace the current linked-server membership rule with ${simplifiedAccessModeLabel(draft.mode)}.`
+            ));
+        }
+        const mode = element("select", "matrix-select");
+        mode.name = "access-mode";
+        mode.dataset.focusKey = `matrix-access-mode-${spaceId}`;
+        for (const value of ["public", "request", "invite"] as const) {
+            const option = element("option", "");
+            option.value = value;
+            option.textContent = accessModeLabel(value);
+            mode.append(option);
+        }
+        mode.value = draft.mode;
+        mode.disabled = accessActionBusy;
+        mode.addEventListener("change", () => {
+            draft.mode = mode.value === "public" || mode.value === "request" ? mode.value : "invite";
+            spaceAccessErrors.delete(spaceId);
+            scheduleRender();
+        });
+        card.append(labelledField("Who can join?", mode));
+
+        if (draft.mode === "request") {
+            const joinName = input("text", "joinName", "my-server", draft.joinName);
+            joinName.maxLength = JOIN_NAME_MAX_LENGTH;
+            joinName.dataset.focusKey = `matrix-access-join-name-${spaceId}`;
+            joinName.disabled = accessActionBusy;
+            joinName.addEventListener("input", () => {
+                draft.joinName = joinName.value.toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
+                spaceAccessErrors.delete(spaceId);
+                scheduleRender();
+            });
+            card.append(
+                labelledField("Server join name", joinName),
+                textElement("p", "matrix-subtle", "Share this unique lowercase name so people can request access. It is not a password."),
+            );
+            if (access?.joinName) {
+                card.append(textElement("p", "matrix-subtle", `Current join name: ${access.joinName}`));
+            }
+        }
+
+        card.append(makeButton(saving ? "Saving access settings..." : "Save access settings", "matrix-button matrix-button-primary", () => {
+            void saveSpaceAccess(spaceId);
+        }, {
+            disabled: accessActionBusy || draft.mode === "request" && !validJoinName(cleanJoinName(draft.joinName)),
+        }));
+    }
+
+    const accessError = spaceAccessErrors.get(spaceId);
+    if (accessError) card.append(textElement("p", "matrix-access-error", accessError));
+
+    if (requests) {
+        card.append(textElement("h3", "matrix-access-requests-heading", `Access requests (${requests.requests.length})`));
+        if (!requests.requests.length) card.append(textElement("p", "matrix-subtle", "No pending access requests."));
+        if (requests.truncated) card.append(textElement("p", "matrix-subtle", "Only the first pending requests are shown."));
+        const grid = element("div", "matrix-grid");
+        for (const request of requests.requests) {
+            const approveAction = `approve:${spaceId}:${request.userId}`;
+            const denyAction = `deny:${spaceId}:${request.userId}`;
+            const requesterName = safeRequesterDisplayName(request.displayName);
+            const requesterUserId = visibleRequesterUserId(request.userId);
+            const actions: HTMLElement[] = [];
+            if (request.canApprove) {
+                actions.push(makeButton(
+                    spaceAccessAction === approveAction ? "Approving..." : "Approve",
+                    "matrix-button matrix-button-primary",
+                    () => void resolveSpaceAccessRequest(spaceId, request.userId, "approve"),
+                    { disabled: accessActionBusy }
+                ));
+            }
+            if (request.canDeny) {
+                actions.push(makeButton(
+                    spaceAccessAction === denyAction ? "Denying..." : "Deny",
+                    "matrix-button matrix-button-danger",
+                    () => void resolveSpaceAccessRequest(spaceId, request.userId, "deny"),
+                    { disabled: accessActionBusy }
+                ));
+            }
+            grid.append(element(
+                "article",
+                "matrix-card",
+                textElement("h3", "", requesterName || requesterUserId),
+                requesterName ? textElement("div", "matrix-subtle", requesterUserId) : null,
+                actions.length ? element("div", "matrix-card-actions", ...actions) : null,
+            ));
+        }
+        card.append(grid);
+    }
+    return card;
+}
+
 function renderSpaceMain(space: MatrixRoomDTO) {
     const main = element("section", "matrix-main");
-    main.append(renderHeading(roomName(space), space.topic || "Matrix server", space));
+    main.append(renderHeading(roomName(space), space.topic || "Server", space));
     const page = element("div", "matrix-page");
+    const canOpenAccess = space.canConfigureSpaceAccess === true
+        || space.canApproveAccessRequests === true
+        || space.canDenyAccessRequests === true;
+    const accessExpanded = expandedSpaceAccess.has(space.roomId);
     const narrow = element("div", "matrix-page-narrow",
         textElement("h1", "", roomName(space)),
         space.topic ? textElement("p", "matrix-subtle", space.topic) : null,
@@ -2494,8 +3006,15 @@ function renderSpaceMain(space: MatrixRoomDTO) {
                 hierarchies.delete(space.roomId);
                 void loadHierarchy(space.roomId);
             }),
+            canOpenAccess ? makeButton(
+                `${accessExpanded ? "Hide access settings" : "Access settings"}${space.accessRequestCount ? ` (${space.accessRequestCount})` : ""}`,
+                "matrix-button",
+                () => toggleSpaceAccess(space),
+                { disabled: spaceAccessLoading === space.roomId }
+            ) : null,
         ),
     );
+    if (accessExpanded) narrow.append(renderSpaceAccessPanel(space));
     const hierarchy = hierarchies.get(space.roomId);
     narrow.append(textElement("h2", "", "Rooms"));
     if (hierarchyLoading === space.roomId) {
@@ -2550,61 +3069,91 @@ function renderSpaceMain(space: MatrixRoomDTO) {
 
 function renderDiscoverMain() {
     const main = element("section", "matrix-main");
-    main.append(renderHeading("Discover Matrix", "Published rooms and servers"));
+    main.append(renderHeading("Discover servers", "Public listings and join-name access"));
     const page = element("div", "matrix-page");
     const narrow = element("div", "matrix-page-narrow", renderSettingsTabs("discover"));
-    const joinForm = element("form", "matrix-card matrix-form");
-    joinForm.append(textElement("h2", "", "Join by address"));
+
+    const joinNameForm = element("form", "matrix-card matrix-form");
+    joinNameForm.append(
+        textElement("h2", "", "Request server access"),
+        textElement("p", "matrix-subtle", "Enter the server's join name. An admin can then approve your request."),
+    );
+    const joinName = input("text", "joinName", "my-server", joinNameValue);
+    joinName.maxLength = JOIN_NAME_MAX_LENGTH;
+    joinName.dataset.focusKey = "matrix-request-access-join-name";
+    joinName.disabled = joinNameBusy || joinAddressBusy;
+    joinName.addEventListener("input", () => {
+        joinNameValue = joinName.value.toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
+        joinNameError = "";
+        scheduleRender();
+    });
+    joinNameForm.append(labelledField("Server join name", joinName));
+    joinNameForm.append(makeButton(joinNameBusy ? "Requesting access..." : "Request access", "matrix-button matrix-button-primary", () => {
+        joinNameForm.requestSubmit();
+    }, { disabled: joinNameBusy || joinAddressBusy || !joinNameValue.trim() }));
+    joinNameForm.addEventListener("submit", event => {
+        event.preventDefault();
+        joinNameValue = joinName.value.toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
+        void requestServerAccess(joinNameValue);
+    });
+    if (joinNameError) joinNameForm.append(textElement("p", "matrix-access-error", joinNameError));
+    narrow.append(joinNameForm);
+
+    const advanced = element("details", "matrix-card matrix-advanced-join");
+    advanced.append(textElement("summary", "", "Advanced: join by full room address"));
+    const joinForm = element("form", "matrix-form");
+    joinForm.append(textElement("p", "matrix-subtle", "Use a full Matrix alias or room ID."));
     const address = input("text", "address", "#room:server.example or !roomId:server.example", joinAddressValue);
     address.dataset.focusKey = "matrix-join-address";
-    address.disabled = joinAddressBusy;
+    address.disabled = joinAddressBusy || joinNameBusy;
     address.addEventListener("input", () => { joinAddressValue = address.value.slice(0, 512); });
     joinForm.append(labelledField("Room alias or ID", address));
     joinForm.append(makeButton(joinAddressBusy ? "Joining..." : "Join", "matrix-button matrix-button-primary", () => {
         if (joinForm.requestSubmit) joinForm.requestSubmit();
-    }, { disabled: joinAddressBusy }));
+    }, { disabled: joinAddressBusy || joinNameBusy }));
     joinForm.addEventListener("submit", event => {
         event.preventDefault();
         joinAddressValue = address.value.slice(0, 512);
         void joinAddress(joinAddressValue);
     });
-    narrow.append(joinForm);
+    advanced.append(joinForm);
+    narrow.append(advanced);
     const heading = element("div", "matrix-card-actions",
-        textElement("h2", "", "Published rooms and servers"),
-        makeButton(directoryLoading ? "Refreshing..." : "Refresh directory", "matrix-button", () => void loadDirectory(), {
+        textElement("h2", "", "Public servers and chats"),
+        makeButton(directoryLoading ? "Refreshing..." : "Refresh discovery", "matrix-button", () => void loadDirectory(), {
             disabled: directoryLoading,
         }),
     );
     narrow.append(heading);
     if (directoryLoading) {
-        narrow.append(textElement("p", "matrix-subtle", "Fetching every published directory page from this homeserver..."));
+        narrow.append(textElement("p", "matrix-subtle", "Fetching public listings from your provider..."));
     } else if (directory) {
         narrow.append(textElement(
             "p",
             "matrix-subtle",
             `${directory.rooms.length} listed${directory.totalRoomCountEstimate == null
                 ? ""
-                : ` - homeserver estimate: ${directory.totalRoomCountEstimate}`}.`,
+                : ` - provider estimate: ${directory.totalRoomCountEstimate}`}.`,
         ));
         if (directory.truncated) {
             narrow.append(textElement(
                 "p",
                 "matrix-subtle",
-                "The safe 2,000-entry scan bound was reached. This directory list is incomplete.",
+                "The safe 2,000-entry scan bound was reached. This discovery list is incomplete.",
             ));
         }
     } else {
-        narrow.append(textElement("p", "matrix-subtle", "Directory has not been loaded yet."));
+        narrow.append(textElement("p", "matrix-subtle", "Discovery has not been loaded yet."));
     }
-    const filter = input("search", "directory-query", "Search published rooms", directoryQuery);
+    const filter = input("search", "directory-query", "Search public servers and chats", directoryQuery);
     filter.dataset.focusKey = "matrix-directory-query";
     filter.addEventListener("input", () => {
         directoryQuery = filter.value.slice(0, 256);
         scheduleRender();
     });
-    narrow.append(labelledField("Search directory", filter));
+    narrow.append(labelledField("Search discovery", filter));
     if (!directory && !directoryLoading) {
-        narrow.append(makeButton("Load published rooms", "matrix-button matrix-button-primary", () => void loadDirectory()));
+        narrow.append(makeButton("Load public listings", "matrix-button matrix-button-primary", () => void loadDirectory()));
     }
     const query = directoryQuery.trim().toLocaleLowerCase();
     const visibleDirectory = (directory?.rooms ?? []).filter(room => !query
@@ -2614,23 +3163,36 @@ function renderDiscoverMain() {
     const grid = element("div", "matrix-grid");
     for (const publicRoom of visibleDirectory) {
         const known = roomById(publicRoom.roomId);
+        const listedJoinName = publicRoom.joinRule === "knock" && publicRoom.roomType === "m.space"
+            ? joinNameFromAlias(publicRoom.alias)
+            : undefined;
         const copy = element("div", "matrix-card-copy",
-            textElement("h3", "", publicRoom.name || publicRoom.alias || "Matrix room"),
+            textElement("h3", "", publicRoom.name || publicRoom.alias || (publicRoom.roomType === "m.space" ? "Server" : "Chat")),
             publicRoom.topic ? textElement("p", "matrix-subtle", publicRoom.topic) : null,
             textElement("div", "matrix-subtle", `${publicRoom.joinedMembers} members - ${publicRoom.roomType === "m.space" ? "server" : "chat"}`),
         );
         const card = element("article", "matrix-card", element("div", "matrix-card-row", copy));
-        card.append(element("div", "matrix-card-actions",
-            known?.membership === "join"
+        const action = known?.membership === "join"
                 ? makeButton("Open", "matrix-button", () => setRoute({
                     kind: isSpace(known) ? "space" : isDirect(known) ? "dm" : "room",
                     roomId: known.roomId,
                 }))
-                : makeButton("Join", "matrix-button matrix-button-primary", () => void joinRoom(publicRoom.roomId)),
-        ));
+                : publicRoom.joinRule === "knock"
+                    ? listedJoinName
+                        ? makeButton("Request access", "matrix-button matrix-button-primary", () => {
+                            void requestServerAccess(listedJoinName, false);
+                        }, { disabled: joinNameBusy || joinAddressBusy })
+                        : textElement("span", "matrix-subtle", "Ask an admin for an invitation")
+                    : makeButton(
+                        publicRoom.roomType === "m.space" ? "Join server" : "Join",
+                        "matrix-button matrix-button-primary",
+                        () => void joinRoom(publicRoom.roomId),
+                        { disabled: joinNameBusy || joinAddressBusy }
+                    );
+        card.append(element("div", "matrix-card-actions", action));
         grid.append(card);
     }
-    if (directory && !visibleDirectory.length) grid.append(textElement("div", "matrix-subtle", "No published rooms match."));
+    if (directory && !visibleDirectory.length) grid.append(textElement("div", "matrix-subtle", "No public servers or chats match."));
     narrow.append(grid);
     page.append(narrow);
     main.append(page);
@@ -2696,9 +3258,14 @@ function renderSecurityIndicator() {
 
 function renderSettingsTabs(selected: "discover" | "account") {
     const tabs = element("div", "matrix-tabs");
-    for (const [page, label] of [["account", "Account"], ["discover", "Find rooms"]] as const) {
+    for (const [page, label] of [["account", "Account"], ["discover", "Discover"]] as const) {
         const tab = makeButton(label, "matrix-tab", () => {
             settingsPage = page;
+            if (page !== "discover") {
+                joinNameValue = "";
+                joinNameError = "";
+                joinAddressValue = "";
+            }
             scheduleRender();
             if (page === "discover" && !directory && !directoryLoading) void loadDirectory();
         });
@@ -2827,7 +3394,7 @@ function renderAuth() {
 function renderCreateSpaceOverlay() {
     const body = element("div", "matrix-modal-body");
     const form = element("form", "matrix-form");
-    const name = input("text", "name", "My Matrix server", createSpaceForm.name);
+    const name = input("text", "name", "My server", createSpaceForm.name);
     name.required = true;
     name.maxLength = 100;
     name.dataset.focusKey = "matrix-create-space-name";
@@ -2843,7 +3410,7 @@ function renderCreateSpaceOverlay() {
     topic.addEventListener("input", () => { createSpaceForm.topic = topic.value; });
     const visibility = element("select", "matrix-select");
     visibility.name = "visibility";
-    for (const [value, label] of [["private", "Private - invitation only"], ["public", "Public - discoverable"]]) {
+    for (const [value, label] of [["private", "Unlisted - invitation only"], ["public", "Public - listed and open to everyone"]]) {
         const option = element("option", "");
         option.value = value;
         option.textContent = label;
@@ -2865,7 +3432,9 @@ function renderCreateSpaceOverlay() {
     form.append(
         labelledField("Server name", name),
         labelledField("Description (optional)", topic),
-        labelledField("Visibility", visibility),
+        labelledField("Initial access", visibility),
+        textElement("p", "matrix-subtle", "Unlisted servers are not listed in your provider's public directory, but links, aliases, or parent servers may still reveal them. Admission is controlled by invitation or request; a join name is not a password."),
+        textElement("p", "matrix-subtle", "After creation, use Access settings on the server page to require approval and choose a unique join name."),
         generalLabel,
     );
     const submit = makeButton(spaceCreationInFlight ? "Creating..." : "Create server", "matrix-button matrix-button-primary", () => form.requestSubmit(), {
@@ -2918,7 +3487,7 @@ function renderCreateSpaceOverlay() {
         });
     });
     body.append(form);
-    return renderModal("Create a Matrix server", body, [submit]);
+    return renderModal("Create a server", body, [submit]);
 }
 
 function setSelectOptions(select: HTMLSelectElement, values: Array<{ value: string; label: string; }>) {

@@ -56,6 +56,9 @@ import type {
     MatrixBridgeEvent,
     MatrixBridgeState,
     MatrixBridgeStatus,
+    MatrixConfigureSpaceAccessRequest,
+    MatrixConfigureSpaceAccessResult,
+    MatrixConfigureSpaceAccessStep,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpacePartialCode,
@@ -78,11 +81,17 @@ import type {
     MatrixReauthenticationRequest,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
+    MatrixRequestSpaceAccessResult,
+    MatrixResolveSpaceAccessRequest,
+    MatrixResolveSpaceAccessRequestResult,
     MatrixRoomActionResult,
     MatrixRoomDTO,
     MatrixRoomJoinRule,
     MatrixRoomKind,
     MatrixSnapshot,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessRequestMemberDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceChildDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
@@ -517,6 +526,19 @@ function projectShellRoom(room: MatrixRoomDTO): MatrixShellRoom {
         membership: room.membership,
         kind: room.kind,
         ...(room.roomType ? { roomType: room.roomType } : {}),
+        ...(room.canConfigureSpaceAccess == null ? {} : {
+            canConfigureSpaceAccess: room.canConfigureSpaceAccess
+        }),
+        ...(room.accessRequestCount == null ? {} : { accessRequestCount: room.accessRequestCount }),
+        ...(room.accessRequestCountComplete == null ? {} : {
+            accessRequestCountComplete: room.accessRequestCountComplete
+        }),
+        ...(room.canApproveAccessRequests == null ? {} : {
+            canApproveAccessRequests: room.canApproveAccessRequests
+        }),
+        ...(room.canDenyAccessRequests == null ? {} : {
+            canDenyAccessRequests: room.canDenyAccessRequests
+        }),
         joinRule: room.joinRule,
         parentIds: [...room.parentIds],
         childIds: [...room.childIds],
@@ -774,6 +796,24 @@ function protocolString(value: unknown, label: string, maximum: number): string 
         throw bridgeError("MATRIX_PROTOCOL_ERROR", `The Matrix ${label} response was invalid.`);
     }
     return value;
+}
+
+function protocolObjectKeys(
+    value: unknown,
+    label: string,
+    allowed: readonly string[],
+    required: readonly string[] = allowed
+): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value) || ArrayBuffer.isView(value)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", `The Matrix ${label} response was invalid.`);
+    }
+    const record = value as Record<string, unknown>;
+    const allowedKeys = new Set(allowed);
+    if (Object.keys(record).some(key => !allowedKeys.has(key))
+        || required.some(key => !Object.hasOwn(record, key))) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", `The Matrix ${label} response contained invalid fields.`);
+    }
+    return record;
 }
 
 function protocolText(value: unknown, label: string, maximum: number, allowEmpty = false): string {
@@ -1280,6 +1320,28 @@ function validateProtocolRoom(value: unknown): MatrixRoomDTO {
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space management permission was invalid.");
         }
         room.canManageSpaceChildren = raw.canManageSpaceChildren;
+    }
+    const hasAccessProjection = raw.canConfigureSpaceAccess !== undefined
+        || raw.accessRequestCount !== undefined
+        || raw.accessRequestCountComplete !== undefined
+        || raw.canApproveAccessRequests !== undefined
+        || raw.canDenyAccessRequests !== undefined;
+    if (kind === "space" && raw.membership === "join") {
+        if (typeof raw.canConfigureSpaceAccess !== "boolean"
+            || !Number.isSafeInteger(raw.accessRequestCount)
+            || raw.accessRequestCount! < 0 || raw.accessRequestCount! > 200
+            || typeof raw.accessRequestCountComplete !== "boolean"
+            || typeof raw.canApproveAccessRequests !== "boolean"
+            || typeof raw.canDenyAccessRequests !== "boolean") {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access projection was invalid.");
+        }
+        room.canConfigureSpaceAccess = raw.canConfigureSpaceAccess;
+        room.accessRequestCount = raw.accessRequestCount;
+        room.accessRequestCountComplete = raw.accessRequestCountComplete;
+        room.canApproveAccessRequests = raw.canApproveAccessRequests;
+        room.canDenyAccessRequests = raw.canDenyAccessRequests;
+    } else if (hasAccessProjection) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "A non-joined Matrix Space exposed access-request state.");
     }
     if (raw.roomType != null) {
         const roomType = protocolText(raw.roomType, "room type", 256);
@@ -2250,6 +2312,44 @@ async function refreshConvergenceSnapshot(
     ));
 }
 
+function ambiguousAccessMutationError(error: unknown): boolean {
+    return error instanceof Error && (error.name === "MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS"
+        || error.name === "MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS"
+        || error.name === "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS");
+}
+
+async function bestEffortAccessMutationRefresh(
+    event: IpcMainInvokeEvent,
+    state: SecureViewState
+): Promise<void> {
+    try {
+        await refreshConvergenceSnapshot(event, state);
+    } catch (error) {
+        // The worker mutation result remains authoritative. Force the outer
+        // shell's next read through a fresh snapshot cut, and log only the
+        // sanitized public code (never account or event data).
+        shellSnapshotDirty = true;
+        console.warn(`[MatrixBridge] Access mutation succeeded or is ambiguous, but convergence refresh failed (${errorDTO(error).code}).`);
+    }
+}
+
+async function runPrivateAccessMutation<T>(
+    event: IpcMainInvokeEvent,
+    state: SecureViewState,
+    mutation: () => Promise<T>
+): Promise<T> {
+    try {
+        const result = await mutation();
+        await bestEffortAccessMutationRefresh(event, state);
+        return result;
+    } catch (error) {
+        if (ambiguousAccessMutationError(error)) {
+            await bestEffortAccessMutationRefresh(event, state);
+        }
+        throw error;
+    }
+}
+
 function secureViewSecurityState(): MatrixSecureViewSecurityState {
     return {
         isolated: true,
@@ -2874,6 +2974,28 @@ async function secureViewBootstrap(event: IpcMainInvokeEvent, state: SecureViewS
     ));
 }
 
+function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]): Error | undefined {
+    switch (commandType) {
+        case "configureSpaceAccess":
+            return bridgeError(
+                "MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS",
+                "Matrix access settings were interrupted and may have changed. Refresh them before saving again."
+            );
+        case "requestSpaceAccess":
+            return bridgeError(
+                "MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS",
+                "Matrix could not confirm the access request. It may already be pending; refresh before trying again."
+            );
+        case "resolveSpaceAccessRequest":
+            return bridgeError(
+                "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS",
+                "Matrix could not confirm the access decision. It may already be resolved; refresh before acting again."
+            );
+        default:
+            return undefined;
+    }
+}
+
 function rejectWorker(reason: Error): void {
     rejectWorkerReady?.(reason);
     resolveWorkerReady = null;
@@ -2882,12 +3004,15 @@ function rejectWorker(reason: Error): void {
 
     for (const request of pendingWorkerRequests.values()) {
         clearTimeout(request.timer);
+        const interruptedAccessMutation = request.started
+            ? interruptedAccessMutationError(request.commandType)
+            : undefined;
         request.reject(request.started && request.commandType === "createSpaceChild"
             ? bridgeError(
                 "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS",
                 "Matrix room creation was interrupted and may have succeeded. Reconcile the parent Space before trying again."
             )
-            : reason);
+            : interruptedAccessMutation ?? reason);
     }
     pendingWorkerRequests.clear();
 }
@@ -2915,6 +3040,7 @@ function commandTimer(commandType: MatrixWorkerCommand["type"], queued: boolean)
     return setTimeout(() => {
         const createSpaceMayHaveSucceeded = !queued && commandType === "createSpace";
         const createSpaceChildMayHaveSucceeded = !queued && commandType === "createSpaceChild";
+        const interruptedAccessMutation = !queued ? interruptedAccessMutationError(commandType) : undefined;
         const error = queued
             ? bridgeError(
                 "MATRIX_COMMAND_QUEUE_TIMEOUT",
@@ -2930,7 +3056,7 @@ function commandTimer(commandType: MatrixWorkerCommand["type"], queued: boolean)
                         "MATRIX_CREATE_SPACE_AMBIGUOUS",
                         "Matrix Space creation timed out and may have succeeded. Refresh your Spaces before trying again."
                     )
-                    : bridgeError(
+                    : interruptedAccessMutation ?? bridgeError(
                         "MATRIX_COMMAND_TIMEOUT",
                         `The Matrix ${commandType} operation timed out; its backend was restarted.`
                     );
@@ -4007,6 +4133,377 @@ async function createSpace(
     };
 }
 
+const SPACE_JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const MAX_SPACE_ACCESS_REQUEST_TIMESTAMP = 4_102_444_800_000;
+
+function validateSpaceJoinName(value: unknown): string {
+    const joinName = validateString(value, "Space join name", 64);
+    if (!SPACE_JOIN_NAME_PATTERN.test(joinName)) {
+        throw bridgeError(
+            "MATRIX_INVALID_SPACE_JOIN_NAME",
+            "Use 1-64 lowercase letters, numbers, dots, underscores, or hyphens, with a letter or number at each end."
+        );
+    }
+    return joinName;
+}
+
+function validateConfigureSpaceAccessRequest(value: unknown): MatrixConfigureSpaceAccessRequest {
+    const input = exactObjectKeys(
+        value,
+        "Space access settings",
+        ["spaceId", "mode", "joinName"],
+        ["spaceId", "mode"]
+    );
+    if (input.mode !== "public" && input.mode !== "request" && input.mode !== "invite") {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space access mode is invalid.");
+    }
+    return {
+        spaceId: validateRoomId(input.spaceId),
+        mode: input.mode,
+        ...(input.joinName == null ? {} : { joinName: validateSpaceJoinName(input.joinName) })
+    };
+}
+
+function validateResolveSpaceAccessRequest(value: unknown): MatrixResolveSpaceAccessRequest {
+    const input = exactObjectKeys(
+        value,
+        "Space access request decision",
+        ["spaceId", "userId", "decision"]
+    );
+    if (input.decision !== "approve" && input.decision !== "deny") {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space access request decision is invalid.");
+    }
+    return {
+        spaceId: validateRoomId(input.spaceId),
+        userId: validateUserId(input.userId),
+        decision: input.decision
+    };
+}
+
+async function withExpectedMatrixAccount<T>(
+    expectedUserId: string,
+    operation: (binding: MatrixAccountBinding) => Promise<T>
+): Promise<T> {
+    const targetUserId = validateUserId(expectedUserId);
+    await requireStarted();
+    const binding = activeWorkerBinding;
+    if (!binding || binding.userId !== targetUserId) {
+        throw bridgeError("MATRIX_SESSION_CHANGED", "The Matrix account changed. Try again.");
+    }
+    const releaseAccount = beginAccountBoundOperation(binding);
+    try {
+        const result = await operation(binding);
+        if (!sameAccountBinding(binding, activeWorkerBinding)) {
+            throw bridgeError("MATRIX_SESSION_CHANGED", "The Matrix account changed during the request.");
+        }
+        return result;
+    } finally {
+        releaseAccount();
+    }
+}
+
+function validateProtocolSpaceAccessSummary(
+    value: unknown,
+    expectedSpaceId: string,
+    expectedServerName: string
+): MatrixSpaceAccessSummaryDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "Space access summary",
+        [
+            "spaceId",
+            "mode",
+            "joinRule",
+            "directoryVisibility",
+            "historyVisibility",
+            "guestAccess",
+            "joinName",
+            "joinAlias"
+        ],
+        ["spaceId", "mode", "joinRule", "directoryVisibility", "historyVisibility", "guestAccess"]
+    );
+    const spaceId = protocolRoomId(raw.spaceId);
+    const joinRule = protocolJoinRule(raw.joinRule);
+    if (spaceId !== expectedSpaceId || !joinRule
+        || (raw.mode !== "public" && raw.mode !== "request" && raw.mode !== "invite")
+        || (raw.directoryVisibility !== "public" && raw.directoryVisibility !== "private")
+        || (raw.historyVisibility !== "invited" && raw.historyVisibility !== "joined"
+            && raw.historyVisibility !== "shared" && raw.historyVisibility !== "world_readable")
+        || (raw.guestAccess !== "can_join" && raw.guestAccess !== "forbidden")) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access summary was invalid.");
+    }
+    const derivedMode = joinRule === "public"
+        ? "public"
+        : joinRule === "knock" || joinRule === "knock_restricted" ? "request" : "invite";
+    if (raw.mode !== derivedMode || (raw.joinName == null) !== (raw.joinAlias == null)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access summary was inconsistent.");
+    }
+    const result: MatrixSpaceAccessSummaryDTO = {
+        spaceId,
+        mode: raw.mode,
+        joinRule,
+        directoryVisibility: raw.directoryVisibility,
+        historyVisibility: raw.historyVisibility,
+        guestAccess: raw.guestAccess
+    };
+    if (raw.joinName != null) {
+        let joinName: string;
+        try {
+            joinName = validateSpaceJoinName(raw.joinName);
+        } catch {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space join name response was invalid.");
+        }
+        const joinAlias = protocolString(raw.joinAlias, "Space join alias", 1_024);
+        if (joinAlias !== `#${joinName}:${expectedServerName}`) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space join alias response was invalid.");
+        }
+        result.joinName = joinName;
+        result.joinAlias = joinAlias;
+    }
+    return result;
+}
+
+function validateProtocolConfigureSpaceAccessResult(
+    value: unknown,
+    request: MatrixConfigureSpaceAccessRequest,
+    expectedServerName: string
+): MatrixConfigureSpaceAccessResult {
+    const raw = protocolObjectKeys(
+        value,
+        "Space access configuration",
+        ["spaceId", "requestedMode", "access", "accessConfirmed", "complete", "partial"],
+        ["spaceId", "requestedMode", "access", "accessConfirmed", "complete"]
+    );
+    if (protocolRoomId(raw.spaceId) !== request.spaceId || raw.requestedMode !== request.mode
+        || typeof raw.accessConfirmed !== "boolean" || typeof raw.complete !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access configuration was inconsistent.");
+    }
+    const access = validateProtocolSpaceAccessSummary(raw.access, request.spaceId, expectedServerName);
+    let partial: MatrixConfigureSpaceAccessResult["partial"];
+    if (raw.partial != null) {
+        const candidate = protocolObjectKeys(
+            raw.partial,
+            "Space access partial result",
+            ["code", "failedStep", "message"]
+        );
+        const steps = new Set<MatrixConfigureSpaceAccessStep>([
+            "alias",
+            "alias_rollback",
+            "canonical_alias",
+            "history_visibility",
+            "guest_access",
+            "join_rule",
+            "directory",
+            "verification"
+        ]);
+        if (candidate.code !== "MATRIX_SPACE_ACCESS_PARTIAL" || !steps.has(candidate.failedStep as MatrixConfigureSpaceAccessStep)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access partial result was invalid.");
+        }
+        partial = {
+            code: "MATRIX_SPACE_ACCESS_PARTIAL",
+            failedStep: candidate.failedStep as MatrixConfigureSpaceAccessStep,
+            message: protocolText(candidate.message, "Space access partial-result message", 300)
+        };
+    }
+    if (raw.complete === (partial != null)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access configuration completion state was invalid.");
+    }
+    if (raw.complete && !raw.accessConfirmed) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access configuration was not confirmed.");
+    }
+    if (raw.complete) {
+        const desiredJoinRule = request.mode === "public" ? "public" : request.mode === "request" ? "knock" : "invite";
+        const desiredDirectory = request.mode === "public" ? "public" : "private";
+        if (access.joinRule !== desiredJoinRule || access.directoryVisibility !== desiredDirectory
+            || access.historyVisibility !== "joined" || access.guestAccess !== "forbidden"
+            || (request.joinName != null
+                && access.joinAlias !== `#${request.joinName}:${expectedServerName}`)
+            || (request.mode === "request" && !access.joinName)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access configuration claimed an incomplete state.");
+        }
+    }
+    return {
+        spaceId: request.spaceId,
+        requestedMode: request.mode,
+        access,
+        accessConfirmed: raw.accessConfirmed,
+        complete: raw.complete,
+        ...(partial ? { partial } : {})
+    };
+}
+
+function validateProtocolRequestSpaceAccessResult(value: unknown): MatrixRequestSpaceAccessResult {
+    const raw = protocolObjectKeys(value, "Space access request", ["roomId", "membership"]);
+    if (raw.membership !== "knock" && raw.membership !== "invite" && raw.membership !== "join") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access request membership was invalid.");
+    }
+    return { roomId: protocolRoomId(raw.roomId), membership: raw.membership };
+}
+
+function validateProtocolSpaceAccessRequestMember(value: unknown): MatrixSpaceAccessRequestMemberDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "Space access requester",
+        ["userId", "displayName", "avatarUrl", "requestedAt", "canApprove", "canDeny"],
+        ["userId", "canApprove", "canDeny"]
+    );
+    if (typeof raw.canApprove !== "boolean" || typeof raw.canDeny !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access requester permissions were invalid.");
+    }
+    const result: MatrixSpaceAccessRequestMemberDTO = {
+        userId: protocolUserId(raw.userId),
+        canApprove: raw.canApprove,
+        canDeny: raw.canDeny
+    };
+    if (raw.displayName != null) {
+        result.displayName = protocolText(raw.displayName, "Space access requester display name", 256);
+    }
+    if (raw.avatarUrl != null) result.avatarUrl = protocolMediaUrl(raw.avatarUrl);
+    if (raw.requestedAt != null) {
+        if (!Number.isSafeInteger(raw.requestedAt) || Number(raw.requestedAt) < 0
+            || Number(raw.requestedAt) > MAX_SPACE_ACCESS_REQUEST_TIMESTAMP) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access request timestamp was invalid.");
+        }
+        result.requestedAt = Number(raw.requestedAt);
+    }
+    return result;
+}
+
+function validateProtocolSpaceAccessRequestList(
+    value: unknown,
+    expectedSpaceId: string
+): MatrixSpaceAccessRequestListDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "Space access request list",
+        ["spaceId", "requests", "truncated", "canApproveAccessRequests", "canDenyAccessRequests"]
+    );
+    if (protocolRoomId(raw.spaceId) !== expectedSpaceId || !Array.isArray(raw.requests)
+        || raw.requests.length > 200 || typeof raw.truncated !== "boolean"
+        || typeof raw.canApproveAccessRequests !== "boolean"
+        || typeof raw.canDenyAccessRequests !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access request list was invalid.");
+    }
+    const requests = raw.requests.map(validateProtocolSpaceAccessRequestMember);
+    if (new Set(requests.map(request => request.userId)).size !== requests.length
+        || requests.some(request => request.canApprove !== raw.canApproveAccessRequests
+            || (!raw.canDenyAccessRequests && request.canDeny))) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access request list was inconsistent.");
+    }
+    return {
+        spaceId: expectedSpaceId,
+        requests,
+        truncated: raw.truncated,
+        canApproveAccessRequests: raw.canApproveAccessRequests,
+        canDenyAccessRequests: raw.canDenyAccessRequests
+    };
+}
+
+function validateProtocolResolveSpaceAccessRequestResult(
+    value: unknown,
+    request: MatrixResolveSpaceAccessRequest
+): MatrixResolveSpaceAccessRequestResult {
+    const raw = protocolObjectKeys(
+        value,
+        "Space access request resolution",
+        ["spaceId", "userId", "decision", "membership", "accessRequestCount"]
+    );
+    const membershipValid = request.decision === "approve"
+        ? raw.membership === "invite" || raw.membership === "join"
+        : raw.membership === "leave";
+    if (protocolRoomId(raw.spaceId) !== request.spaceId || protocolUserId(raw.userId) !== request.userId
+        || raw.decision !== request.decision || !membershipValid
+        || !Number.isSafeInteger(raw.accessRequestCount)
+        || Number(raw.accessRequestCount) < 0 || Number(raw.accessRequestCount) > 200) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space access request resolution was invalid.");
+    }
+    return {
+        ...request,
+        membership: raw.membership as MatrixResolveSpaceAccessRequestResult["membership"],
+        accessRequestCount: Number(raw.accessRequestCount)
+    };
+}
+
+async function getSpaceAccess(
+    _: IpcMainInvokeEvent,
+    spaceId: string,
+    expectedUserId: string
+): Promise<MatrixSpaceAccessSummaryDTO> {
+    const targetSpaceId = validateRoomId(spaceId);
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const result = await callWorker<MatrixSpaceAccessSummaryDTO>({ type: "getSpaceAccess", spaceId: targetSpaceId });
+        return validateProtocolSpaceAccessSummary(
+            result,
+            targetSpaceId,
+            serverNameFromMatrixIdentifier(binding.userId)
+        );
+    });
+}
+
+async function configureSpaceAccess(
+    _: IpcMainInvokeEvent,
+    request: MatrixConfigureSpaceAccessRequest,
+    expectedUserId: string
+): Promise<MatrixConfigureSpaceAccessResult> {
+    const validatedRequest = validateConfigureSpaceAccessRequest(request);
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const result = await callWorker<MatrixConfigureSpaceAccessResult>({
+            type: "configureSpaceAccess",
+            request: validatedRequest
+        });
+        return validateProtocolConfigureSpaceAccessResult(
+            result,
+            validatedRequest,
+            serverNameFromMatrixIdentifier(binding.userId)
+        );
+    });
+}
+
+async function requestSpaceAccess(
+    _: IpcMainInvokeEvent,
+    joinName: string,
+    expectedUserId: string
+): Promise<MatrixRequestSpaceAccessResult> {
+    const validatedJoinName = validateSpaceJoinName(joinName);
+    return await withExpectedMatrixAccount(expectedUserId, async () => {
+        const result = await callWorker<MatrixRequestSpaceAccessResult>({
+            type: "requestSpaceAccess",
+            joinName: validatedJoinName
+        });
+        return validateProtocolRequestSpaceAccessResult(result);
+    });
+}
+
+async function getSpaceAccessRequests(
+    _: IpcMainInvokeEvent,
+    spaceId: string,
+    expectedUserId: string
+): Promise<MatrixSpaceAccessRequestListDTO> {
+    const targetSpaceId = validateRoomId(spaceId);
+    return await withExpectedMatrixAccount(expectedUserId, async () => {
+        const result = await callWorker<MatrixSpaceAccessRequestListDTO>({
+            type: "getSpaceAccessRequests",
+            spaceId: targetSpaceId
+        });
+        return validateProtocolSpaceAccessRequestList(result, targetSpaceId);
+    });
+}
+
+async function resolveSpaceAccessRequest(
+    _: IpcMainInvokeEvent,
+    request: MatrixResolveSpaceAccessRequest,
+    expectedUserId: string
+): Promise<MatrixResolveSpaceAccessRequestResult> {
+    const validatedRequest = validateResolveSpaceAccessRequest(request);
+    return await withExpectedMatrixAccount(expectedUserId, async () => {
+        const result = await callWorker<MatrixResolveSpaceAccessRequestResult>({
+            type: "resolveSpaceAccessRequest",
+            request: validatedRequest
+        });
+        return validateProtocolResolveSpaceAccessRequestResult(result, validatedRequest);
+    });
+}
+
 function validateCreateSpaceChildRequest(value: unknown): MatrixCreateSpaceChildRequest {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space child details are invalid.");
@@ -4900,6 +5397,30 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
                 ["name"]
             );
             break;
+        case "getSpaceAccess":
+        case "getSpaceAccessRequests":
+            exactObjectKeys(request, "secure view request", ["type", "spaceId"]);
+            break;
+        case "configureSpaceAccess":
+            exactObjectKeys(request, "secure view request", ["type", "request"]);
+            exactObjectKeys(
+                request.request,
+                "configure Space access request",
+                ["spaceId", "mode", "joinName"],
+                ["spaceId", "mode"]
+            );
+            break;
+        case "requestSpaceAccess":
+            exactObjectKeys(request, "secure view request", ["type", "joinName"]);
+            break;
+        case "resolveSpaceAccessRequest":
+            exactObjectKeys(request, "secure view request", ["type", "request"]);
+            exactObjectKeys(
+                request.request,
+                "resolve Space access request",
+                ["spaceId", "userId", "decision"]
+            );
+            break;
         case "createSpaceChild":
             exactObjectKeys(request, "secure view request", ["type", "request"]);
             exactObjectKeys(
@@ -5093,6 +5614,17 @@ function requireCurrentSecureViewAccount(state: SecureViewState): void {
     }
 }
 
+function secureViewExpectedUserId(state: SecureViewState): string {
+    const userId = state.boundAccount?.userId;
+    if (!userId) {
+        throw bridgeError(
+            "MATRIX_SECURE_VIEW_ACCOUNT_STALE",
+            "Reload the secure Matrix view before changing Space access."
+        );
+    }
+    return userId;
+}
+
 function requireVerifiedSignedOutView(state: SecureViewState): void {
     if (accountLifecycleTransitions > 0 || state.boundAccount !== null || activeWorkerBinding !== null) {
         throw bridgeError(
@@ -5267,6 +5799,23 @@ async function handlePrivateRequest(
             } finally {
                 createSpaceInFlight = false;
             }
+        }
+        case "getSpaceAccess":
+            return await getSpaceAccess(event, request.spaceId, secureViewExpectedUserId(state));
+        case "configureSpaceAccess": {
+            return await runPrivateAccessMutation(event, state, () => configureSpaceAccess(
+                event, request.request, secureViewExpectedUserId(state)
+            ));
+        }
+        case "requestSpaceAccess": return await runPrivateAccessMutation(event, state, () =>
+            requestSpaceAccess(event, request.joinName, secureViewExpectedUserId(state))
+        );
+        case "getSpaceAccessRequests":
+            return await getSpaceAccessRequests(event, request.spaceId, secureViewExpectedUserId(state));
+        case "resolveSpaceAccessRequest": {
+            return await runPrivateAccessMutation(event, state, () => resolveSpaceAccessRequest(
+                event, request.request, secureViewExpectedUserId(state)
+            ));
         }
         case "createSpaceChild": {
             const result = await createSpaceChild(event, request.request);
@@ -5651,11 +6200,14 @@ export async function secureViewDispose(event: IpcMainInvokeEvent): Promise<void
 export {
     acceptInvite,
     cancelPending,
+    configureSpaceAccess,
     createSpace,
     createSpaceChild,
     downloadMedia,
     edit,
     getConfig,
+    getSpaceAccess,
+    getSpaceAccessRequests,
     getStatus,
     joinRoom,
     joinRoomAddress,
@@ -5674,6 +6226,8 @@ export {
     register,
     rejectInvite,
     repairSpaceChildLink,
+    requestSpaceAccess,
+    resolveSpaceAccessRequest,
     searchMessages,
     sendAttachment,
     sendSticker,

@@ -263,6 +263,30 @@
     outline: none;
 }
 
+.vc-matrix-access-requests-button {
+    position: relative;
+}
+
+.vc-matrix-access-requests-badge {
+    align-items: center;
+    background: var(--status-danger);
+    border: 2px solid var(--background-primary);
+    border-radius: 10px;
+    color: var(--white-500);
+    display: flex;
+    font-size: 9px;
+    font-weight: 700;
+    height: 14px;
+    justify-content: center;
+    line-height: 10px;
+    min-width: 14px;
+    padding: 0 2px;
+    pointer-events: none;
+    position: absolute;
+    right: -3px;
+    top: -3px;
+}
+
 .vc-matrix-readonly-title {
     align-items: center;
     color: var(--header-primary);
@@ -355,6 +379,80 @@
     text-align: center;
 }
 
+.vc-matrix-access-requests {
+    display: grid;
+    gap: 10px;
+}
+
+.vc-matrix-access-requests-status {
+    color: var(--text-muted);
+    min-height: 20px;
+}
+
+.vc-matrix-access-requests-list {
+    display: grid;
+    gap: 4px;
+    max-height: min(55vh, 560px);
+    overflow-y: auto;
+}
+
+.vc-matrix-access-request {
+    align-items: center;
+    background: var(--background-secondary);
+    border-radius: 8px;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    padding: 10px 12px;
+}
+
+.vc-matrix-access-request-avatar {
+    align-items: center;
+    background: var(--brand-500);
+    border-radius: 50%;
+    color: var(--white-500);
+    display: flex;
+    font-size: 16px;
+    font-weight: 700;
+    height: 40px;
+    justify-content: center;
+    overflow: hidden;
+    text-transform: uppercase;
+    width: 40px;
+}
+
+.vc-matrix-access-request-identity {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.vc-matrix-access-request-identity > strong,
+.vc-matrix-access-request-identity > code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vc-matrix-access-request-identity > code {
+    color: var(--text-muted);
+    font-family: var(--font-code);
+    font-size: 12px;
+}
+
+.vc-matrix-access-request-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.vc-matrix-access-requests-empty {
+    color: var(--text-muted);
+    padding: 24px 12px;
+    text-align: center;
+}
+
 @media (width <= 720px) {
     .vc-matrix-settings-header,
     .vc-matrix-heading-with-actions,
@@ -377,5 +475,19 @@
     .vc-matrix-restriction {
         max-width: none;
         text-align: left;
+    }
+
+    .vc-matrix-access-request {
+        align-items: start;
+        grid-template-columns: 40px minmax(0, 1fr);
+    }
+
+    .vc-matrix-access-request-actions {
+        grid-column: 1 / -1;
+        justify-content: stretch;
+    }
+
+    .vc-matrix-access-request-actions > button {
+        flex: 1;
     }
 }

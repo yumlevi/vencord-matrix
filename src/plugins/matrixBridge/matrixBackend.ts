@@ -42,6 +42,9 @@ import type {
     MatrixBridgeError,
     MatrixBridgeState,
     MatrixBridgeStatus,
+    MatrixConfigureSpaceAccessRequest,
+    MatrixConfigureSpaceAccessResult,
+    MatrixConfigureSpaceAccessStep,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpacePartialResult,
@@ -63,11 +66,17 @@ import type {
     MatrixReactionDTO,
     MatrixReauthenticationRequest,
     MatrixReconcileSpaceChildCreateResult,
+    MatrixRequestSpaceAccessResult,
+    MatrixResolveSpaceAccessRequest,
+    MatrixResolveSpaceAccessRequestResult,
     MatrixRoomActionResult,
     MatrixRoomDTO,
     MatrixRoomJoinRule,
     MatrixRoomKind,
     MatrixSnapshot,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessRequestMemberDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceChildDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
@@ -90,6 +99,8 @@ import type {
 const MAX_TIMELINE_MESSAGES = 100;
 const MAX_SNAPSHOT_ROOMS = 250;
 const MAX_ROOM_MEMBERS = 2_000;
+const MAX_SPACE_ACCESS_REQUESTS = 200;
+const MAX_RESOLVED_SPACE_ACCESS_REQUESTS = 1_000;
 const MAX_SNAPSHOT_MESSAGES = 1_000;
 const MAX_SNAPSHOT_MEMBERS = 2_000;
 const MAX_SNAPSHOT_MESSAGE_JSON_CHARS = 2 * 1024 * 1024;
@@ -140,6 +151,7 @@ const ATTACHMENT_GROUP_CONTENT_KEY = "dev.vencord.matrix_bridge.attachment_group
 const ATTACHMENT_GROUP_ID_PATTERN = /^vcgrp_[0-9a-f]{64}$/u;
 const SPACE_CHILD_CREATION_EVENT_TYPE = "dev.vencord.matrix_bridge.space_child_creation";
 const SPACE_CHILD_CREATION_MARKER_PATTERN = /^vccreate_[0-9a-f]{64}$/u;
+const SPACE_JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
 
 class PublicWorkerError extends Error {
     constructor(public readonly code: string, message: string) {
@@ -234,6 +246,14 @@ const reactionTargets = new Map<string, { roomId: string; eventId: string; }>();
 const publicDirectoryTargets = new Set<string>();
 const spaceHierarchyTargets = new Map<string, Map<string, string[]>>();
 const pendingHiddenRooms = new Set<string>();
+const resolvedSpaceAccessRequests = new Map<string, { roomId: string; userId: string; }>();
+interface SpaceAccessMemberLoad {
+    client: MatrixClient;
+    generation: number;
+    userId: string;
+    promise?: Promise<boolean>;
+}
+const spaceAccessMemberLoads = new Map<Room, SpaceAccessMemberLoad>();
 interface CachedUrlPreview {
     sourceUrl: string;
     imageMxc?: string;
@@ -252,6 +272,38 @@ const searchEventCache = new Map<string, CachedSearchEvent>();
 const reactionMapCache = new WeakMap<Room, Map<string, MatrixReactionDTO[]>>();
 const isolatedDecryptionEvents = new WeakSet<MatrixEvent>();
 const activeMediaReadControllers = new Set<AbortController>();
+
+function resolvedSpaceAccessRequestKey(roomId: string, userId: string): string {
+    return `${roomId}\0${userId}`;
+}
+
+function isResolvedSpaceAccessRequest(roomId: string, userId: string): boolean {
+    return resolvedSpaceAccessRequests.has(resolvedSpaceAccessRequestKey(roomId, userId));
+}
+
+function reserveResolvedSpaceAccessRequest(roomId: string, userId: string): void {
+    const key = resolvedSpaceAccessRequestKey(roomId, userId);
+    if (resolvedSpaceAccessRequests.has(key)) {
+        fail("MATRIX_SPACE_ACCESS_REQUEST_NOT_PENDING", "That Matrix Space access request is no longer pending.");
+    }
+    if (resolvedSpaceAccessRequests.size >= MAX_RESOLVED_SPACE_ACCESS_REQUESTS) {
+        fail(
+            "MATRIX_SPACE_ACCESS_RESOLUTION_BUSY",
+            "Matrix is still confirming too many resolved Space access requests. Try again after the next sync."
+        );
+    }
+    resolvedSpaceAccessRequests.set(key, { roomId, userId });
+}
+
+function forgetResolvedSpaceAccessRequest(roomId: string, userId: string): void {
+    resolvedSpaceAccessRequests.delete(resolvedSpaceAccessRequestKey(roomId, userId));
+}
+
+function forgetResolvedSpaceAccessRequestsForRoom(roomId: string): void {
+    for (const [key, request] of resolvedSpaceAccessRequests) {
+        if (request.roomId === roomId) resolvedSpaceAccessRequests.delete(key);
+    }
+}
 
 function trackMediaReadController(controller: AbortController): AbortController {
     activeMediaReadControllers.add(controller);
@@ -1894,6 +1946,180 @@ function boundedNotificationCount(value: unknown): number {
         : 0;
 }
 
+interface ParsedMatrixPowerLevel {
+    valid: boolean;
+    value: number;
+}
+
+function invalidMatrixPowerLevel(): ParsedMatrixPowerLevel {
+    return { valid: false, value: 0 };
+}
+
+function parseMatrixPowerLevel(value: unknown, roomVersion: string): ParsedMatrixPowerLevel {
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) return invalidMatrixPowerLevel();
+        // Room version 1 accepted finite JSON numbers and its authorization
+        // rules truncated fractional power levels toward zero. Later room
+        // versions require integer-valued JSON numbers.
+        const normalized = roomVersion === "1" ? Math.trunc(value) : value;
+        return Number.isSafeInteger(normalized)
+            ? { valid: true, value: normalized }
+            : invalidMatrixPowerLevel();
+    }
+    // Room versions 1-9 accepted integer-valued strings, including the
+    // historical whitespace, sign, and leading-zero forms. Modern versions
+    // reject strings rather than silently applying an absent-field default.
+    if (/^[1-9]$/u.test(roomVersion) && typeof value === "string"
+        && /^\s*[+-]?[0-9]+\s*$/u.test(value)) {
+        const normalized = Number(value.trim());
+        if (Number.isSafeInteger(normalized)) return { valid: true, value: normalized };
+    }
+    return invalidMatrixPowerLevel();
+}
+
+function defaultedMatrixPowerLevel(
+    content: Record<string, unknown>,
+    key: string,
+    fallback: number,
+    roomVersion: string
+): ParsedMatrixPowerLevel {
+    return Object.hasOwn(content, key)
+        ? parseMatrixPowerLevel(content[key], roomVersion)
+        : { valid: true, value: fallback };
+}
+
+function roomPowerLevelContent(room: Room): { valid: boolean; content: Record<string, unknown>; } {
+    const event = room.currentState.getStateEvents(EventType.RoomPowerLevels, "");
+    if (!event) return { valid: true, content: {} };
+    const content: unknown = event.getContent();
+    return content && typeof content === "object" && !Array.isArray(content)
+        ? { valid: true, content: content as Record<string, unknown> }
+        : { valid: false, content: {} };
+}
+
+function userPowerLevel(
+    content: Record<string, unknown>,
+    userId: string,
+    roomVersion: string
+): ParsedMatrixPowerLevel {
+    const usersDefault = defaultedMatrixPowerLevel(content, "users_default", 0, roomVersion);
+    if (!usersDefault.valid) return usersDefault;
+    if (!Object.hasOwn(content, "users")) return usersDefault;
+    const { users } = content;
+    if (!users || typeof users !== "object" || Array.isArray(users)) return invalidMatrixPowerLevel();
+    const levels = users as Record<string, unknown>;
+    return Object.hasOwn(levels, userId)
+        ? parseMatrixPowerLevel(levels[userId], roomVersion)
+        : usersDefault;
+}
+
+function spaceAccessPermissions(
+    room: Room,
+    targetUserId?: string
+): { canApprove: boolean; canDeny: boolean; } {
+    if (!activeCredentials || room.getMember(activeCredentials.userId)?.membership !== "join") {
+        return { canApprove: false, canDeny: false };
+    }
+    const roomVersion = room.getVersion();
+    const powerLevelState = roomPowerLevelContent(room);
+    if (!powerLevelState.valid) return { canApprove: false, canDeny: false };
+    const powerLevels = powerLevelState.content;
+    const senderLevel = userPowerLevel(powerLevels, activeCredentials.userId, roomVersion);
+    const inviteLevel = defaultedMatrixPowerLevel(powerLevels, "invite", 0, roomVersion);
+    const kickLevel = defaultedMatrixPowerLevel(powerLevels, "kick", 50, roomVersion);
+    const targetLevel = targetUserId == null
+        ? undefined
+        : room.getMember(targetUserId)?.powerLevel === Infinity
+            ? { valid: true, value: Infinity }
+            : userPowerLevel(powerLevels, targetUserId, roomVersion);
+    if (!senderLevel.valid || !inviteLevel.valid || !kickLevel.valid || targetLevel?.valid === false) {
+        return { canApprove: false, canDeny: false };
+    }
+    return {
+        canApprove: senderLevel.value >= inviteLevel.value,
+        canDeny: senderLevel.value >= kickLevel.value
+            && (targetLevel == null || senderLevel.value > targetLevel.value)
+    };
+}
+
+function canConfigureSpaceAccess(room: Room): boolean {
+    if (!activeCredentials) return false;
+    const sender = room.getMember(activeCredentials.userId);
+    if (sender?.membership !== "join") return false;
+    const roomVersion = room.getVersion();
+    const powerLevelState = roomPowerLevelContent(room);
+    if (!powerLevelState.valid) return false;
+    const powerLevels = powerLevelState.content;
+    const senderLevel = sender.powerLevel === Infinity
+        ? { valid: true, value: Infinity }
+        : userPowerLevel(powerLevels, activeCredentials.userId, roomVersion);
+    const stateDefault = defaultedMatrixPowerLevel(powerLevels, "state_default", 50, roomVersion);
+    if (!senderLevel.valid || !stateDefault.valid) return false;
+    let eventLevels: Record<string, unknown> | undefined;
+    if (Object.hasOwn(powerLevels, "events")) {
+        const { events } = powerLevels;
+        if (!events || typeof events !== "object" || Array.isArray(events)) return false;
+        eventLevels = events as Record<string, unknown>;
+    }
+    return [
+        EventType.RoomJoinRules,
+        EventType.RoomHistoryVisibility,
+        EventType.RoomGuestAccess,
+        EventType.RoomCanonicalAlias
+    ].every(type => {
+        const required = eventLevels && Object.hasOwn(eventLevels, type)
+            ? parseMatrixPowerLevel(eventLevels[type], roomVersion)
+            : stateDefault;
+        return required.valid && senderLevel.value >= required.value;
+    });
+}
+
+function currentSpaceAccessRequestCount(room: Room): number {
+    let count = 0;
+    for (const member of room.getMembers()) {
+        if (member.membership !== "knock" || isResolvedSpaceAccessRequest(room.roomId, member.userId)) continue;
+        count++;
+        if (count >= MAX_SPACE_ACCESS_REQUESTS) return MAX_SPACE_ACCESS_REQUESTS;
+    }
+    return count;
+}
+
+function spaceAccessMembersLoading(room: Room): boolean {
+    return spaceAccessMemberLoads.has(room);
+}
+
+function loadSpaceAccessMembers(room: Room): Promise<boolean> {
+    const existing = spaceAccessMemberLoads.get(room)?.promise;
+    if (existing) return existing;
+    if (!matrixClient || !activeCredentials) {
+        return Promise.reject(new PublicWorkerError("MATRIX_NOT_STARTED", "The Matrix backend is not started."));
+    }
+    const entry: SpaceAccessMemberLoad = {
+        client: matrixClient,
+        generation: clientGeneration,
+        userId: activeCredentials.userId
+    };
+    spaceAccessMemberLoads.set(room, entry);
+    entry.promise = Promise.resolve()
+        .then(() => room.loadMembersIfNeeded())
+        .finally(() => {
+            if (spaceAccessMemberLoads.get(room) !== entry) return;
+            spaceAccessMemberLoads.delete(room);
+            if (matrixClient === entry.client && clientGeneration === entry.generation
+                && activeCredentials?.userId === entry.userId) {
+                // Membership/name/power listeners are coalesced while the OOB
+                // load runs. Publish one authoritative post-hydration delta,
+                // including any live change which arrived during that window.
+                safeListener(() => emitRoom(room));
+            }
+        });
+    return entry.promise;
+}
+
+function disposeSpaceAccessMemberHydrations(): void {
+    spaceAccessMemberLoads.clear();
+}
+
 function recentRoomMessages(
     room: Room,
     reactionMap: Map<string, MatrixReactionDTO[]>,
@@ -1971,6 +2197,14 @@ function normalizeRoom(
         result.canManageSpaceChildren = membership === "join"
             && activeCredentials != null
             && room.currentState.maySendStateEvent(EventType.SpaceChild, activeCredentials.userId);
+        if (membership === "join") {
+            const permissions = spaceAccessPermissions(room);
+            result.canConfigureSpaceAccess = canConfigureSpaceAccess(room);
+            result.accessRequestCount = currentSpaceAccessRequestCount(room);
+            result.accessRequestCountComplete = room.membersLoaded();
+            result.canApproveAccessRequests = permissions.canApprove;
+            result.canDenyAccessRequests = permissions.canDeny;
+        }
     }
     const directUserId = roomDirectUserId(room, directRooms);
     if (directUserId) result.directUserId = directUserId;
@@ -2096,7 +2330,9 @@ function observeRoom(room: Room): void {
     const guarded = (callback: () => void) => safeListener(() => {
         if (client && matrixClient === client && clientGeneration === generation) callback();
     });
-    room.on(RoomEvent.CurrentStateUpdated, () => guarded(() => emitRoom(room)));
+    room.on(RoomEvent.CurrentStateUpdated, () => guarded(() => {
+        if (!spaceAccessMembersLoading(room)) emitRoom(room);
+    }));
     room.on(RoomEvent.UnreadNotifications, () => guarded(() => emitRoom(room)));
     room.on(RoomEvent.TimelineReset, (_emittedRoom, timelineSet) => guarded(() => {
         if (!isMainMatrixTimelineReset(room, timelineSet)) return;
@@ -2192,7 +2428,10 @@ function attachClientListeners(client: MatrixClient): void {
             emit({ type: "snapshot", snapshot: snapshot() });
         }
     }));
-    client.on(ClientEvent.DeleteRoom, () => guarded(() => emit({ type: "snapshot", snapshot: snapshot() })));
+    client.on(ClientEvent.DeleteRoom, roomId => guarded(() => {
+        forgetResolvedSpaceAccessRequestsForRoom(roomId);
+        emit({ type: "snapshot", snapshot: snapshot() });
+    }));
     client.on(ClientEvent.AccountData, event => guarded(() => {
         if (event.getType() === EventType.Direct) emit({ type: "snapshot", snapshot: snapshot() });
     }));
@@ -2246,23 +2485,27 @@ function attachClientListeners(client: MatrixClient): void {
             emit({ type: "redact", roomId: room.roomId, eventId: redactedId });
         }
     }));
-    client.on(RoomEvent.Name, room => guarded(() => emitRoom(room)));
+    client.on(RoomEvent.Name, room => guarded(() => {
+        if (!spaceAccessMembersLoading(room)) emitRoom(room);
+    }));
     client.on(RoomEvent.MyMembership, room => guarded(() => {
         const membership = room.getMyMembership();
         if (membership === "join" || membership === "invite") pendingHiddenRooms.delete(room.roomId);
+        else forgetResolvedSpaceAccessRequestsForRoom(room.roomId);
         emit({ type: "snapshot", snapshot: snapshot() });
     }));
     client.on(RoomMemberEvent.Membership, (_event, member) => guarded(() => {
+        forgetResolvedSpaceAccessRequest(member.roomId, member.userId);
         const room = client.getRoom(member.roomId);
-        if (room) emitRoom(room);
+        if (room && !spaceAccessMembersLoading(room)) emitRoom(room);
     }));
     client.on(RoomMemberEvent.Name, (_event, member) => guarded(() => {
         const room = client.getRoom(member.roomId);
-        if (room) emitRoom(room);
+        if (room && !spaceAccessMembersLoading(room)) emitRoom(room);
     }));
     client.on(RoomMemberEvent.PowerLevel, (_event, member) => guarded(() => {
         const room = client.getRoom(member.roomId);
-        if (room) emitRoom(room);
+        if (room && !spaceAccessMembersLoading(room)) emitRoom(room);
     }));
     client.on(RoomMemberEvent.Typing, (_event, member) => guarded(() => {
         const room = client.getRoom(member.roomId);
@@ -2301,6 +2544,7 @@ function attachClientListeners(client: MatrixClient): void {
 
 async function disposeClient(clearStores: boolean): Promise<void> {
     clientGeneration++;
+    disposeSpaceAccessMemberHydrations();
     historyCursors.clear();
     searchCursors.clear();
     searchEventCache.clear();
@@ -2316,6 +2560,7 @@ async function disposeClient(clearStores: boolean): Promise<void> {
     publicDirectoryTargets.clear();
     spaceHierarchyTargets.clear();
     pendingHiddenRooms.clear();
+    resolvedSpaceAccessRequests.clear();
     urlPreviewMedia.clear();
     if (!client) {
         await store?.destroy();
@@ -3016,8 +3261,6 @@ async function spaceChildren(
 ): Promise<MatrixSpaceHierarchyDTO> {
     const space = getRoom(command.spaceId);
     if (!space.isSpaceRoom()) fail("MATRIX_ROOM_NOT_SPACE", "The selected Matrix room is not a space.");
-    await space.loadMembersIfNeeded();
-    emitRoom(space);
     const limit = Number.isSafeInteger(command.limit) ? Math.min(Math.max(command.limit, 1), 200) : 200;
     const maxDepth = Number.isSafeInteger(command.maxDepth) ? Math.min(Math.max(command.maxDepth, 1), 16) : 8;
     spaceHierarchyTargets.delete(space.roomId);
@@ -3167,8 +3410,818 @@ async function leaveRoom(
     pendingHiddenRooms.add(room.roomId);
     spaceHierarchyTargets.delete(room.roomId);
     removeHierarchyTarget(room.roomId);
+    forgetResolvedSpaceAccessRequestsForRoom(room.roomId);
     emit({ type: "snapshot", snapshot: snapshot() });
     return { roomId: room.roomId };
+}
+
+function validateSpaceJoinName(value: unknown): string {
+    const joinName = validateString(value, "Space join name", 64);
+    if (!SPACE_JOIN_NAME_PATTERN.test(joinName)) {
+        fail(
+            "MATRIX_INVALID_SPACE_JOIN_NAME",
+            "Use 1-64 lowercase letters, numbers, dots, underscores, or hyphens, with a letter or number at each end."
+        );
+    }
+    return joinName;
+}
+
+function sameServerSpaceAlias(joinName: string): string {
+    return `#${validateSpaceJoinName(joinName)}:${activeServerName()}`;
+}
+
+function safeSameServerJoinAlias(value: unknown): { joinName: string; joinAlias: string; } | undefined {
+    if (typeof value !== "string" || value.length > 1_024 || !value.startsWith("#")) return undefined;
+    const suffix = `:${activeServerName()}`;
+    if (!value.endsWith(suffix)) return undefined;
+    const joinName = value.slice(1, -suffix.length);
+    try {
+        validateSpaceJoinName(joinName);
+    } catch {
+        return undefined;
+    }
+    return value === sameServerSpaceAlias(joinName) ? { joinName, joinAlias: value } : undefined;
+}
+
+function validMatrixAlias(value: unknown): value is string {
+    if (typeof value !== "string" || value.length < 4 || value.length > 1_024 || value[0] !== "#") return false;
+    const separator = value.indexOf(":", 1);
+    return separator > 1
+        && separator < value.length - 1
+        && !/[\s\u0000-\u001f\u007f]/u.test(value);
+}
+
+function matrixErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const candidate = error as { errcode?: unknown; data?: { errcode?: unknown; }; };
+    const value = candidate.errcode ?? candidate.data?.errcode;
+    return typeof value === "string" && /^[A-Z0-9._]{1,128}$/u.test(value) ? value : undefined;
+}
+
+function isDefinitiveMatrixMutationRejection(error: unknown): boolean {
+    if (!error || typeof error !== "object" || matrixErrorCode(error) == null) return false;
+    const status = (error as { httpStatus?: unknown; }).httpStatus;
+    return Number.isSafeInteger(status) && Number(status) >= 400 && Number(status) < 500;
+}
+
+async function optionalRoomState(roomId: string, eventType: string): Promise<Record<string, unknown>> {
+    try {
+        const content = await matrixClient!.getStateEvent(roomId, eventType, "");
+        return content && typeof content === "object" && !Array.isArray(content) ? content : {};
+    } catch (error) {
+        if (matrixErrorCode(error) === "M_NOT_FOUND") return {};
+        throw error;
+    }
+}
+
+function joinedSpace(spaceId: unknown): Room {
+    const room = getRoom(validateRoomId(spaceId));
+    if (!room.isSpaceRoom()) fail("MATRIX_SPACE_REQUIRED", "The selected Matrix room is not a Space.");
+    return room;
+}
+
+function normalizedHistoryVisibility(value: unknown): MatrixSpaceAccessSummaryDTO["historyVisibility"] {
+    switch (value) {
+        case HistoryVisibility.Invited:
+        case HistoryVisibility.Joined:
+        case HistoryVisibility.Shared:
+        case HistoryVisibility.WorldReadable:
+            return value;
+        default:
+            // The Matrix default when no valid history visibility state exists.
+            return HistoryVisibility.Shared;
+    }
+}
+
+function normalizedGuestAccess(value: unknown): MatrixSpaceAccessSummaryDTO["guestAccess"] {
+    return value === GuestAccess.CanJoin ? GuestAccess.CanJoin : GuestAccess.Forbidden;
+}
+
+function spaceAccessMode(joinRule: MatrixRoomJoinRule): MatrixSpaceAccessSummaryDTO["mode"] {
+    if (joinRule === "public") return "public";
+    if (joinRule === "knock" || joinRule === "knock_restricted") return "request";
+    return "invite";
+}
+
+async function readSpaceAccessSummary(space: Room): Promise<MatrixSpaceAccessSummaryDTO> {
+    const [joinRules, history, guest, canonical, directory] = await Promise.all([
+        optionalRoomState(space.roomId, EventType.RoomJoinRules),
+        optionalRoomState(space.roomId, EventType.RoomHistoryVisibility),
+        optionalRoomState(space.roomId, EventType.RoomGuestAccess),
+        optionalRoomState(space.roomId, EventType.RoomCanonicalAlias),
+        matrixClient!.getRoomDirectoryVisibility(space.roomId)
+    ]);
+    const joinRule = normalizeJoinRule(joinRules.join_rule) ?? "invite";
+    const directoryVisibility = directory?.visibility;
+    if (directoryVisibility !== Visibility.Public && directoryVisibility !== Visibility.Private) {
+        fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an invalid Space directory visibility.");
+    }
+    const result: MatrixSpaceAccessSummaryDTO = {
+        spaceId: space.roomId,
+        mode: spaceAccessMode(joinRule),
+        joinRule,
+        directoryVisibility,
+        historyVisibility: normalizedHistoryVisibility(history.history_visibility),
+        guestAccess: normalizedGuestAccess(guest.guest_access)
+    };
+    const alias = safeSameServerJoinAlias(canonical.alias);
+    if (alias && await resolveRoomAlias(alias.joinAlias) === space.roomId) {
+        result.joinName = alias.joinName;
+        result.joinAlias = alias.joinAlias;
+    }
+    return result;
+}
+
+async function getSpaceAccess(
+    command: Extract<MatrixWorkerCommand, { type: "getSpaceAccess"; }>
+): Promise<MatrixSpaceAccessSummaryDTO> {
+    return await readSpaceAccessSummary(joinedSpace(command.spaceId));
+}
+
+function validateConfigureSpaceAccessRequest(value: unknown): MatrixConfigureSpaceAccessRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access settings are invalid.");
+    }
+    const input = value as Partial<MatrixConfigureSpaceAccessRequest>;
+    if (!Object.keys(input).every(key => key === "spaceId" || key === "mode" || key === "joinName")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access settings contain unsupported fields.");
+    }
+    const spaceId = validateRoomId(input.spaceId);
+    if (input.mode !== "public" && input.mode !== "request" && input.mode !== "invite") {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access mode is invalid.");
+    }
+    return {
+        spaceId,
+        mode: input.mode,
+        ...(input.joinName == null ? {} : { joinName: validateSpaceJoinName(input.joinName) })
+    };
+}
+
+async function resolveRoomAlias(alias: string): Promise<string | undefined> {
+    try {
+        const response = await matrixClient!.getRoomIdForAlias(alias);
+        return validateRoomId(response?.room_id);
+    } catch (error) {
+        if (matrixErrorCode(error) === "M_NOT_FOUND") return undefined;
+        throw error;
+    }
+}
+
+type SpaceAliasReservation = "preexisting" | "created" | "ambiguous";
+
+class SpaceAliasReservationUnresolvedError extends Error { }
+
+async function ensureSpaceAlias(
+    alias: string,
+    spaceId: string,
+    mutationDispatched: () => void
+): Promise<SpaceAliasReservation> {
+    const existingRoomId = await resolveRoomAlias(alias);
+    if (existingRoomId) {
+        if (existingRoomId !== spaceId) {
+            fail("MATRIX_SPACE_ALIAS_IN_USE", "That Matrix Space join name is already in use.");
+        }
+        return "preexisting";
+    }
+    try {
+        mutationDispatched();
+        await matrixClient!.createAlias(alias, spaceId);
+        return "created";
+    } catch (error) {
+        // A lost response or a concurrent idempotent retry can report failure
+        // even though the exact mapping now exists. Resolve it before failing.
+        let recoveredRoomId: string | undefined;
+        try {
+            recoveredRoomId = await resolveRoomAlias(alias);
+        } catch {
+            // createAlias may have landed, but a failed recovery read cannot
+            // establish ownership or absence. The caller reports an explicit
+            // unconfirmed rollback and must never delete this mapping.
+            throw new SpaceAliasReservationUnresolvedError();
+        }
+        // A lost response cannot prove that this operation, rather than a
+        // concurrent same-room creator, owns the mapping. Treat it as
+        // ambiguous and never attempt automatic alias deletion.
+        if (recoveredRoomId === spaceId) return "ambiguous";
+        if (recoveredRoomId) {
+            fail("MATRIX_SPACE_ALIAS_IN_USE", "That Matrix Space join name is already in use.");
+        }
+        if (!isDefinitiveMatrixMutationRejection(error)) {
+            throw new SpaceAliasReservationUnresolvedError();
+        }
+        throw error;
+    }
+}
+
+function canonicalAltAliases(content: Record<string, unknown>, nextAlias: string): string[] {
+    const rawAltAliases = content.alt_aliases;
+    if (rawAltAliases != null && (!Array.isArray(rawAltAliases) || rawAltAliases.length > 256
+        || !rawAltAliases.every(validMatrixAlias))) {
+        fail("MATRIX_SPACE_CANONICAL_ALIAS_INVALID", "The Matrix Space has invalid alternate aliases.");
+    }
+    const aliases = [...new Set((rawAltAliases as string[] | undefined) ?? [])]
+        .filter(alias => alias !== nextAlias);
+    if (validMatrixAlias(content.alias) && content.alias !== nextAlias && !aliases.includes(content.alias)) {
+        if (aliases.length >= 256) {
+            fail("MATRIX_SPACE_CANONICAL_ALIAS_INVALID", "The Matrix Space has too many alternate aliases.");
+        }
+        aliases.push(content.alias);
+    }
+    return aliases;
+}
+
+function canonicalAliasContentMatches(
+    content: Record<string, unknown>,
+    alias: string,
+    altAliases: readonly string[]
+): boolean {
+    return content.alias === alias
+        && (altAliases.length === 0
+            ? content.alt_aliases == null || (Array.isArray(content.alt_aliases) && content.alt_aliases.length === 0)
+            : Array.isArray(content.alt_aliases)
+                && content.alt_aliases.length === altAliases.length
+                && content.alt_aliases.every((item, index) => item === altAliases[index]));
+}
+
+async function ensureCanonicalSpaceAlias(
+    space: Room,
+    alias: string,
+    mutationDispatched: () => void
+): Promise<boolean> {
+    const content = await optionalRoomState(space.roomId, EventType.RoomCanonicalAlias);
+    const altAliases = canonicalAltAliases(content, alias);
+    if (canonicalAliasContentMatches(content, alias, altAliases)) return false;
+    try {
+        mutationDispatched();
+        await matrixClient!.sendStateEvent(space.roomId, EventType.RoomCanonicalAlias, {
+            alias,
+            ...(altAliases.length ? { alt_aliases: altAliases } : {})
+        }, "");
+    } catch (error) {
+        // A lost PUT response is successful if an exact authenticated state
+        // re-read observes the complete desired canonical-alias content.
+        try {
+            const actual = await optionalRoomState(space.roomId, EventType.RoomCanonicalAlias);
+            if (canonicalAliasContentMatches(actual, alias, altAliases)) return true;
+        } catch {
+            // Preserve the original write failure. The caller handles the
+            // ownership-safe alias rollback and reports uncertainty.
+        }
+        throw error;
+    }
+    return true;
+}
+
+async function ensureSpaceStateValue(
+    space: Room,
+    eventType: EventType.RoomHistoryVisibility | EventType.RoomGuestAccess | EventType.RoomJoinRules,
+    value: HistoryVisibility.Joined | GuestAccess.Forbidden | JoinRule.Public | JoinRule.Knock | JoinRule.Invite,
+    mutationDispatched: () => void
+): Promise<boolean> {
+    const content = await optionalRoomState(space.roomId, eventType);
+    const key = eventType === EventType.RoomHistoryVisibility
+        ? "history_visibility"
+        : eventType === EventType.RoomGuestAccess ? "guest_access" : "join_rule";
+    if (content[key] === value && Object.keys(content).length === 1) return false;
+    switch (eventType) {
+        case EventType.RoomHistoryVisibility:
+            mutationDispatched();
+            await matrixClient!.sendStateEvent(space.roomId, eventType, {
+                history_visibility: HistoryVisibility.Joined
+            }, "");
+            break;
+        case EventType.RoomGuestAccess:
+            mutationDispatched();
+            await matrixClient!.sendStateEvent(space.roomId, eventType, {
+                guest_access: GuestAccess.Forbidden
+            }, "");
+            break;
+        case EventType.RoomJoinRules:
+            if (value !== JoinRule.Public && value !== JoinRule.Knock && value !== JoinRule.Invite) {
+                fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space join rule is invalid.");
+            }
+            mutationDispatched();
+            await matrixClient!.sendStateEvent(space.roomId, eventType, { join_rule: value }, "");
+            break;
+    }
+    return true;
+}
+
+async function ensureSpaceDirectoryVisibility(
+    spaceId: string,
+    visibility: Visibility,
+    mutationDispatched: () => void
+): Promise<boolean> {
+    const current = await matrixClient!.getRoomDirectoryVisibility(spaceId);
+    if (current?.visibility === visibility) return false;
+    mutationDispatched();
+    await matrixClient!.setRoomDirectoryVisibility(spaceId, visibility);
+    return true;
+}
+
+function publicWorkerError(error: unknown): PublicWorkerError {
+    if (error instanceof PublicWorkerError) return error;
+    const safe = publicError(error);
+    return new PublicWorkerError(safe.code, safe.message);
+}
+
+function partialSpaceAccessMessage(step: MatrixConfigureSpaceAccessStep): string {
+    switch (step) {
+        case "alias": return "Matrix could not reserve the requested Space join name.";
+        case "alias_rollback": return "Matrix could not confirm the requested join-name change. That name may remain active; refresh and retry the same name before choosing another.";
+        case "canonical_alias": return "Matrix could not set the Space's canonical join name.";
+        case "history_visibility": return "Matrix could not restrict the Space history to joined members.";
+        case "guest_access": return "Matrix could not forbid guest access to the Space.";
+        case "join_rule": return "Matrix could not apply the requested Space join rule.";
+        case "directory": return "Matrix could not confirm or apply the requested Space directory visibility.";
+        case "verification": return "Matrix may have changed the Space, but its current access settings could not be verified.";
+    }
+}
+
+function accessMismatchStep(
+    actual: MatrixSpaceAccessSummaryDTO,
+    alias: string | undefined,
+    joinRule: MatrixRoomJoinRule,
+    directoryVisibility: MatrixSpaceAccessSummaryDTO["directoryVisibility"]
+): MatrixConfigureSpaceAccessStep | undefined {
+    if (alias != null && actual.joinAlias !== alias) return "canonical_alias";
+    if (actual.historyVisibility !== HistoryVisibility.Joined) return "history_visibility";
+    if (actual.guestAccess !== GuestAccess.Forbidden) return "guest_access";
+    if (actual.joinRule !== joinRule) return "join_rule";
+    if (actual.directoryVisibility !== directoryVisibility) return "directory";
+    return undefined;
+}
+
+async function configureSpaceAccess(
+    command: Extract<MatrixWorkerCommand, { type: "configureSpaceAccess"; }>
+): Promise<MatrixConfigureSpaceAccessResult> {
+    const request = validateConfigureSpaceAccessRequest(command.request);
+    const space = joinedSpace(request.spaceId);
+    if (!canConfigureSpaceAccess(space)) {
+        fail("MATRIX_SPACE_ACCESS_FORBIDDEN", "You do not have permission to change this Matrix Space's access settings.");
+    }
+
+    const initial = await readSpaceAccessSummary(space);
+    const joinName = request.joinName ?? (request.mode === "request" ? initial.joinName : undefined);
+    if (request.mode === "request" && !joinName) {
+        fail("MATRIX_SPACE_JOIN_NAME_REQUIRED", "Choose a join name before changing this Matrix Space's access mode.");
+    }
+    const alias = joinName == null ? undefined : sameServerSpaceAlias(joinName);
+    const desiredJoinRule = request.mode === "public"
+        ? JoinRule.Public
+        : request.mode === "request" ? JoinRule.Knock : JoinRule.Invite;
+    const desiredDirectory = request.mode === "public" ? Visibility.Public : Visibility.Private;
+    let confirmed = initial;
+    let mutated = false;
+    let mutationPossible = false;
+    let aliasReservation: SpaceAliasReservation | undefined;
+    let aliasRollbackUnconfirmed = false;
+    let failure: { step: MatrixConfigureSpaceAccessStep; error: unknown; } | undefined;
+
+    const runStep = async (
+        step: MatrixConfigureSpaceAccessStep,
+        action: (mutationDispatched: () => void) => Promise<boolean>
+    ): Promise<boolean> => {
+        if (failure) return false;
+        const previousMutationPossible = mutationPossible;
+        let dispatched = false;
+        const markMutationDispatched = () => {
+            dispatched = true;
+            mutationPossible = true;
+        };
+        try {
+            const changed = await action(markMutationDispatched);
+            mutated ||= changed;
+            return true;
+        } catch (error) {
+            if (dispatched && isDefinitiveMatrixMutationRejection(error)) {
+                mutationPossible = previousMutationPossible;
+            }
+            failure = { step, error };
+            return false;
+        }
+    };
+
+    if (alias != null) {
+        await runStep("alias", async mutationDispatched => {
+            try {
+                aliasReservation = await ensureSpaceAlias(alias, space.roomId, mutationDispatched);
+            } catch (error) {
+                if (error instanceof SpaceAliasReservationUnresolvedError) {
+                    aliasReservation = "ambiguous";
+                    aliasRollbackUnconfirmed = true;
+                    // A lost create response is a possible mutation. Preserve
+                    // that ambiguity even if every later access-state read is
+                    // successful, and never attempt to delete an unowned alias.
+                    mutationPossible = true;
+                }
+                throw error;
+            }
+            return aliasReservation !== "preexisting";
+        });
+        if (aliasRollbackUnconfirmed && failure?.step === "alias") {
+            failure = { step: "alias_rollback", error: failure.error };
+        }
+    }
+    if (alias != null && await runStep("canonical_alias", mutationDispatched =>
+        ensureCanonicalSpaceAlias(space, alias, mutationDispatched))) {
+        confirmed = { ...confirmed, joinName: joinName!, joinAlias: alias };
+    } else if (alias != null && failure?.step === "canonical_alias"
+        && aliasReservation && aliasReservation !== "preexisting") {
+        // Alias deletion has no conditional/CAS form. Never risk deleting a
+        // mapping which another client could have rebound after our create.
+        aliasRollbackUnconfirmed = true;
+        mutated = true;
+        failure = { step: "alias_rollback", error: failure.error };
+    }
+    if (await runStep("history_visibility", mutationDispatched => ensureSpaceStateValue(
+        space,
+        EventType.RoomHistoryVisibility,
+        HistoryVisibility.Joined,
+        mutationDispatched
+    ))) {
+        confirmed = { ...confirmed, historyVisibility: HistoryVisibility.Joined };
+    }
+    if (await runStep("guest_access", mutationDispatched => ensureSpaceStateValue(
+        space,
+        EventType.RoomGuestAccess,
+        GuestAccess.Forbidden,
+        mutationDispatched
+    ))) {
+        confirmed = { ...confirmed, guestAccess: GuestAccess.Forbidden };
+    }
+    if (await runStep("join_rule", mutationDispatched => ensureSpaceStateValue(
+        space,
+        EventType.RoomJoinRules,
+        desiredJoinRule,
+        mutationDispatched
+    ))) {
+        confirmed = { ...confirmed, joinRule: desiredJoinRule, mode: spaceAccessMode(desiredJoinRule) };
+    }
+    if (await runStep("directory", mutationDispatched =>
+        ensureSpaceDirectoryVisibility(space.roomId, desiredDirectory, mutationDispatched))) {
+        confirmed = { ...confirmed, directoryVisibility: desiredDirectory };
+    }
+
+    let actual: MatrixSpaceAccessSummaryDTO;
+    let exactReadSucceeded = false;
+    try {
+        // This exact homeserver re-read is the source of truth returned to the
+        // renderer. In particular, access mode never implies directory state.
+        actual = await readSpaceAccessSummary(space);
+        exactReadSucceeded = true;
+    } catch (error) {
+        if (!mutated && !mutationPossible) throw publicWorkerError(failure?.error ?? error);
+        actual = confirmed;
+        failure ??= { step: "verification", error };
+    }
+
+    const mismatch = accessMismatchStep(actual, alias, desiredJoinRule, desiredDirectory);
+    // A successful exact re-read supersedes an ambiguous write response. If
+    // every desired field is present, the retry-safe operation did complete.
+    if (failure && !mutated && !mutationPossible && (!exactReadSucceeded || mismatch != null)) {
+        throw publicWorkerError(failure.error);
+    }
+    const canonicalAliasConfirmed = alias == null || actual.joinAlias === alias;
+    const failedStep = exactReadSucceeded
+        ? mismatch == null
+            ? undefined
+            : aliasRollbackUnconfirmed && !canonicalAliasConfirmed ? "alias_rollback" : mismatch
+        : aliasRollbackUnconfirmed ? "alias_rollback" : failure?.step ?? mismatch;
+    const result: MatrixConfigureSpaceAccessResult = {
+        spaceId: space.roomId,
+        requestedMode: request.mode,
+        access: actual,
+        accessConfirmed: exactReadSucceeded,
+        complete: failedStep == null
+    };
+    if (failedStep) {
+        result.partial = {
+            code: "MATRIX_SPACE_ACCESS_PARTIAL",
+            failedStep,
+            message: partialSpaceAccessMessage(failedStep)
+        };
+    }
+    emitRoom(space);
+    return result;
+}
+
+function validateResolveSpaceAccessRequest(value: unknown): MatrixResolveSpaceAccessRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access request decision is invalid.");
+    }
+    const input = value as Partial<MatrixResolveSpaceAccessRequest>;
+    if (!Object.keys(input).every(key => key === "spaceId" || key === "userId" || key === "decision")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access request decision contains unsupported fields.");
+    }
+    if (input.decision !== "approve" && input.decision !== "deny") {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space access request decision is invalid.");
+    }
+    return {
+        spaceId: validateRoomId(input.spaceId),
+        userId: validateUserId(input.userId),
+        decision: input.decision
+    };
+}
+
+function memberRequestTimestamp(member: ReturnType<Room["getMembers"]>[number]): number | undefined {
+    const timestamp = member.events.member?.getTs();
+    return Number.isSafeInteger(timestamp) && timestamp! >= 0 && timestamp! <= MAX_EVENT_TIMESTAMP
+        ? timestamp
+        : undefined;
+}
+
+function normalizeSpaceAccessRequester(
+    room: Room,
+    member: ReturnType<Room["getMembers"]>[number]
+): MatrixSpaceAccessRequestMemberDTO | undefined {
+    const userId = optionalUserId(member.userId);
+    if (!userId || member.membership !== "knock" || isResolvedSpaceAccessRequest(room.roomId, userId)) {
+        return undefined;
+    }
+    const permissions = spaceAccessPermissions(room, userId);
+    const result: MatrixSpaceAccessRequestMemberDTO = {
+        userId,
+        canApprove: permissions.canApprove,
+        canDeny: permissions.canDeny
+    };
+    const displayName = publicRoomText(member.name, 256);
+    if (displayName) result.displayName = displayName;
+    const avatarUrl = mediaUrl(member.getMxcAvatarUrl(), 96, 96);
+    if (avatarUrl) result.avatarUrl = avatarUrl;
+    const requestedAt = memberRequestTimestamp(member);
+    if (requestedAt != null) result.requestedAt = requestedAt;
+    return result;
+}
+
+async function getSpaceAccessRequests(
+    command: Extract<MatrixWorkerCommand, { type: "getSpaceAccessRequests"; }>
+): Promise<MatrixSpaceAccessRequestListDTO> {
+    const space = joinedSpace(command.spaceId);
+    let permissions = spaceAccessPermissions(space);
+    if (!permissions.canApprove && !permissions.canDeny) {
+        fail(
+            "MATRIX_SPACE_ACCESS_REQUESTS_FORBIDDEN",
+            "You do not have permission to review this Matrix Space's access requests."
+        );
+    }
+    await loadSpaceAccessMembers(space);
+    permissions = spaceAccessPermissions(space);
+    if (!permissions.canApprove && !permissions.canDeny) {
+        fail(
+            "MATRIX_SPACE_ACCESS_REQUESTS_FORBIDDEN",
+            "You no longer have permission to review this Matrix Space's access requests."
+        );
+    }
+    const requests: MatrixSpaceAccessRequestMemberDTO[] = [];
+    let truncated = false;
+    for (const member of space.getMembers()) {
+        const request = normalizeSpaceAccessRequester(space, member);
+        if (!request) continue;
+        if (requests.length >= MAX_SPACE_ACCESS_REQUESTS) {
+            truncated = true;
+            break;
+        }
+        requests.push(request);
+    }
+    requests.sort((left, right) => (left.requestedAt ?? Number.MAX_SAFE_INTEGER)
+        - (right.requestedAt ?? Number.MAX_SAFE_INTEGER)
+        || left.userId.localeCompare(right.userId));
+    const result: MatrixSpaceAccessRequestListDTO = {
+        spaceId: space.roomId,
+        requests,
+        truncated,
+        canApproveAccessRequests: permissions.canApprove,
+        canDenyAccessRequests: permissions.canDeny
+    };
+    return result;
+}
+
+function accessRequestCountWithout(room: Room, excludedUserId?: string): number {
+    let count = 0;
+    for (const member of room.getMembers()) {
+        if (member.membership !== "knock" || member.userId === excludedUserId
+            || isResolvedSpaceAccessRequest(room.roomId, member.userId)) continue;
+        count++;
+        if (count >= MAX_SPACE_ACCESS_REQUESTS) return MAX_SPACE_ACCESS_REQUESTS;
+    }
+    return count;
+}
+
+type AccessMutationMembership = "knock" | "invite" | "join" | "leave";
+
+async function exactRoomMembership(roomId: string, userId: string): Promise<AccessMutationMembership | undefined> {
+    try {
+        const content = await matrixClient!.getStateEvent(roomId, EventType.RoomMember, userId);
+        if (!content || typeof content !== "object" || Array.isArray(content)) return undefined;
+        const { membership }: { membership?: unknown } = content;
+        return membership === "knock" || membership === "invite" || membership === "join" || membership === "leave"
+            ? membership
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function resolvedSpaceAccessRequestResult(
+    request: MatrixResolveSpaceAccessRequest,
+    space: Room,
+    membership: MatrixResolveSpaceAccessRequestResult["membership"]
+): MatrixResolveSpaceAccessRequestResult {
+    return {
+        ...request,
+        membership,
+        accessRequestCount: accessRequestCountWithout(space, request.userId)
+    };
+}
+
+async function resolveSpaceAccessRequest(
+    command: Extract<MatrixWorkerCommand, { type: "resolveSpaceAccessRequest"; }>
+): Promise<MatrixResolveSpaceAccessRequestResult> {
+    const request = validateResolveSpaceAccessRequest(command.request);
+    const space = joinedSpace(request.spaceId);
+    const member = space.getMember(request.userId);
+    if (!member || member.membership !== "knock" || isResolvedSpaceAccessRequest(space.roomId, request.userId)) {
+        fail("MATRIX_SPACE_ACCESS_REQUEST_NOT_PENDING", "That Matrix Space access request is no longer pending.");
+    }
+    const permissions = spaceAccessPermissions(space, request.userId);
+    if (request.decision === "approve") {
+        if (!permissions.canApprove) {
+            fail("MATRIX_SPACE_ACCESS_APPROVE_FORBIDDEN", "You do not have permission to approve this Matrix Space access request.");
+        }
+    } else {
+        if (!permissions.canDeny) {
+            fail("MATRIX_SPACE_ACCESS_DENY_FORBIDDEN", "You do not have permission to deny this Matrix Space access request.");
+        }
+    }
+    reserveResolvedSpaceAccessRequest(space.roomId, request.userId);
+    let resolvedMembership: MatrixResolveSpaceAccessRequestResult["membership"] = request.decision === "approve"
+        ? "invite"
+        : "leave";
+    try {
+        if (request.decision === "approve") await matrixClient!.invite(space.roomId, request.userId);
+        else await matrixClient!.kick(space.roomId, request.userId);
+    } catch (error) {
+        const actualMembership = await exactRoomMembership(space.roomId, request.userId);
+        const converged = request.decision === "approve"
+            ? actualMembership === "invite" || actualMembership === "join"
+            : actualMembership === "leave";
+        if (converged) {
+            resolvedMembership = actualMembership as MatrixResolveSpaceAccessRequestResult["membership"];
+        } else {
+            forgetResolvedSpaceAccessRequest(space.roomId, request.userId);
+            if (isDefinitiveMatrixMutationRejection(error)) throw error;
+            fail(
+                "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS",
+                `Matrix could not confirm whether this access request was ${request.decision === "approve" ? "approved" : "denied"}. It may already be resolved; refresh before acting again.`
+            );
+        }
+    }
+    const result = resolvedSpaceAccessRequestResult(request, space, resolvedMembership);
+    emitRoom(space);
+    return result;
+}
+
+function validateSpaceAliasResolution(value: unknown): { roomId: string; servers: unknown[]; } {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an invalid Space alias response.");
+    }
+    const input = value as { room_id?: unknown; servers?: unknown; };
+    if (!Array.isArray(input.servers) || input.servers.length > 100) {
+        fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an invalid Space alias response.");
+    }
+    return { roomId: validateRoomId(input.room_id), servers: input.servers };
+}
+
+async function attestRequestEnabledSpace(
+    joinAlias: string,
+    roomId: string,
+    viaServers: string[]
+): Promise<MatrixRequestSpaceAccessResult["membership"] | undefined> {
+    const localRoom = matrixClient!.getRoom(roomId);
+    if (localRoom && !localRoom.isSpaceRoom()) {
+        fail("MATRIX_SPACE_REQUIRED", "The selected Matrix room is not a Space.");
+    }
+
+    let summaryUnsupported = false;
+    try {
+        // The pre-join room summary surface can attest type and join rule even
+        // though request-mode Spaces intentionally expose history only after
+        // joining. Hierarchy commonly rejects that same nonmember.
+        const summary = await matrixClient!.getRoomSummary(joinAlias, viaServers);
+        const summaryJoinRule: unknown = summary?.join_rule;
+        if (!summary || typeof summary !== "object" || Array.isArray(summary)
+            || validateRoomId(summary.room_id) !== roomId
+            || summary.room_type !== RoomType.Space
+            || (summaryJoinRule !== JoinRule.Knock && summaryJoinRule !== "knock_restricted")) {
+            fail("MATRIX_SPACE_REQUIRED", "Matrix could not verify a request-enabled Space at that join name.");
+        }
+        const summaryMembership: unknown = summary.membership;
+        if (summaryMembership != null && summaryMembership !== "knock" && summaryMembership !== "invite"
+            && summaryMembership !== "join" && summaryMembership !== "leave" && summaryMembership !== "ban") {
+            fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an invalid Space membership summary.");
+        }
+        if (summaryMembership === "knock" || summaryMembership === "invite" || summaryMembership === "join") {
+            return summaryMembership;
+        }
+    } catch (error) {
+        if (matrixErrorCode(error) !== "M_UNRECOGNIZED") throw error;
+        summaryUnsupported = true;
+    }
+    if (!summaryUnsupported) return undefined;
+
+    const hierarchy = await matrixClient!.getRoomHierarchy(roomId, 1, 0, false);
+    if (!hierarchy || typeof hierarchy !== "object" || !Array.isArray(hierarchy.rooms)
+        || hierarchy.rooms.length > 100) {
+        fail("MATRIX_SPACE_REQUIRED", "Matrix could not verify a request-enabled Space at that join name.");
+    }
+    const root = hierarchy.rooms.slice(0, 10).find(room => room?.room_id === roomId);
+    const rootJoinRule: unknown = root?.join_rule;
+    if (!root || root.room_type !== RoomType.Space
+        || (rootJoinRule !== JoinRule.Knock && rootJoinRule !== "knock_restricted")) {
+        fail("MATRIX_SPACE_REQUIRED", "Matrix could not verify a request-enabled Space at that join name.");
+    }
+    return undefined;
+}
+
+async function reconciledSpaceAccessMembership(
+    joinAlias: string,
+    roomId: string,
+    viaServers: string[],
+    userId: string
+): Promise<MatrixRequestSpaceAccessResult["membership"] | undefined> {
+    try {
+        const resolved = validateSpaceAliasResolution(await matrixClient!.getRoomIdForAlias(joinAlias));
+        if (resolved.roomId !== roomId) return undefined;
+        const summaryMembership = await attestRequestEnabledSpace(joinAlias, roomId, viaServers);
+        const localMembership = matrixClient!.getRoom(roomId)?.getMyMembership();
+        if (localMembership === "knock" || localMembership === "invite" || localMembership === "join") {
+            return localMembership;
+        }
+        if (summaryMembership) return summaryMembership;
+        const membership = await exactRoomMembership(roomId, userId);
+        return membership === "knock" || membership === "invite" || membership === "join"
+            ? membership
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function requestSpaceAccess(
+    command: Extract<MatrixWorkerCommand, { type: "requestSpaceAccess"; }>
+): Promise<MatrixRequestSpaceAccessResult> {
+    if (!matrixClient || !activeCredentials) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const requestingUserId = activeCredentials.userId;
+    const joinName = validateSpaceJoinName(command.joinName);
+    const joinAlias = sameServerSpaceAlias(joinName);
+    const { roomId, servers } = validateSpaceAliasResolution(await matrixClient.getRoomIdForAlias(joinAlias));
+    const viaServers = [activeServerName()];
+    for (const rawServer of servers.slice(0, 3)) {
+        try {
+            const server = validateServerName(rawServer);
+            if (!viaServers.includes(server)) viaServers.push(server);
+        } catch {
+            // Ignore an invalid routing hint from an otherwise exact alias
+            // response. The active alias server remains authoritative.
+        }
+        if (viaServers.length >= 3) break;
+    }
+    const localRoom = matrixClient.getRoom(roomId);
+    if (localRoom && !localRoom.isSpaceRoom()) {
+        fail("MATRIX_SPACE_REQUIRED", "The selected Matrix room is not a Space.");
+    }
+
+    const currentMembership = localRoom?.getMyMembership();
+    if (currentMembership === "join" || currentMembership === "invite") {
+        return { roomId, membership: currentMembership };
+    }
+    if (currentMembership === "knock") {
+        await attestRequestEnabledSpace(joinAlias, roomId, viaServers);
+        return { roomId, membership: currentMembership };
+    }
+
+    await attestRequestEnabledSpace(joinAlias, roomId, viaServers);
+    try {
+        const knocked = await matrixClient.knockRoom(roomId, { viaServers });
+        if (validateRoomId(knocked?.room_id) !== roomId) {
+            fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an unexpected room for the Space access request.");
+        }
+    } catch (error) {
+        const membership = await reconciledSpaceAccessMembership(
+            joinAlias,
+            roomId,
+            viaServers,
+            requestingUserId
+        );
+        if (membership) return { roomId, membership };
+        if (isDefinitiveMatrixMutationRejection(error)) throw error;
+        fail(
+            "MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS",
+            "Matrix could not confirm the access request. It may already be pending; refresh before trying again."
+        );
+    }
+    return { roomId, membership: "knock" };
 }
 
 function validateCreateSpaceRequest(value: unknown): Required<Pick<MatrixCreateSpaceRequest, "name" | "visibility" | "createGeneral">>
@@ -3619,8 +4672,15 @@ async function openDirectMessage(
     if (!space.isSpaceRoom()) fail("MATRIX_ROOM_NOT_SPACE", "Direct messages must be opened from a joined Matrix space.");
     const userId = validateUserId(command.userId);
     if (userId === activeCredentials.userId) fail("MATRIX_DM_SELF", "A direct message cannot target your own account.");
-    await space.loadMembersIfNeeded();
-    if (space.getMember(userId)?.membership !== "join") {
+    let targetMembership: unknown;
+    try {
+        const memberState = await matrixClient!.getStateEvent(space.roomId, EventType.RoomMember, userId);
+        targetMembership = memberState?.membership;
+    } catch {
+        // Do not turn a DM click into an unbounded full-member download. An
+        // exact target-state read is the only bounded membership authority.
+    }
+    if (targetMembership !== "join") {
         fail("MATRIX_DM_USER_NOT_IN_SPACE", "This user is not a joined member of the selected Matrix space.");
     }
 
@@ -5583,6 +6643,11 @@ async function handleCommand(
         case "rejectInvite": return await rejectInvite(command);
         case "leaveRoom": return await leaveRoom(command);
         case "createSpace": return await createSpace(command);
+        case "getSpaceAccess": return await getSpaceAccess(command);
+        case "configureSpaceAccess": return await configureSpaceAccess(command);
+        case "requestSpaceAccess": return await requestSpaceAccess(command);
+        case "getSpaceAccessRequests": return await getSpaceAccessRequests(command);
+        case "resolveSpaceAccessRequest": return await resolveSpaceAccessRequest(command);
         case "createSpaceChild": return await createSpaceChild(command);
         case "reconcileSpaceChildCreate": return await reconcileSpaceChildCreate(command);
         case "repairSpaceChildLink": return await repairSpaceChildLink(command);

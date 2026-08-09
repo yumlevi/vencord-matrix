@@ -173,6 +173,16 @@ export interface MatrixRoomDTO {
     roomType?: string;
     /** Whether the current account may add m.space.child state in this Space. */
     canManageSpaceChildren?: boolean;
+    /** Whether the current account may change every state event used by Space access settings. */
+    canConfigureSpaceAccess?: boolean;
+    /** Bounded number of pending membership knocks for a joined Space. */
+    accessRequestCount?: number;
+    /** Whether accessRequestCount was computed from the Space's fully-loaded member list. */
+    accessRequestCountComplete?: boolean;
+    /** Whether the current account meets this Space's exact invite threshold. */
+    canApproveAccessRequests?: boolean;
+    /** Whether the current account meets this Space's exact kick threshold. */
+    canDenyAccessRequests?: boolean;
     joinRule: MatrixRoomJoinRule;
     /** The other user for rooms listed in the account's m.direct map. */
     directUserId?: string;
@@ -229,6 +239,94 @@ export interface MatrixRoomActionResult {
 }
 
 export type MatrixSpaceVisibility = "private" | "public";
+
+export type MatrixSpaceAccessMode = "public" | "request" | "invite";
+export type MatrixSpaceHistoryVisibility = "invited" | "joined" | "shared" | "world_readable";
+export type MatrixSpaceGuestAccess = "can_join" | "forbidden";
+
+/** Actual interoperable Matrix state which governs discovery and Space admission. */
+export interface MatrixSpaceAccessSummaryDTO {
+    spaceId: string;
+    /** Discord-facing mode derived from the actual Matrix join rule. */
+    mode: MatrixSpaceAccessMode;
+    joinRule: MatrixRoomJoinRule;
+    /** Actual homeserver directory state; never inferred from mode. */
+    directoryVisibility: MatrixSpaceVisibility;
+    historyVisibility: MatrixSpaceHistoryVisibility;
+    guestAccess: MatrixSpaceGuestAccess;
+    /** Safe same-server alias localpart, when one is configured canonically. */
+    joinName?: string;
+    /** Exact same-server Matrix alias corresponding to joinName. */
+    joinAlias?: string;
+}
+
+export interface MatrixConfigureSpaceAccessRequest {
+    spaceId: string;
+    mode: MatrixSpaceAccessMode;
+    /** Lowercase same-server alias localpart. Required when no safe alias exists. */
+    joinName?: string;
+}
+
+export type MatrixConfigureSpaceAccessStep =
+    | "alias"
+    | "alias_rollback"
+    | "canonical_alias"
+    | "history_visibility"
+    | "guest_access"
+    | "join_rule"
+    | "directory"
+    | "verification";
+
+export interface MatrixConfigureSpaceAccessResult {
+    spaceId: string;
+    requestedMode: MatrixSpaceAccessMode;
+    /** Exact state when accessConfirmed is true; otherwise the safest last-known state. */
+    access: MatrixSpaceAccessSummaryDTO;
+    /** True only when every access field was re-read from the homeserver after the mutation. */
+    accessConfirmed: boolean;
+    complete: boolean;
+    partial?: {
+        code: "MATRIX_SPACE_ACCESS_PARTIAL";
+        failedStep: MatrixConfigureSpaceAccessStep;
+        message: string;
+    };
+}
+
+export interface MatrixRequestSpaceAccessResult {
+    roomId: string;
+    membership: "knock" | "invite" | "join";
+}
+
+export interface MatrixSpaceAccessRequestMemberDTO {
+    userId: string;
+    displayName?: string;
+    avatarUrl?: string;
+    /** Homeserver event timestamp, when it is a safe non-negative integer. */
+    requestedAt?: number;
+    canApprove: boolean;
+    canDeny: boolean;
+}
+
+export interface MatrixSpaceAccessRequestListDTO {
+    spaceId: string;
+    requests: MatrixSpaceAccessRequestMemberDTO[];
+    truncated: boolean;
+    canApproveAccessRequests: boolean;
+    canDenyAccessRequests: boolean;
+}
+
+export type MatrixSpaceAccessDecision = "approve" | "deny";
+
+export interface MatrixResolveSpaceAccessRequest {
+    spaceId: string;
+    userId: string;
+    decision: MatrixSpaceAccessDecision;
+}
+
+export interface MatrixResolveSpaceAccessRequestResult extends MatrixResolveSpaceAccessRequest {
+    membership: "invite" | "join" | "leave";
+    accessRequestCount: number;
+}
 
 /** User-controlled metadata for creating a Matrix Space. */
 export interface MatrixCreateSpaceRequest {

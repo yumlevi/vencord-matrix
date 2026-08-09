@@ -11,6 +11,8 @@ import type {
     MatrixAttachmentSendResult,
     MatrixBridgeEvent,
     MatrixBridgeStatus,
+    MatrixConfigureSpaceAccessRequest,
+    MatrixConfigureSpaceAccessResult,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpaceRequest,
@@ -26,11 +28,16 @@ import type {
     MatrixPublicRoomDirectoryDTO,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
+    MatrixRequestSpaceAccessResult,
+    MatrixResolveSpaceAccessRequest,
+    MatrixResolveSpaceAccessRequestResult,
     MatrixRoomActionResult,
     MatrixRoomJoinRule,
     MatrixRoomKind,
     MatrixRoomMembership,
     MatrixSnapshot,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceChildDTO,
     MatrixSpaceHierarchyDTO,
     MatrixStickerSendRequest,
@@ -73,6 +80,11 @@ export interface MatrixShellRoom {
     membership: MatrixRoomMembership;
     kind: MatrixRoomKind;
     roomType?: string;
+    canConfigureSpaceAccess?: boolean;
+    accessRequestCount?: number;
+    accessRequestCountComplete?: boolean;
+    canApproveAccessRequests?: boolean;
+    canDenyAccessRequests?: boolean;
     joinRule: MatrixRoomJoinRule;
     parentIds: string[];
     childIds: string[];
@@ -203,6 +215,17 @@ export interface MatrixSecureViewRequestMap {
     rejectInvite: { input: { roomId: string; }; output: MatrixRoomActionResult; };
     leaveRoom: { input: { roomId: string; }; output: MatrixRoomActionResult; };
     createSpace: { input: { request: MatrixCreateSpaceRequest; }; output: MatrixCreateSpaceResult; };
+    getSpaceAccess: { input: { spaceId: string; }; output: MatrixSpaceAccessSummaryDTO; };
+    configureSpaceAccess: {
+        input: { request: MatrixConfigureSpaceAccessRequest; };
+        output: MatrixConfigureSpaceAccessResult;
+    };
+    requestSpaceAccess: { input: { joinName: string; }; output: MatrixRequestSpaceAccessResult; };
+    getSpaceAccessRequests: { input: { spaceId: string; }; output: MatrixSpaceAccessRequestListDTO; };
+    resolveSpaceAccessRequest: {
+        input: { request: MatrixResolveSpaceAccessRequest; };
+        output: MatrixResolveSpaceAccessRequestResult;
+    };
     createSpaceChild: {
         input: { request: MatrixCreateSpaceChildRequest; };
         output: MatrixCreateSpaceChildResult;

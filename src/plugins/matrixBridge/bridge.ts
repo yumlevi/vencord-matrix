@@ -170,6 +170,10 @@ export interface MatrixRoomDto {
         suggested?: boolean;
     }>;
     canManageSpaceChildren?: boolean;
+    accessRequestCount?: number;
+    accessRequestCountComplete?: boolean;
+    canApproveAccessRequests?: boolean;
+    canDenyAccessRequests?: boolean;
     topic?: string;
     avatarUrl?: string;
     encrypted?: boolean;
@@ -286,6 +290,7 @@ const guildIdsBySpaceId = new Map<string, Set<string>>();
 const projectedRoomIdsByGuildId = new Map<string, Set<string>>();
 const leavingMatrixSpaceSessions = new Set<string>();
 const leavingMatrixGroupSessions = new Set<string>();
+const accessRequestProjectionListeners = new Set<(contexts: readonly MatrixAccessRequestContext[]) => void>();
 const spaceCreateContextsByCategoryId = new Map<string, {
     guildId: string;
     parentSpaceId: string;
@@ -2327,6 +2332,7 @@ export function applySnapshot(
         if (!keepChannels.has(channelId)) removeInjectedChannel(channelId);
     }
     completeProjectedEchoRows(completedEchoesByRoom);
+    publishMatrixAccessRequestProjection();
 }
 
 function projectionChannelRecord(injected: InjectedRoom, snapshot: MatrixSnapshotDto) {
@@ -2935,6 +2941,7 @@ export function stopBridge() {
     spaceCreateContextsByCategoryId.clear();
     activeMatrixChannelId = undefined;
     lastPersistedRoute = "";
+    publishMatrixAccessRequestProjection();
 }
 
 export async function suspendBridge() {
@@ -3360,6 +3367,288 @@ export interface MatrixSpaceCreateContext {
     parentSpaceId: string;
     parentLabel: string;
     canManageSpaceChildren: boolean;
+}
+
+export interface MatrixAccessRequestContext {
+    guildId: string;
+    spaceId: string;
+    label: string;
+    expectedAccountId: string;
+    generation: number;
+    count: number;
+    countComplete: boolean;
+    canApprove: boolean;
+    canDeny: boolean;
+}
+
+export interface MatrixAccessRequest {
+    userId: string;
+    displayName: string;
+    /** Validated but deliberately not rendered directly; it is still external media. */
+    avatarUrl?: string;
+    canApprove: boolean;
+    canDeny: boolean;
+}
+
+export interface MatrixAccessRequestList {
+    spaceId: string;
+    requests: MatrixAccessRequest[];
+    truncated: boolean;
+    canApprove: boolean;
+    canDeny: boolean;
+}
+
+export type MatrixAccessRequestDecision = "approve" | "deny";
+
+function boundedAccessRequestCount(value: unknown) {
+    return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 200
+        ? value as number
+        : 0;
+}
+
+function sameAccessRequestBinding(
+    left: MatrixAccessRequestContext,
+    right: MatrixAccessRequestContext | undefined
+) {
+    return Boolean(right)
+        && left.guildId === right!.guildId
+        && left.spaceId === right!.spaceId
+        && left.expectedAccountId === right!.expectedAccountId
+        && left.generation === right!.generation;
+}
+
+export function getMatrixAccessRequestContext(guildId: string): MatrixAccessRequestContext | undefined {
+    if (!bridgeActive || !injectedGuildIds.has(guildId) || !GuildStore.getGuild(guildId)) return undefined;
+    const spaceId = spaceIdsByGuildId.get(guildId);
+    const expectedAccountId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
+    if (!spaceId || !expectedAccountId) return undefined;
+    const space = joinedSpace(spaceId);
+    if (!space) return undefined;
+    return {
+        guildId,
+        spaceId,
+        label: cleanDisplayText(
+            space.name?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+            "Server",
+            100
+        ),
+        expectedAccountId,
+        generation: pollGeneration,
+        count: boundedAccessRequestCount(space.accessRequestCount),
+        countComplete: space.accessRequestCountComplete === true,
+        canApprove: space.canApproveAccessRequests === true,
+        canDeny: space.canDenyAccessRequests === true,
+    };
+}
+
+export function getMatrixAccessRequestContexts() {
+    return [...injectedGuildIds]
+        .sort()
+        .map(getMatrixAccessRequestContext)
+        .filter((context): context is MatrixAccessRequestContext => Boolean(context));
+}
+
+export function isMatrixAccessRequestContextCurrent(context: MatrixAccessRequestContext) {
+    return sameAccessRequestBinding(context, getMatrixAccessRequestContext(context.guildId));
+}
+
+export function subscribeMatrixAccessRequestProjection(
+    listener: (contexts: readonly MatrixAccessRequestContext[]) => void
+) {
+    accessRequestProjectionListeners.add(listener);
+    try {
+        listener(getMatrixAccessRequestContexts());
+    } catch (error) {
+        logger.warn("Access request projection listener failed", error);
+    }
+    return () => accessRequestProjectionListeners.delete(listener);
+}
+
+function publishMatrixAccessRequestProjection() {
+    const contexts = getMatrixAccessRequestContexts();
+    for (const listener of accessRequestProjectionListeners) {
+        try {
+            listener(contexts);
+        } catch (error) {
+            logger.warn("Access request projection listener failed", error);
+        }
+    }
+}
+
+function currentAccessRequestContext(
+    expected: MatrixAccessRequestContext,
+    decision?: MatrixAccessRequestDecision
+) {
+    const current = getMatrixAccessRequestContext(expected.guildId);
+    if (!sameAccessRequestBinding(expected, current)) return undefined;
+    if (decision === "approve" && !current!.canApprove) return undefined;
+    if (decision === "deny" && !current!.canDeny) return undefined;
+    return current;
+}
+
+function normalizedAccessRequestUserId(value: unknown) {
+    if (typeof value !== "string" || value.length < 4 || value.length > 512
+        || !/^@[^\s:\u0000-\u001f\u007f]+:[^\s\u0000-\u001f\u007f]+$/u.test(value)) {
+        throw new Error("The access request response was invalid.");
+    }
+    return value;
+}
+
+function normalizedAccessRequestDisplayName(value: unknown, userId: string) {
+    if (value == null) return userId;
+    if (typeof value !== "string") throw new Error("The access request response was invalid.");
+    return cleanDisplayText(
+        value.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+        userId,
+        100
+    );
+}
+
+function normalizedAccessRequestAvatarUrl(value: unknown) {
+    if (value == null) return undefined;
+    if (typeof value !== "string" || value.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(value)) {
+        throw new Error("The access request response was invalid.");
+    }
+    try {
+        const url = new URL(value);
+        if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
+            throw new Error("The access request response was invalid.");
+        }
+    } catch {
+        throw new Error("The access request response was invalid.");
+    }
+    return value;
+}
+
+function normalizeAccessRequestList(value: unknown, context: MatrixAccessRequestContext): MatrixAccessRequestList {
+    const response = value as Record<string, unknown> | null;
+    if (!response || typeof response !== "object"
+        || response.spaceId !== context.spaceId
+        || !Array.isArray(response.requests)
+        || response.requests.length > 200
+        || typeof response.truncated !== "boolean"
+        || typeof response.canApproveAccessRequests !== "boolean"
+        || typeof response.canDenyAccessRequests !== "boolean") {
+        throw new Error("The access request response was invalid.");
+    }
+    const seen = new Set<string>();
+    const requests = response.requests.map(value => {
+        const request = value as Record<string, unknown> | null;
+        if (!request || typeof request !== "object"
+            || typeof request.canApprove !== "boolean"
+            || typeof request.canDeny !== "boolean") {
+            throw new Error("The access request response was invalid.");
+        }
+        const userId = normalizedAccessRequestUserId(request.userId);
+        if (seen.has(userId)) throw new Error("The access request response was invalid.");
+        seen.add(userId);
+        return {
+            userId,
+            displayName: normalizedAccessRequestDisplayName(request.displayName, userId),
+            avatarUrl: normalizedAccessRequestAvatarUrl(request.avatarUrl),
+            canApprove: request.canApprove,
+            canDeny: request.canDeny,
+        };
+    });
+    return {
+        spaceId: context.spaceId,
+        requests,
+        truncated: response.truncated,
+        canApprove: response.canApproveAccessRequests,
+        canDeny: response.canDenyAccessRequests,
+    };
+}
+
+export async function getMatrixSpaceAccessRequests(context: MatrixAccessRequestContext) {
+    const current = currentAccessRequestContext(context);
+    if (!current || !current.canApprove && !current.canDeny) {
+        throw new Error("The access request context is no longer current.");
+    }
+    const result = await Native.getSpaceAccessRequests(context.spaceId, context.expectedAccountId) as unknown;
+    const after = currentAccessRequestContext(context);
+    if (!after || !after.canApprove && !after.canDeny) {
+        throw new Error("The access request context is no longer current.");
+    }
+    return normalizeAccessRequestList(result, context);
+}
+
+function updateProjectedAccessRequestCount(context: MatrixAccessRequestContext, count: number) {
+    if (!latestSnapshot || !currentAccessRequestContext(context)) return;
+    let changed = false;
+    const rooms = (latestSnapshot.rooms ?? []).map(room => {
+        if (room.roomId !== context.spaceId || room.accessRequestCount === count) return room;
+        changed = true;
+        return { ...room, accessRequestCount: count };
+    });
+    if (!changed) return;
+    latestSnapshot = { ...latestSnapshot, rooms };
+    publishMatrixAccessRequestProjection();
+}
+
+export async function resolveMatrixSpaceAccessRequest(
+    context: MatrixAccessRequestContext,
+    userIdValue: string,
+    decision: MatrixAccessRequestDecision
+) {
+    const userId = normalizedAccessRequestUserId(userIdValue);
+    if (!currentAccessRequestContext(context, decision)) {
+        throw new Error("The access request context is no longer current.");
+    }
+    let value: unknown;
+    try {
+        value = await Native.resolveSpaceAccessRequest({
+            spaceId: context.spaceId,
+            userId,
+            decision,
+        }, context.expectedAccountId) as unknown;
+    } catch (error) {
+        if (matrixErrorCode(error) === "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS"
+            && currentAccessRequestContext(context, decision)) {
+            try {
+                await refreshSnapshot(context.generation);
+            } catch (refreshError) {
+                logger.warn("Ambiguous access request resolution refresh failed", refreshError);
+            }
+        }
+        throw error;
+    }
+    if (!currentAccessRequestContext(context, decision)) {
+        throw new Error("The access request context is no longer current.");
+    }
+    const result = value as Record<string, unknown> | null;
+    const count = result ? boundedAccessRequestCount(result.accessRequestCount) : -1;
+    const membershipValid = decision === "approve"
+        ? result?.membership === "invite" || result?.membership === "join"
+        : result?.membership === "leave";
+    if (!result || typeof result !== "object"
+        || result.spaceId !== context.spaceId
+        || result.userId !== userId
+        || result.decision !== decision
+        || !membershipValid
+        || count !== result.accessRequestCount) {
+        throw new Error("The access request response was invalid.");
+    }
+    updateProjectedAccessRequestCount(context, count);
+    if (!currentAccessRequestContext(context, decision)) {
+        throw new Error("The access request context is no longer current.");
+    }
+    try {
+        await refreshSnapshot(context.generation);
+    } catch (error) {
+        if (!currentAccessRequestContext(context, decision)) {
+            throw new Error("The access request context is no longer current.");
+        }
+        logger.warn("Access request projection refresh failed", error);
+    }
+    if (!currentAccessRequestContext(context, decision)) {
+        throw new Error("The access request context is no longer current.");
+    }
+    return {
+        userId,
+        decision,
+        membership: result.membership as "invite" | "join" | "leave",
+        accessRequestCount: count
+    };
 }
 
 function joinedSpace(spaceId: string) {

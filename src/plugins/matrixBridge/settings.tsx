@@ -35,11 +35,16 @@ import {
 } from "./bridge";
 import { matrixErrorCode } from "./errorCode";
 import type {
+    MatrixConfigureSpaceAccessResult,
     MatrixCreateSpaceResult,
     MatrixMemberDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixPublicRoomDTO,
+    MatrixRequestSpaceAccessResult,
     MatrixRoomDTO,
+    MatrixSpaceAccessMode,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
 } from "./types";
@@ -49,6 +54,11 @@ type SettingsTab = "rooms" | "discover" | "account";
 type MatrixRoomLike = MatrixRoomDTO | MatrixSpaceHierarchyRoomDTO;
 type MatrixSpaceVisibility = "private" | "public";
 type MatrixSpaceCreationPhase = "idle" | "creating" | "syncing" | "checking";
+type MatrixSpaceAccessDraft = Pick<MatrixSpaceAccessSummaryDTO, "mode"> & { joinName: string; };
+
+const JOIN_NAME_MAX_LENGTH = 64;
+const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 
 const MATRIX_SESSION_RESET_CODES = new Set([
     "MATRIX_SESSION_RESET_REQUIRED",
@@ -111,6 +121,77 @@ function matrixServerName(identifier: unknown) {
         : undefined;
 }
 
+function cleanJoinName(value: string) {
+    return value.trim().toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
+}
+
+function validJoinName(value: string) {
+    return JOIN_NAME_PATTERN.test(value);
+}
+
+function joinNameFromAlias(alias: string | undefined, expectedServer: string | undefined) {
+    if (!alias?.startsWith("#")) return undefined;
+    const separator = alias.indexOf(":");
+    if (separator < 2 || separator === alias.length - 1) return undefined;
+    if (expectedServer && alias.slice(separator + 1) !== expectedServer) return undefined;
+    const joinName = alias.slice(1, separator);
+    return validJoinName(joinName) ? joinName : undefined;
+}
+
+function accessModeLabel(mode: MatrixSpaceAccessMode) {
+    switch (mode) {
+        case "public": return "Public and listed";
+        case "request": return "Unlisted; requests require approval";
+        case "invite": return "Unlisted; invitation only";
+    }
+}
+
+function simplifiedAccessModeLabel(mode: MatrixSpaceAccessMode) {
+    switch (mode) {
+        case "public": return "Public access";
+        case "request": return "Request approval";
+        case "invite": return "Invitation only";
+    }
+}
+
+function safeRequesterDisplayName(value: string | undefined) {
+    return value?.replace(BIDI_FORMATTING_CONTROL_PATTERN, "").trim() || undefined;
+}
+
+function visibleRequesterUserId(value: string) {
+    return value.replace(BIDI_FORMATTING_CONTROL_PATTERN, character =>
+        `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
+}
+
+function actualAccessLabel(access: MatrixSpaceAccessSummaryDTO) {
+    const listed = access.directoryVisibility === "public" ? "listed" : "unlisted";
+    const admission = access.joinRule === "public"
+        ? "open to everyone"
+        : access.joinRule === "knock"
+            ? "requests require approval"
+            : access.joinRule === "restricted"
+                ? "restricted by linked-server membership"
+                : access.joinRule === "knock_restricted"
+                    ? "linked-server members can join; others can request approval"
+                    : "invitation only";
+    return `${listed}; ${admission}`;
+}
+
+function accessConfirmationText(result: MatrixConfigureSpaceAccessResult) {
+    const access = actualAccessLabel(result.access);
+    return result.accessConfirmed
+        ? `Current access is ${access}.`
+        : `Could not verify current access. Last confirmed state: ${access}.`;
+}
+
+function accessResultNotice(result: MatrixRequestSpaceAccessResult) {
+    switch (result.membership) {
+        case "knock": return "Your access request is pending approval.";
+        case "invite": return "Access was approved. Accept the server invitation under Chats & servers.";
+        case "join": return "You already have access to this server.";
+    }
+}
+
 function roomName(room: MatrixRoomLike) {
     return room.name?.trim() || room.roomId;
 }
@@ -139,6 +220,10 @@ function isHierarchyChild(hierarchy: MatrixSpaceHierarchyDTO, roomId: string) {
 
 function snapshotRooms() {
     return (getLatestSnapshot()?.rooms ?? []) as MatrixRoomDTO[];
+}
+
+function isCurrentAccount(expectedUserId: string) {
+    return getLatestSnapshot()?.account?.userId === expectedUserId;
 }
 
 function hierarchyRows(hierarchy: MatrixSpaceHierarchyDTO | undefined, spaceId: string) {
@@ -175,7 +260,7 @@ function RoomIdentity({ room }: { room: MatrixRoomLike; }) {
             <div className="vc-matrix-room-heading">
                 <Heading tag="h5">{roomName(room)}</Heading>
                 <span className={`vc-matrix-kind vc-matrix-kind-${kind}`}>
-                    {kind === "dm" ? "Direct message" : kind === "space" ? "Space" : "Room"}
+                    {kind === "dm" ? "Direct message" : kind === "space" ? "Server" : "Room"}
                 </span>
             </div>
             <div className="vc-matrix-room-id">{room.roomId}</div>
@@ -295,8 +380,8 @@ function CreateMatrixServerModal({
     return (
         <Modal
             {...modalProps}
-            title="Create a Matrix server"
-            subtitle="It will appear beside your Discord servers while its messages stay on Matrix."
+            title="Create a server"
+            subtitle="It will appear beside your other Discord servers."
             actions={[
                 {
                     text: "Cancel",
@@ -353,11 +438,11 @@ function CreateMatrixServerModal({
                     <Select
                         options={[
                             {
-                                label: "Private - invitation only",
+                                label: "Unlisted - invitation only",
                                 value: "private" as const,
                             },
                             {
-                                label: "Public - discoverable and open to anyone",
+                                label: "Public - listed and open to everyone",
                                 value: "public" as const,
                             },
                         ]}
@@ -372,8 +457,11 @@ function CreateMatrixServerModal({
                     />
                     <Paragraph className="vc-matrix-field-help">
                         {visibility === "private"
-                            ? "Private servers can only be joined by people you invite."
-                            : "Public servers are listed by your provider and can be joined by anyone, subject to its policies."}
+                            ? "This server will not be listed in your provider's public directory, but links, aliases, or parent servers may still reveal it. Admission is controlled by invitation or request; a join name is not a password."
+                            : "This server will appear in discovery and anyone can join."}
+                    </Paragraph>
+                    <Paragraph className="vc-matrix-field-help">
+                        After creation, use Access settings on the server card to require approval and choose a unique join name.
                     </Paragraph>
                 </label>
                 <Checkbox
@@ -389,8 +477,8 @@ function CreateMatrixServerModal({
                         <strong>Create a general chat</strong>
                         <span>
                             {visibility === "private"
-                                ? "Start with an encrypted #general for server members; members see messages from when they join."
-                                : "Start with a public #general that is not listed separately; members see messages from when they join."}
+                                ? "Start with a #general chat for invited server members."
+                                : "Start with a #general chat that is reached through this server and is not listed separately."}
                         </span>
                     </span>
                 </Checkbox>
@@ -436,6 +524,9 @@ export function MatrixSettings() {
     const [addressBusy, setAddressBusy] = useState(false);
     const [addressError, setAddressError] = useState("");
     const [pendingAddressRoomId, setPendingAddressRoomId] = useState<string>();
+    const [joinName, setJoinName] = useState("");
+    const [joinNameBusy, setJoinNameBusy] = useState(false);
+    const [joinNameError, setJoinNameError] = useState("");
     const [notice, setNoticeText] = useState("");
     const [noticeTone, setNoticeTone] = useState<"success" | "warning">("success");
     const [error, setError] = useState("");
@@ -446,6 +537,14 @@ export function MatrixSettings() {
     const [spaceCreationNeedsRefresh, setSpaceCreationNeedsRefresh] = useState(matrixSpaceCreationNeedsRefresh);
     const [spaceHierarchies, setSpaceHierarchies] = useState<Record<string, MatrixSpaceHierarchyDTO>>({});
     const [spaceErrors, setSpaceErrors] = useState<Record<string, string>>({});
+    const [expandedAccessSpaces, setExpandedAccessSpaces] = useState<Set<string>>(() => new Set());
+    const [spaceAccess, setSpaceAccess] = useState<Record<string, MatrixSpaceAccessSummaryDTO>>({});
+    const [spaceAccessConfirmed, setSpaceAccessConfirmed] = useState<Record<string, boolean>>({});
+    const [spaceAccessDrafts, setSpaceAccessDrafts] = useState<Record<string, MatrixSpaceAccessDraft>>({});
+    const [spaceAccessRequests, setSpaceAccessRequests] = useState<Record<string, MatrixSpaceAccessRequestListDTO>>({});
+    const [spaceAccessLoading, setSpaceAccessLoading] = useState<string>();
+    const [spaceAccessAction, setSpaceAccessAction] = useState<string>();
+    const [spaceAccessErrors, setSpaceAccessErrors] = useState<Record<string, string>>({});
     const [dmSpaceId, setDmSpaceId] = useState("");
     const [dmUserId, setDmUserId] = useState("");
     const [dmMembersLoading, setDmMembersLoading] = useState(false);
@@ -510,7 +609,7 @@ export function MatrixSettings() {
         }
     }
 
-    async function loadPublicRooms(): Promise<MatrixPublicRoomDirectoryDTO | undefined> {
+    async function loadPublicRooms(expectedUserId?: string): Promise<MatrixPublicRoomDirectoryDTO | undefined> {
         const requestId = ++directoryRequest.current;
         setDirectoryBusy(true);
         setDirectoryLoaded(false);
@@ -518,6 +617,7 @@ export function MatrixSettings() {
         try {
             const directory = await Native.publicRooms();
             if (requestId !== directoryRequest.current) return;
+            if (expectedUserId && !isCurrentAccount(expectedUserId)) return;
             setPublicRooms(directory.rooms);
             setDirectoryTotalEstimate(directory.totalRoomCountEstimate);
             setDirectoryTruncated(directory.truncated);
@@ -532,11 +632,17 @@ export function MatrixSettings() {
         }
     }
 
-    async function loadRooms(includeDirectory = false) {
+    async function loadRooms(includeDirectory = false, expectedUserId?: string) {
         const snapshot = await refreshSnapshot();
+        if (expectedUserId && snapshot.account?.userId !== expectedUserId) {
+            throw new Error("The connected account changed while refreshing.");
+        }
         const nextRooms = (snapshot.rooms ?? []) as MatrixRoomDTO[];
         setRooms(nextRooms);
-        const directory = includeDirectory ? await loadPublicRooms() : undefined;
+        const directory = includeDirectory ? await loadPublicRooms(expectedUserId) : undefined;
+        if (expectedUserId && !isCurrentAccount(expectedUserId)) {
+            throw new Error("The connected account changed while refreshing.");
+        }
         return { rooms: nextRooms, directory };
     }
 
@@ -636,9 +742,9 @@ export function MatrixSettings() {
                 matrixSpaceCreationNeedsRefresh = false;
                 setSpaceCreationNeedsRefresh(false);
                 if (directory) {
-                    setNotice(`Matrix rooms and ${directory.rooms.length} published listings refreshed.`);
+                    setNotice(`Chats, servers, and ${directory.rooms.length} public listings refreshed.`);
                 } else {
-                    setWarning("Matrix rooms refreshed, but the published directory refresh failed.");
+                    setWarning("Chats and servers refreshed, but discovery could not be refreshed.");
                 }
             });
         } finally {
@@ -761,8 +867,19 @@ export function MatrixSettings() {
         setRoomAddress("");
         setAddressError("");
         setPendingAddressRoomId(undefined);
+        setJoinName("");
+        setJoinNameBusy(false);
+        setJoinNameError("");
         setExpandedSpaces(new Set());
         setSpaceHierarchies({});
+        setExpandedAccessSpaces(new Set());
+        setSpaceAccess({});
+        setSpaceAccessConfirmed({});
+        setSpaceAccessDrafts({});
+        setSpaceAccessRequests({});
+        setSpaceAccessLoading(undefined);
+        setSpaceAccessAction(undefined);
+        setSpaceAccessErrors({});
         setTab("account");
     }
 
@@ -820,10 +937,10 @@ export function MatrixSettings() {
             if (opened) {
                 setTab("rooms");
                 setNotice(room.roomType === "m.space"
-                    ? "Space joined and opened as a Discord server."
+                    ? "Server joined and opened."
                     : "Room joined and opened in Discord.");
             } else {
-                setWarning(`${room.name} was joined, but it is still syncing. Use Refresh rooms & directory in a moment.`);
+                setWarning(`${room.name} was joined, but it is still syncing. Use Refresh in a moment.`);
             }
         });
     }
@@ -855,6 +972,280 @@ export function MatrixSettings() {
         } catch (caught) {
             setAddressBusy(false);
             setAddressError(errorMessage(caught));
+        }
+    }
+
+    async function requestAccess(joinNameValue: string, inlineError = true) {
+        const normalized = cleanJoinName(joinNameValue);
+        if (!validJoinName(normalized)) {
+            const message = "Use 1-64 lowercase letters or numbers. Dots, underscores, and hyphens may appear between them.";
+            if (inlineError) setJoinNameError(message);
+            else setError(message);
+            return;
+        }
+        if (!config?.userId) {
+            const message = "Reconnect your account before requesting access.";
+            if (inlineError) setJoinNameError(message);
+            else setError(message);
+            return;
+        }
+        const expectedUserId = config.userId;
+
+        setJoinNameBusy(true);
+        setJoinNameError("");
+        setError("");
+        setNotice("");
+        try {
+            const result = await Native.requestSpaceAccess(normalized, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            setJoinName("");
+            setJoinNameError("");
+            setNotice(accessResultNotice(result));
+            if (result.membership === "invite" || result.membership === "join") {
+                try {
+                    const { rooms: nextRooms } = await loadRooms(false, expectedUserId);
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    const joinedSpace = nextRooms.find(room => room.roomId === result.roomId
+                        && roomMembership(room) === "join" && roomKind(room) === "space");
+                    if (joinedSpace && result.membership === "join") {
+                        openMatrixSpace(joinedSpace.roomId);
+                        setTab("rooms");
+                    }
+                } catch {
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    setWarning("The access request succeeded, but the server list could not be refreshed yet.");
+                }
+            }
+        } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (matrixErrorCode(caught) === "MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS") {
+                const ambiguity = errorMessage(caught);
+                setJoinName("");
+                setJoinNameError("");
+                setWarning(`The access request may have succeeded, but its response could not be confirmed: ${ambiguity}`);
+                try {
+                    await loadRooms(false, expectedUserId);
+                } catch {
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    setWarning(`The access request may have succeeded, but the server list could not be refreshed yet. ${ambiguity}`);
+                }
+                return;
+            }
+            const message = errorMessage(caught);
+            if (inlineError) setJoinNameError(message);
+            else setError(message);
+        } finally {
+            setJoinNameBusy(false);
+        }
+    }
+
+    async function loadSpaceAccess(space: MatrixRoomDTO) {
+        if (!config?.userId) return;
+        const expectedUserId = config.userId;
+        const spaceId = space.roomId;
+        setSpaceAccessLoading(spaceId);
+        setSpaceAccessErrors(current => ({ ...current, [spaceId]: "" }));
+        try {
+            const access = await Native.getSpaceAccess(spaceId, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            setSpaceAccess(current => ({ ...current, [spaceId]: access }));
+            setSpaceAccessConfirmed(current => ({ ...current, [spaceId]: true }));
+            setSpaceAccessDrafts(current => ({
+                ...current,
+                [spaceId]: { mode: access.mode, joinName: access.joinName ?? "" },
+            }));
+            if (space.canApproveAccessRequests || space.canDenyAccessRequests) {
+                const requests = await Native.getSpaceAccessRequests(spaceId, expectedUserId);
+                if (!isCurrentAccount(expectedUserId)) return;
+                setSpaceAccessRequests(current => ({ ...current, [spaceId]: requests }));
+            }
+        } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) return;
+            setSpaceAccessErrors(current => ({ ...current, [spaceId]: errorMessage(caught) }));
+        } finally {
+            setSpaceAccessLoading(current => current === spaceId ? undefined : current);
+        }
+    }
+
+    function toggleSpaceAccess(space: MatrixRoomDTO) {
+        if (expandedAccessSpaces.has(space.roomId)) {
+            setExpandedAccessSpaces(current => {
+                const next = new Set(current);
+                next.delete(space.roomId);
+                return next;
+            });
+            setSpaceAccessDrafts(current => {
+                const next = { ...current };
+                delete next[space.roomId];
+                return next;
+            });
+            return;
+        }
+        setExpandedAccessSpaces(current => new Set(current).add(space.roomId));
+        void loadSpaceAccess(space);
+    }
+
+    function applyAccessResult(result: MatrixConfigureSpaceAccessResult) {
+        setSpaceAccess(current => ({ ...current, [result.spaceId]: result.access }));
+        setSpaceAccessConfirmed(current => ({ ...current, [result.spaceId]: result.accessConfirmed }));
+        setSpaceAccessDrafts(current => ({
+            ...current,
+            [result.spaceId]: { mode: result.access.mode, joinName: result.access.joinName ?? "" },
+        }));
+        const confirmation = accessConfirmationText(result);
+        if (result.complete) setNotice(`Access settings saved. ${confirmation}`);
+        else setWarning(`Access settings were only partly applied. ${result.partial?.message ?? "Review the settings."} ${confirmation}`);
+    }
+
+    async function saveSpaceAccess(spaceId: string) {
+        const draft = spaceAccessDrafts[spaceId];
+        if (!draft || !config?.userId || spaceAccessAction) return;
+        const expectedUserId = config.userId;
+        const normalizedJoinName = cleanJoinName(draft.joinName);
+        if (draft.mode === "request" && !validJoinName(normalizedJoinName)) {
+            setSpaceAccessErrors(current => ({
+                ...current,
+                [spaceId]: "Request approval needs a unique join name using 1-64 lowercase letters or numbers. Dots, underscores, and hyphens may appear between them.",
+            }));
+            return;
+        }
+
+        setSpaceAccessAction(`save:${spaceId}`);
+        setSpaceAccessErrors(current => ({ ...current, [spaceId]: "" }));
+        setError("");
+        setNotice("");
+        try {
+            const result = await Native.configureSpaceAccess({
+                spaceId,
+                mode: draft.mode,
+                ...(draft.mode === "request" ? { joinName: normalizedJoinName } : {}),
+            }, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            applyAccessResult(result);
+            try {
+                const { directory } = await loadRooms(true, expectedUserId);
+                if (!isCurrentAccount(expectedUserId)) return;
+                if (!directory) {
+                    setWarning(`${result.complete ? "Access settings were saved" : "Access settings were partly applied"}, but the public directory could not be refreshed yet. ${accessConfirmationText(result)}`);
+                }
+            } catch {
+                if (!isCurrentAccount(expectedUserId)) return;
+                setWarning(`${result.complete ? "Access settings were saved" : "Access settings were partly applied"}, but the server list could not be refreshed yet. ${accessConfirmationText(result)}`);
+            }
+        } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (matrixErrorCode(caught) === "MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS") {
+                setSpaceAccessConfirmed(current => ({ ...current, [spaceId]: false }));
+                let refreshedAccess: MatrixSpaceAccessSummaryDTO | undefined;
+                try {
+                    const access = await Native.getSpaceAccess(spaceId, expectedUserId);
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    refreshedAccess = access;
+                    setSpaceAccess(current => ({ ...current, [spaceId]: access }));
+                    setSpaceAccessConfirmed(current => ({ ...current, [spaceId]: true }));
+                    setSpaceAccessDrafts(current => ({
+                        ...current,
+                        [spaceId]: {
+                            mode: access.mode,
+                            joinName: access.joinName ?? "",
+                        },
+                    }));
+                } catch {
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    setSpaceAccessDrafts(current => {
+                        const next = { ...current };
+                        delete next[spaceId];
+                        return next;
+                    });
+                }
+                try {
+                    await loadRooms(true, expectedUserId);
+                } catch {
+                    // The bridge poll will retry the room and directory lists.
+                }
+                if (!isCurrentAccount(expectedUserId)) return;
+                setWarning(refreshedAccess
+                    ? `The save response could not be confirmed. Current access was refreshed: ${actualAccessLabel(refreshedAccess)}.`
+                    : "Access settings may have changed, but current access could not be verified. Refresh before saving again.");
+                return;
+            }
+            setSpaceAccessErrors(current => ({ ...current, [spaceId]: errorMessage(caught) }));
+        } finally {
+            setSpaceAccessAction(current => current === `save:${spaceId}` ? undefined : current);
+        }
+    }
+
+    async function resolveAccessRequest(spaceId: string, userId: string, decision: "approve" | "deny") {
+        if (!config?.userId || spaceAccessAction) return;
+        const expectedUserId = config.userId;
+        const action = `${decision}:${spaceId}:${userId}`;
+        setSpaceAccessAction(action);
+        setSpaceAccessErrors(current => ({ ...current, [spaceId]: "" }));
+        setError("");
+        setNotice("");
+        try {
+            const result = await Native.resolveSpaceAccessRequest({ spaceId, userId, decision }, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            setSpaceAccessRequests(current => {
+                const existing = current[spaceId];
+                if (!existing) return current;
+                return {
+                    ...current,
+                    [spaceId]: {
+                        ...existing,
+                        requests: existing.requests.filter(request => request.userId !== userId),
+                    },
+                };
+            });
+            const approved = result.membership === "invite" || result.membership === "join";
+            setNotice(approved
+                ? result.membership === "join"
+                    ? "Access approved. The requester has joined the server."
+                    : "Access approved. The server invitation is ready."
+                : "Access request denied.");
+            try {
+                const [requests] = await Promise.all([
+                    Native.getSpaceAccessRequests(spaceId, expectedUserId),
+                    loadRooms(false, expectedUserId),
+                ]);
+                if (!isCurrentAccount(expectedUserId)) return;
+                setSpaceAccessRequests(current => ({ ...current, [spaceId]: requests }));
+            } catch {
+                if (!isCurrentAccount(expectedUserId)) return;
+                setWarning(approved
+                    ? "Access was approved, but the request list could not be refreshed yet."
+                    : "Access was denied, but the request list could not be refreshed yet.");
+            }
+        } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (matrixErrorCode(caught) === "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS") {
+                const ambiguity = errorMessage(caught);
+                setWarning(`This access decision may have succeeded, but its response could not be confirmed: ${ambiguity}`);
+                let requestsRefreshed = false;
+                let roomsRefreshed = false;
+                try {
+                    const requests = await Native.getSpaceAccessRequests(spaceId, expectedUserId);
+                    if (!isCurrentAccount(expectedUserId)) return;
+                    setSpaceAccessRequests(current => ({ ...current, [spaceId]: requests }));
+                    requestsRefreshed = true;
+                } catch {
+                    // Reopening access settings retries the authoritative request list.
+                }
+                try {
+                    await loadRooms(false, expectedUserId);
+                    roomsRefreshed = true;
+                } catch {
+                    // The bridge poll retries the room projection.
+                }
+                if (!isCurrentAccount(expectedUserId)) return;
+                if (!requestsRefreshed || !roomsRefreshed) {
+                    setWarning(`This access decision may have succeeded, but the server or request list could not be refreshed yet. ${ambiguity}`);
+                }
+            } else {
+                setSpaceAccessErrors(current => ({ ...current, [spaceId]: errorMessage(caught) }));
+            }
+        } finally {
+            setSpaceAccessAction(current => current === action ? undefined : current);
         }
     }
 
@@ -897,7 +1288,7 @@ export function MatrixSettings() {
                 || freshMembership === "join"
                 || freshMembership === "invite"
                 || !canJoinFromHierarchy(freshRoom)) {
-                throw new Error("This room is no longer available to join from the selected space.");
+                throw new Error("This room is no longer available to join from the selected server.");
             }
             await Native.joinRoom(room.roomId);
             await loadRooms(false);
@@ -1074,7 +1465,7 @@ export function MatrixSettings() {
 
     async function createDirectMessage() {
         if (!dmSpaceId || !dmUserId) {
-            setError("Choose a space and one of its joined members.");
+            setError("Choose a server and one of its joined members.");
             return;
         }
         await run(async () => {
@@ -1364,10 +1755,150 @@ export function MatrixSettings() {
         );
     }
 
+    function renderSpaceAccess(space: MatrixRoomDTO) {
+        const spaceId = space.roomId;
+        const access = spaceAccess[spaceId];
+        const draft = spaceAccessDrafts[spaceId];
+        const requests = spaceAccessRequests[spaceId];
+        const saving = spaceAccessAction === `save:${spaceId}`;
+        const accessActionBusy = spaceAccessAction != null;
+        return (
+            <div className="vc-matrix-hierarchy">
+                <div className="vc-matrix-section-heading">
+                    <Heading tag="h4">Access settings</Heading>
+                    <Paragraph>
+                        Unlisted means not listed in your provider&apos;s public directory; links, aliases, or parent servers may still reveal the server. Admission is controlled by invitation or request; a join name is not a password.
+                    </Paragraph>
+                    {access && <Paragraph>
+                        {spaceAccessConfirmed[spaceId] === false
+                            ? `Could not verify current access. Last confirmed state: ${actualAccessLabel(access)}.`
+                            : `Current access: ${actualAccessLabel(access)}.`}
+                    </Paragraph>}
+                </div>
+                {spaceAccessLoading === spaceId && <Paragraph>Loading access settings...</Paragraph>}
+                {space.canConfigureSpaceAccess === true && draft && (
+                    <>
+                        {access && (access.joinRule === "restricted" || access.joinRule === "knock_restricted") && (
+                            <Paragraph style={{ color: "var(--text-warning)" }}>
+                                Saving will replace the current linked-server membership rule with {simplifiedAccessModeLabel(draft.mode)}.
+                            </Paragraph>
+                        )}
+                        <label>
+                            <Heading tag="h5">Who can join?</Heading>
+                            <Select
+                                options={(["public", "request", "invite"] as const).map(mode => ({
+                                    label: accessModeLabel(mode),
+                                    value: mode,
+                                }))}
+                                closeOnSelect={true}
+                                select={mode => {
+                                    setSpaceAccessDrafts(current => ({
+                                        ...current,
+                                        [spaceId]: { ...current[spaceId], mode },
+                                    }));
+                                    setSpaceAccessErrors(current => ({ ...current, [spaceId]: "" }));
+                                }}
+                                isSelected={mode => mode === draft.mode}
+                                serialize={mode => mode}
+                                isDisabled={accessActionBusy || spaceAccessLoading === spaceId}
+                            />
+                        </label>
+                        {draft.mode === "request" && (
+                            <label>
+                                <Heading tag="h5">Server join name</Heading>
+                                <TextInput
+                                    disabled={accessActionBusy || spaceAccessLoading === spaceId}
+                                    value={draft.joinName}
+                                    placeholder="my-server"
+                                    maxLength={JOIN_NAME_MAX_LENGTH}
+                                    onChange={value => {
+                                        setSpaceAccessDrafts(current => ({
+                                            ...current,
+                                            [spaceId]: {
+                                                ...current[spaceId],
+                                                joinName: value.toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH),
+                                            },
+                                        }));
+                                        setSpaceAccessErrors(current => ({ ...current, [spaceId]: "" }));
+                                    }}
+                                />
+                                <Paragraph>
+                                    Share this unique lowercase name so people can request access. It is not a password.
+                                </Paragraph>
+                                {access?.joinName && <Paragraph>Current join name: {access.joinName}</Paragraph>}
+                            </label>
+                        )}
+                        <Button
+                            disabled={accessActionBusy
+                                || spaceAccessLoading === spaceId
+                                || (draft.mode === "request" && !validJoinName(cleanJoinName(draft.joinName)))}
+                            variant="positive"
+                            onClick={() => void saveSpaceAccess(spaceId)}
+                        >
+                            {saving ? "Saving access settings..." : "Save access settings"}
+                        </Button>
+                    </>
+                )}
+                {spaceAccessErrors[spaceId] && (
+                    <Paragraph style={{ color: "var(--text-danger)" }} role="alert">
+                        {spaceAccessErrors[spaceId]}
+                    </Paragraph>
+                )}
+                {requests && (
+                    <div className="vc-matrix-section-heading">
+                        <Heading tag="h5">Access requests ({requests.requests.length})</Heading>
+                        {!requests.requests.length && <Paragraph>No pending access requests.</Paragraph>}
+                        {requests.truncated && <Paragraph>Only the first pending requests are shown.</Paragraph>}
+                        <div className="vc-matrix-card-list">
+                            {requests.requests.map(request => {
+                                const approveAction = `approve:${spaceId}:${request.userId}`;
+                                const denyAction = `deny:${spaceId}:${request.userId}`;
+                                const requesterName = safeRequesterDisplayName(request.displayName);
+                                const requesterUserId = visibleRequesterUserId(request.userId);
+                                return (
+                                    <div className="vc-matrix-room-card" key={request.userId}>
+                                        <div className="vc-matrix-room-identity">
+                                            <Heading tag="h5">{requesterName || requesterUserId}</Heading>
+                                            {requesterName && <div className="vc-matrix-room-id">{requesterUserId}</div>}
+                                        </div>
+                                        <div className="vc-matrix-row-actions">
+                                            {request.canApprove && (
+                                                <Button
+                                                    disabled={accessActionBusy}
+                                                    variant="positive"
+                                                    onClick={() => void resolveAccessRequest(spaceId, request.userId, "approve")}
+                                                >
+                                                    {spaceAccessAction === approveAction ? "Approving..." : "Approve"}
+                                                </Button>
+                                            )}
+                                            {request.canDeny && (
+                                                <Button
+                                                    disabled={accessActionBusy}
+                                                    variant="dangerSecondary"
+                                                    onClick={() => void resolveAccessRequest(spaceId, request.userId, "deny")}
+                                                >
+                                                    {spaceAccessAction === denyAction ? "Denying..." : "Deny"}
+                                                </Button>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
     function renderSpace(space: MatrixRoomDTO) {
         const expanded = expandedSpaces.has(space.roomId);
+        const accessExpanded = expandedAccessSpaces.has(space.roomId);
         const hierarchy = spaceHierarchies[space.roomId];
         const children = hierarchyRows(hierarchy, space.roomId);
+        const canOpenAccess = space.canConfigureSpaceAccess === true
+            || space.canApproveAccessRequests === true
+            || space.canDenyAccessRequests === true;
         return (
             <div className="vc-matrix-space-card" key={space.roomId}>
                 <div className="vc-matrix-room-card">
@@ -1379,6 +1910,17 @@ export function MatrixSettings() {
                         <Button disabled={busy || spaceLoading === space.roomId} variant="secondary" onClick={() => void toggleSpace(space.roomId)}>
                             {spaceLoading === space.roomId ? "Loading..." : expanded ? "Hide rooms" : "Browse rooms"}
                         </Button>
+                        {canOpenAccess && (
+                            <Button
+                                disabled={busy || spaceAccessLoading === space.roomId}
+                                variant="secondary"
+                                onClick={() => toggleSpaceAccess(space)}
+                            >
+                                {spaceAccessLoading === space.roomId
+                                    ? "Loading access..."
+                                    : `${accessExpanded ? "Hide access settings" : "Access settings"}${space.accessRequestCount ? ` (${space.accessRequestCount})` : ""}`}
+                            </Button>
+                        )}
                         <Button disabled={busy} variant="dangerSecondary" onClick={() => confirmLeave(space)}>
                             Leave
                         </Button>
@@ -1386,17 +1928,18 @@ export function MatrixSettings() {
                 </div>
                 {expanded && (
                     <div className="vc-matrix-hierarchy">
-                        {spaceLoading === space.roomId && <Paragraph>Loading this space...</Paragraph>}
+                        {spaceLoading === space.roomId && <Paragraph>Loading this server...</Paragraph>}
                         {spaceErrors[space.roomId] && (
                             <Paragraph style={{ color: "var(--text-danger)" }}>
-                                Could not load this space: {spaceErrors[space.roomId]}
+                                Could not load this server: {spaceErrors[space.roomId]}
                             </Paragraph>
                         )}
-                        {hierarchy && children.length === 0 && <Paragraph>This space has no visible rooms.</Paragraph>}
+                        {hierarchy && children.length === 0 && <Paragraph>This server has no visible rooms.</Paragraph>}
                         {hierarchy && children.map(({ room, depth }) =>
                             renderHierarchyRoom(space.roomId, hierarchy, room, depth))}
                     </div>
                 )}
+                {accessExpanded && renderSpaceAccess(space)}
             </div>
         );
     }
@@ -1418,7 +1961,7 @@ export function MatrixSettings() {
                     <section>
                         <div className="vc-matrix-section-heading">
                             <Heading tag="h3">Invitations</Heading>
-                            <Paragraph>Accept or decline rooms and spaces that invited your Matrix account.</Paragraph>
+                            <Paragraph>Accept or decline invitations to chats and servers.</Paragraph>
                         </div>
                         <div className="vc-matrix-card-list">{invites.map(renderInvite)}</div>
                     </section>
@@ -1427,8 +1970,8 @@ export function MatrixSettings() {
                 <section>
                     <div className="vc-matrix-section-heading vc-matrix-heading-with-actions">
                         <div>
-                            <Heading tag="h3">Spaces</Heading>
-                            <Paragraph>Each space appears like a server in Discord and can contain multiple chats.</Paragraph>
+                            <Heading tag="h3">Servers</Heading>
+                            <Paragraph>Each server can contain multiple chats.</Paragraph>
                         </div>
                         <Button
                             disabled={busy || spaceCreationPending || spaceCreationNeedsRefresh}
@@ -1436,13 +1979,13 @@ export function MatrixSettings() {
                             onClick={openCreateMatrixServer}
                         >
                             {spaceCreationPending
-                                ? "Creating Matrix server..."
-                                : spaceCreationNeedsRefresh ? "Refresh before creating" : "Create Matrix server"}
+                                ? "Creating server..."
+                                : spaceCreationNeedsRefresh ? "Refresh before creating" : "Create server"}
                         </Button>
                     </div>
                     <div className="vc-matrix-card-list">
                         {joinedSpaces.map(renderSpace)}
-                        {!joinedSpaces.length && <Paragraph>No joined spaces.</Paragraph>}
+                        {!joinedSpaces.length && <Paragraph>No joined servers.</Paragraph>}
                     </div>
                 </section>
 
@@ -1481,12 +2024,12 @@ export function MatrixSettings() {
                 <section className="vc-matrix-card vc-matrix-dm-card">
                     <div className="vc-matrix-section-heading">
                         <Heading tag="h3">Start a direct message</Heading>
-                        <Paragraph>Choose a joined member from one of your spaces.</Paragraph>
+                            <Paragraph>Choose a joined member from one of your servers.</Paragraph>
                     </div>
                     <label>
-                        <Heading tag="h5">Space</Heading>
+                        <Heading tag="h5">Server</Heading>
                         <Select
-                            placeholder={joinedSpaces.length ? "Choose a space" : "Join a space first"}
+                            placeholder={joinedSpaces.length ? "Choose a server" : "Join a server first"}
                             options={joinedSpaces.map(space => ({ label: roomName(space), value: space.roomId }))}
                             maxVisibleItems={8}
                             closeOnSelect={true}
@@ -1508,7 +2051,7 @@ export function MatrixSettings() {
                             selected={dmUserId}
                             onSelect={setDmUserId}
                         />
-                        {dmMembersLoading && <Paragraph>Loading space members...</Paragraph>}
+                        {dmMembersLoading && <Paragraph>Loading server members...</Paragraph>}
                         {dmMembersError && <Paragraph>Could not load all members: {dmMembersError}</Paragraph>}
                     </label>
                     <Button
@@ -1538,15 +2081,43 @@ export function MatrixSettings() {
             <div className="vc-matrix-section-stack">
                 <section className="vc-matrix-card vc-matrix-room-address">
                     <div className="vc-matrix-section-heading">
-                        <Heading tag="h3">Join by room address</Heading>
+                        <Heading tag="h3">Request server access</Heading>
+                        <Paragraph>Enter the server's join name. An admin can then approve your request.</Paragraph>
+                    </div>
+                    <label>
+                        <Heading tag="h5">Server join name</Heading>
+                        <TextInput
+                            disabled={busy || joinNameBusy || addressBusy}
+                            value={joinName}
+                            placeholder="my-server"
+                            maxLength={JOIN_NAME_MAX_LENGTH}
+                            onChange={value => {
+                                setJoinName(value.toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH));
+                                setJoinNameError("");
+                            }}
+                        />
+                    </label>
+                    <Button
+                        disabled={busy || joinNameBusy || addressBusy || !joinName.trim()}
+                        variant="positive"
+                        onClick={() => void requestAccess(joinName)}
+                    >
+                        {joinNameBusy ? "Requesting access..." : "Request access"}
+                    </Button>
+                    {joinNameError && <Paragraph style={{ color: "var(--text-danger)" }} role="alert">{joinNameError}</Paragraph>}
+                </section>
+
+                <details className="vc-matrix-card vc-matrix-room-address">
+                    <summary>Advanced: join by full room address</summary>
+                    <div className="vc-matrix-section-heading">
                         <Paragraph>
-                            Enter a full alias or room ID on {accountServer ?? "this account's Matrix server"}.
+                            Enter a full Matrix alias or room ID on {accountServer ?? "this account's Matrix server"}.
                         </Paragraph>
                     </div>
                     <label>
                         <Heading tag="h5">Matrix room alias or ID</Heading>
                         <TextInput
-                            disabled={busy || addressBusy || !!pendingAddressRoomId}
+                            disabled={busy || addressBusy || joinNameBusy || !!pendingAddressRoomId}
                             value={roomAddress}
                             placeholder={`#general:${accountServer ?? "example.org"}`}
                             onChange={value => {
@@ -1556,21 +2127,21 @@ export function MatrixSettings() {
                         />
                     </label>
                     <Button
-                        disabled={busy || addressBusy || !!pendingAddressRoomId || !roomAddress.trim()}
+                        disabled={busy || addressBusy || joinNameBusy || !!pendingAddressRoomId || !roomAddress.trim()}
                         variant="positive"
                         onClick={() => void joinRoomByAddress()}
                     >
-                        {addressBusy || pendingAddressRoomId ? "Waiting for Matrix sync..." : "Join room"}
+                        {addressBusy || pendingAddressRoomId ? "Waiting for sync..." : "Join room"}
                     </Button>
                     {addressError && <Paragraph style={{ color: "var(--text-danger)" }}>{addressError}</Paragraph>}
-                </section>
+                </details>
 
                 <section>
                     <div className="vc-matrix-section-heading vc-matrix-heading-with-actions">
                         <div>
-                            <Heading tag="h3">Published chats & spaces</Heading>
+                            <Heading tag="h3">Discover servers & chats</Heading>
                             <Paragraph>
-                                Listings published by your homeserver. Public rooms that are not published cannot be discovered automatically.
+                                Public listings from your provider. Unlisted servers are not listed here, but links, aliases, or parent servers may still reveal them. Admission is controlled by invitation or request; a join name is not a password.
                             </Paragraph>
                         </div>
                         <Button
@@ -1585,13 +2156,13 @@ export function MatrixSettings() {
                         <div>
                             <Paragraph role="status" aria-live="polite">
                                 {directoryBusy
-                                    ? "Fetching every published directory page from this homeserver..."
+                                    ? "Fetching public listings from your provider..."
                                     : directoryLoaded
-                                        ? `${publicRooms.length} supported listings: ${publicChatCount} chats and ${publicSpaceCount} spaces.`
-                                        : "The published directory has not been loaded yet."}
+                                        ? `${publicRooms.length} supported listings: ${publicChatCount} chats and ${publicSpaceCount} servers.`
+                                        : "Discovery has not been loaded yet."}
                             </Paragraph>
                             {!directoryBusy && directoryTotalEstimate != null && (
-                                <Paragraph>Homeserver estimate: {directoryTotalEstimate} total published entries.</Paragraph>
+                                <Paragraph>Provider estimate: {directoryTotalEstimate} total public listings.</Paragraph>
                             )}
                             {!directoryBusy && directoryTruncated && (
                                 <Paragraph style={{ color: "var(--text-warning)" }}>
@@ -1602,7 +2173,7 @@ export function MatrixSettings() {
                         <TextInput
                             disabled={directoryBusy && !publicRooms.length}
                             value={directorySearch}
-                            placeholder="Search published chats & spaces"
+                            placeholder="Search public servers & chats"
                             onChange={setDirectorySearch}
                         />
                     </div>
@@ -1611,13 +2182,16 @@ export function MatrixSettings() {
                             const knownRoom = knownRoomsById.get(room.roomId);
                             const membership = knownRoom && roomMembership(knownRoom);
                             const isSpace = room.roomType === "m.space";
+                            const listedJoinName = room.joinRule === "knock" && isSpace
+                                ? joinNameFromAlias(room.alias, accountServer)
+                                : undefined;
                             return (
                                 <div className="vc-matrix-room-card" key={room.roomId}>
                                     <div className="vc-matrix-room-identity">
                                         <div className="vc-matrix-room-heading">
                                             <Heading tag="h5">{room.name || room.alias || room.roomId}</Heading>
                                             <span className={`vc-matrix-kind${isSpace ? " vc-matrix-kind-space" : ""}`}>
-                                                {isSpace ? "Space" : "Chat"}
+                                                {isSpace ? "Server" : "Chat"}
                                             </span>
                                             {membership === "join" && <span className="vc-matrix-kind">Joined</span>}
                                             {membership === "invite" && <span className="vc-matrix-kind">Invited</span>}
@@ -1644,23 +2218,33 @@ export function MatrixSettings() {
                                         >
                                             Accept invite
                                         </Button>
+                                    ) : room.joinRule === "knock" ? listedJoinName ? (
+                                        <Button
+                                            disabled={busy || joinNameBusy || addressBusy || directoryBusy}
+                                            variant="positive"
+                                            onClick={() => void requestAccess(listedJoinName, false)}
+                                        >
+                                            {joinNameBusy ? "Requesting..." : "Request access"}
+                                        </Button>
+                                    ) : (
+                                        <span className="vc-matrix-restriction">Ask an admin for an invitation</span>
                                     ) : (
                                         <Button
-                                            disabled={busy || addressBusy || directoryBusy || room.joinRule === "knock"}
+                                            disabled={busy || joinNameBusy || addressBusy || directoryBusy}
                                             variant="positive"
                                             onClick={() => void joinPublicRoom(room)}
                                         >
-                                            {room.joinRule === "knock" ? "Request required" : isSpace ? "Join server" : "Join"}
+                                            {isSpace ? "Join server" : "Join"}
                                         </Button>
                                     )}
                                 </div>
                             );
                         })}
                         {directoryLoaded && !directoryBusy && !publicRooms.length && !directoryError && (
-                            <Paragraph>No supported published chats or spaces were found.</Paragraph>
+                            <Paragraph>No supported public servers or chats were found.</Paragraph>
                         )}
                         {directoryLoaded && !directoryBusy && publicRooms.length > 0 && !visiblePublicRooms.length && (
-                            <Paragraph>No published chats or spaces match that search.</Paragraph>
+                            <Paragraph>No public servers or chats match that search.</Paragraph>
                         )}
                     </div>
                     {directoryError && (
@@ -1699,12 +2283,22 @@ export function MatrixSettings() {
                 selectedItem={visibleTab}
                 onItemSelect={(nextTab: SettingsTab) => {
                     setTab(accountActionRequired ? "account" : nextTab);
+                    if (nextTab !== "discover") {
+                        setJoinName("");
+                        setJoinNameError("");
+                        setRoomAddress("");
+                        setAddressError("");
+                    }
+                    if (nextTab !== "rooms") {
+                        setExpandedAccessSpaces(new Set());
+                        setSpaceAccessDrafts({});
+                    }
                     setError("");
                     setNotice("");
                 }}
             >
-                <TabBar.Item id="rooms">Chats & spaces{invites.length ? ` (${invites.length})` : ""}</TabBar.Item>
-                <TabBar.Item id="discover">Find rooms</TabBar.Item>
+                <TabBar.Item id="rooms">Chats & servers{invites.length ? ` (${invites.length})` : ""}</TabBar.Item>
+                <TabBar.Item id="discover">Discover</TabBar.Item>
                 <TabBar.Item id="account">Account</TabBar.Item>
             </TabBar>
 

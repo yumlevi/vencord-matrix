@@ -10,6 +10,8 @@ import type {
     MatrixAttachmentSendResult,
     MatrixBridgeError,
     MatrixBridgeEvent,
+    MatrixConfigureSpaceAccessRequest,
+    MatrixConfigureSpaceAccessResult,
     MatrixCreateSpaceChildRequest,
     MatrixCreateSpaceChildResult,
     MatrixCreateSpaceRequest,
@@ -26,9 +28,14 @@ import type {
     MatrixReauthenticationRequest,
     MatrixReconcileSpaceChildCreateResult,
     MatrixRegistrationRequest,
+    MatrixRequestSpaceAccessResult,
+    MatrixResolveSpaceAccessRequest,
+    MatrixResolveSpaceAccessRequestResult,
     MatrixRoomActionResult,
     MatrixRoomDTO,
     MatrixSnapshot,
+    MatrixSpaceAccessRequestListDTO,
+    MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
     MatrixStickerSendRequest,
     MatrixStickerSendResult,
@@ -71,6 +78,11 @@ export type MatrixWorkerCommand =
     | { type: "rejectInvite"; roomId: string; }
     | { type: "leaveRoom"; roomId: string; }
     | { type: "createSpace"; request: MatrixCreateSpaceRequest; }
+    | { type: "getSpaceAccess"; spaceId: string; }
+    | { type: "configureSpaceAccess"; request: MatrixConfigureSpaceAccessRequest; }
+    | { type: "requestSpaceAccess"; joinName: string; }
+    | { type: "getSpaceAccessRequests"; spaceId: string; }
+    | { type: "resolveSpaceAccessRequest"; request: MatrixResolveSpaceAccessRequest; }
     | { type: "createSpaceChild"; request: MatrixCreateSpaceChildRequest; creationMarker: string; }
     | { type: "reconcileSpaceChildCreate"; parentSpaceId: string; creationMarker: string; }
     | {
@@ -99,10 +111,13 @@ export type MatrixWorkerCommand =
 export type MatrixWorkerResult =
     | undefined
     | MatrixActionResult
+    | MatrixConfigureSpaceAccessResult
     | MatrixCreateSpaceResult
     | MatrixCreateSpaceChildResult
     | MatrixJoinRoomResult
     | MatrixRoomActionResult
+    | MatrixRequestSpaceAccessResult
+    | MatrixResolveSpaceAccessRequestResult
     | MatrixDirectMessageResult
     | MatrixMediaDownloadResult
     | MatrixHistoryPageDTO
@@ -112,6 +127,8 @@ export type MatrixWorkerResult =
     | MatrixReconcileSpaceChildCreateResult
     | MatrixRoomDTO
     | MatrixSnapshot
+    | MatrixSpaceAccessRequestListDTO
+    | MatrixSpaceAccessSummaryDTO
     | MatrixSpaceHierarchyDTO
     | MatrixStickerSendResult
     | MatrixAttachmentSendResult

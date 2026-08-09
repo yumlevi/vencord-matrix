@@ -31,6 +31,12 @@ import {
 } from "@webpack/common";
 
 import {
+    MatrixAccessRequestsToolbarButton,
+    openMatrixAccessRequests,
+    startMatrixAccessRequestUx,
+    stopMatrixAccessRequestUx,
+} from "./accessRequests";
+import {
     activateMatrixChannel,
     addMatrixReaction,
     applySnapshot,
@@ -38,6 +44,7 @@ import {
     editMatrixMessage,
     fetchMatrixMessages,
     getLatestSnapshot,
+    getMatrixAccessRequestContext,
     getMatrixCategoryCreateContext,
     getMatrixGroupLeaveContext,
     getMatrixSendSessionToken,
@@ -535,6 +542,7 @@ function MembersIcon({ height = 24, width = 24 }: IconProps) {
 }
 
 function renderMatrixToolbar(channel: any) {
+    const guildId = typeof channel.guild_id === "string" ? channel.guild_id : undefined;
     return [
         channel.type !== ChannelType.DM && (
             <Tooltip key="matrix-members" text="Show Member List">
@@ -551,6 +559,7 @@ function renderMatrixToolbar(channel: any) {
                 )}
             </Tooltip>
         ),
+        guildId && <MatrixAccessRequestsToolbarButton key="matrix-access-requests" guildId={guildId} />,
         <Tooltip key="matrix-search" text="Search">
             {tooltipProps => (
                 <button
@@ -644,7 +653,22 @@ function replaceMatrixGuildLeaveAction(
 }
 
 const matrixGuildCreateMenuPatch: NavContextMenuPatchCallback = (children, { guild }) => {
+    const accessContext = guild?.id ? getMatrixAccessRequestContext(guild.id) : undefined;
     const context = guild?.id ? getMatrixSpaceCreateContext(guild.id) : undefined;
+    if (!context && !accessContext) return;
+    if (accessContext?.canApprove || accessContext?.canDeny) {
+        children.push(
+            <Menu.MenuGroup key="vc-matrix-access-requests">
+                <Menu.MenuItem
+                    id="vc-matrix-access-requests"
+                    label={accessContext.countComplete
+                        ? `Access requests (${accessContext.count >= 200 ? "200+" : accessContext.count})`
+                        : "Access requests"}
+                    action={() => openMatrixAccessRequests(guild.id, accessContext)}
+                />
+            </Menu.MenuGroup>
+        );
+    }
     if (!context) return;
     if (!context.canManageSpaceChildren) {
         children.push(
@@ -1173,6 +1197,7 @@ export default definePlugin({
         const lifecycleGeneration = ++pluginLifecycleGeneration;
         installRestGuard();
         installReadStateProjection();
+        startMatrixAccessRequestUx();
         window.addEventListener("keydown", onMatrixSearchShortcut, true);
         if (!SettingsPlugin.customEntries.some(entry => entry.key === MATRIX_SETTINGS_ENTRY_KEY)) {
             SettingsPlugin.customEntries.push({
@@ -1194,6 +1219,7 @@ export default definePlugin({
         window.removeEventListener("keydown", onMatrixSearchShortcut, true);
         removeFromArray(SettingsPlugin.customEntries, entry => entry.key === MATRIX_SETTINGS_ENTRY_KEY);
         pendingPluginShutdown = suspendBridge().catch(() => undefined);
+        stopMatrixAccessRequestUx();
         removeReadStateProjection();
         removeRestGuard();
     },
