@@ -11,8 +11,9 @@ and is not supported by the Vencord project.
 3. Fully quit Discord, extract the ZIP, and double-click `Install-Disorder.cmd`.
 4. Reopen Discord and enable/configure MatrixBridge in Vencord settings.
 
-Future signed releases are checked automatically. A completed update asks you to
-restart Discord; the previous verified version is retained for automatic rollback.
+Future signed releases are checked automatically when Discord starts. A completed
+update asks you to restart Discord; the previous verified version is retained for
+automatic rollback.
 Never pipe an installer from the network directly into PowerShell.
 
 ## Privacy and risk
