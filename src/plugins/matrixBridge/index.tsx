@@ -8,8 +8,8 @@ import "./style.css";
 
 import { findGroupChildrenByChildId, type NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
-import { openPluginModal } from "@components/settings";
 import SettingsPlugin from "@plugins/_core/settings";
+import { Devs } from "@utils/constants";
 import { removeFromArray } from "@utils/misc";
 import definePlugin, { IconProps, OptionType } from "@utils/types";
 import { ChannelType, StickerFormatType } from "@vencord/discord-types/enums";
@@ -579,11 +579,7 @@ function renderMatrixReadOnlyTitle(channel: any) {
 }
 
 function openMatrixSettings() {
-    try {
-        SettingsRouter.openUserSettings(MATRIX_SETTINGS_ENTRY_KEY);
-    } catch {
-        openPluginModal(MatrixBridgePlugin);
-    }
+    SettingsRouter.openUserSettings(MATRIX_SETTINGS_ENTRY_KEY);
 }
 
 function confirmLeaveMatrixGuild(guildId: string, label: string) {
@@ -762,10 +758,10 @@ function onMatrixSearchShortcut(event: KeyboardEvent) {
     else openMatrixSearch(channelId);
 }
 
-const MatrixBridgePlugin = definePlugin({
+export default definePlugin({
     name: "MatrixBridge",
     description: "Brings Matrix rooms, spaces, and direct messages into Discord.",
-    authors: [{ name: "Matrix Bridge", id: 0n }],
+    authors: [Devs.MatrixBridge],
     tags: ["Chat", "Privacy"],
     dependencies: ["MessageEventsAPI", "PinDMs"],
     enabledByDefault: IS_DISCORD_DESKTOP || IS_VESKTOP,
@@ -1221,5 +1217,3 @@ const MatrixBridgePlugin = definePlugin({
     matrixTyping,
     matrixReceipt,
 });
-
-export default MatrixBridgePlugin;
