@@ -20,6 +20,7 @@ import {
     FluxDispatcher,
     Menu,
     openModal,
+    React,
     SelectedChannelStore,
     SettingsRouter,
     showToast,
@@ -47,6 +48,7 @@ import {
     getMatrixAccessRequestContext,
     getMatrixCategoryCreateContext,
     getMatrixGroupLeaveContext,
+    getMatrixInviteContext,
     getMatrixSendSessionToken,
     getMatrixSpaceCreateContext,
     hasMatrixRecipients,
@@ -70,10 +72,11 @@ import {
     startBridge,
     suspendBridge,
 } from "./bridge";
+import { openMatrixInvitePeople } from "./invite";
 import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
 import { openMatrixSpaceChildModal } from "./spaceCreate";
-import type { MatrixAttachmentGroupDTO } from "./types";
+import type { MatrixAttachmentGroupDTO, MatrixPowerLevelPermissionDTO } from "./types";
 
 const settings = definePluginSettings({
     matrix: {
@@ -621,6 +624,107 @@ function confirmLeaveMatrixGroup(channelId: string, label: string) {
     ));
 }
 
+type MatrixMenuChildren = Parameters<NavContextMenuPatchCallback>[0];
+
+function removeMatrixMenuItems(children: MatrixMenuChildren, ids: readonly string[]) {
+    let group: ReturnType<typeof findGroupChildrenByChildId>;
+    while ((group = findGroupChildrenByChildId([...ids], children))) {
+        const index = group.findIndex(child => ids.includes(child?.props?.id));
+        if (index === -1) break;
+        group.splice(index, 1);
+    }
+}
+
+function filterMatrixMenuTree(value: any, predicate: (id: unknown) => boolean): any {
+    if (Array.isArray(value)) {
+        return value.map(child => filterMatrixMenuTree(child, predicate)).filter(child => child != null);
+    }
+    if (!React.isValidElement(value)) return value;
+    const element = value as any;
+    if (predicate(element.props?.id)) return null;
+    const nested = element.props?.children;
+    if (!nested || typeof nested === "function") return element;
+    return React.cloneElement(element, { children: filterMatrixMenuTree(nested, predicate) });
+}
+
+function removeMatrixMenuItemsWhere(
+    children: Array<any>,
+    predicate: (id: unknown) => boolean
+) {
+    for (let index = children.length - 1; index >= 0; index--) {
+        const child = children[index];
+        if (Array.isArray(child)) {
+            removeMatrixMenuItemsWhere(child, predicate);
+            continue;
+        }
+        if (!child?.props) continue;
+        if (predicate(child.props.id)) {
+            children.splice(index, 1);
+            continue;
+        }
+        let nested = child.props.children;
+        if (typeof nested === "function") {
+            if (typeof child.props.id === "string" && child.props.id.includes("invite-to-server")) {
+                const renderChildren = nested;
+                child.props.children = (...args: any[]) => {
+                    const rendered = renderChildren(...args);
+                    return filterMatrixMenuTree(rendered, predicate);
+                };
+            }
+            continue;
+        }
+        if (!nested) continue;
+        if (!Array.isArray(nested)) child.props.children = nested = [nested];
+        removeMatrixMenuItemsWhere(nested, predicate);
+    }
+}
+
+function replaceMatrixMenuAction({
+    children,
+    stockIds,
+    matrixId,
+    label,
+    action,
+    disabled,
+}: {
+    children: MatrixMenuChildren;
+    stockIds: readonly string[];
+    matrixId: string;
+    label: string;
+    action?: () => void;
+    disabled: boolean;
+}) {
+    const ids = [...stockIds, matrixId];
+    const anchorGroup = findGroupChildrenByChildId(ids, children);
+    const anchorIndex = anchorGroup?.findIndex(child => ids.includes(child?.props?.id)) ?? -1;
+    const anchor = anchorIndex === -1 ? undefined : anchorGroup?.[anchorIndex];
+    removeMatrixMenuItems(children, ids);
+
+    // Preserve only the visual icon. Copying a stock React element could retain
+    // an undocumented route or callback prop and leak the synthetic ID to REST.
+    const replacement = (
+        <Menu.MenuItem
+            key={matrixId}
+            id={matrixId}
+            label={label}
+            action={disabled ? undefined : action}
+            disabled={disabled}
+            icon={anchor?.props?.icon}
+        />
+    );
+    if (anchorGroup) anchorGroup.splice(Math.min(anchorIndex, anchorGroup.length), 0, replacement);
+    else children.push(<Menu.MenuGroup key={`${matrixId}-group`}>{replacement}</Menu.MenuGroup>);
+}
+
+function matrixPermissionMenuLabel(base: string, permission: MatrixPowerLevelPermissionDTO | undefined) {
+    if (permission?.allowed) return base;
+    if (!permission || permission.current === "unverifiable" || permission.required === "unverifiable") {
+        return `${base} (server permission could not be verified)`;
+    }
+    const current = permission.current === "infinite" ? "\u221e" : permission.current;
+    return `${base} (permission level ${current}; requires ${permission.required})`;
+}
+
 function replaceMatrixGuildLeaveAction(
     children: Parameters<NavContextMenuPatchCallback>[0],
     guildId: string,
@@ -635,13 +739,16 @@ function replaceMatrixGuildLeaveAction(
             action={() => confirmLeaveMatrixGuild(guildId, label)}
         />
     );
-    const destructiveGroup = findGroupChildrenByChildId(["leave-guild", "delete-guild"], children);
+    const destructiveGroup = findGroupChildrenByChildId(
+        ["leave-guild", "delete-guild", "vc-matrix-leave-server"],
+        children
+    );
     if (!destructiveGroup) {
         children.push(<Menu.MenuGroup key="vc-matrix-leave-server-group">{replacement}</Menu.MenuGroup>);
         return;
     }
 
-    const destructiveIds = new Set(["leave-guild", "delete-guild"]);
+    const destructiveIds = new Set(["leave-guild", "delete-guild", "vc-matrix-leave-server"]);
     const firstIndex = destructiveGroup.findIndex(child => destructiveIds.has(child?.props?.id));
     if (firstIndex === -1) return;
     destructiveGroup.splice(firstIndex, 1, replacement);
@@ -653,9 +760,11 @@ function replaceMatrixGuildLeaveAction(
 }
 
 const matrixGuildCreateMenuPatch: NavContextMenuPatchCallback = (children, { guild }) => {
+    if (!guild?.id || !isMatrixGuildId(guild.id)) return;
     const accessContext = guild?.id ? getMatrixAccessRequestContext(guild.id) : undefined;
+    const inviteContext = guild?.id ? getMatrixInviteContext(guild.id) : undefined;
     const context = guild?.id ? getMatrixSpaceCreateContext(guild.id) : undefined;
-    if (!context && !accessContext) return;
+    removeMatrixMenuItems(children, ["vc-matrix-access-requests"]);
     if (accessContext?.canApprove || accessContext?.canDeny) {
         children.push(
             <Menu.MenuGroup key="vc-matrix-access-requests">
@@ -669,76 +778,63 @@ const matrixGuildCreateMenuPatch: NavContextMenuPatchCallback = (children, { gui
             </Menu.MenuGroup>
         );
     }
-    if (!context) return;
-    if (!context.canManageSpaceChildren) {
-        children.push(
-            <Menu.MenuGroup key="vc-matrix-create-guild-items">
-                <Menu.MenuItem
-                    id="vc-matrix-create-no-permission"
-                    label="Matrix creation requires Space permission"
-                    disabled
-                />
-            </Menu.MenuGroup>
-        );
-        replaceMatrixGuildLeaveAction(children, guild.id, context.parentLabel);
-        return;
-    }
-    children.push(
-        <Menu.MenuGroup key="vc-matrix-create-guild-items">
-            <Menu.MenuItem
-                id="vc-matrix-create-channel"
-                label="Create Matrix channel"
-                action={() => openMatrixSpaceChildModal(
-                    context.parentSpaceId,
-                    context.parentLabel,
-                    "room",
-                    true
-                )}
-            />
-            <Menu.MenuItem
-                id="vc-matrix-create-category"
-                label="Create Matrix category"
-                action={() => openMatrixSpaceChildModal(
-                    context.parentSpaceId,
-                    context.parentLabel,
-                    "space",
-                    true
-                )}
-            />
-        </Menu.MenuGroup>
-    );
-    replaceMatrixGuildLeaveAction(children, guild.id, context.parentLabel);
+    replaceMatrixMenuAction({
+        children,
+        stockIds: ["invite-people"],
+        matrixId: "vc-matrix-invite-people",
+        label: matrixPermissionMenuLabel("Invite People", inviteContext?.permission),
+        action: inviteContext ? () => openMatrixInvitePeople(guild.id, inviteContext) : undefined,
+        disabled: !inviteContext?.canInvite,
+    });
+    replaceMatrixMenuAction({
+        children,
+        stockIds: ["create-channel"],
+        matrixId: "vc-matrix-create-channel",
+        label: matrixPermissionMenuLabel("Create Channel", context?.permission),
+        action: context ? () => openMatrixSpaceChildModal(context, "room", true) : undefined,
+        disabled: !context?.canManageSpaceChildren,
+    });
+    replaceMatrixMenuAction({
+        children,
+        stockIds: ["create-category"],
+        matrixId: "vc-matrix-create-category",
+        label: matrixPermissionMenuLabel("Create Category", context?.permission),
+        action: context ? () => openMatrixSpaceChildModal(context, "space", true) : undefined,
+        disabled: !context?.canManageSpaceChildren,
+    });
+    replaceMatrixGuildLeaveAction(children, guild.id, context?.parentLabel ?? guild.name ?? "Matrix server");
 };
 
 const matrixCategoryCreateMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
-    const context = channel?.id ? getMatrixCategoryCreateContext(channel.id) : undefined;
+    if (!channel?.id || !isMatrixChannelId(channel.id)) return;
+    const inviteContext = channel.guild_id ? getMatrixInviteContext(channel.guild_id) : undefined;
+    replaceMatrixMenuAction({
+        children,
+        stockIds: ["invite-people"],
+        matrixId: "vc-matrix-invite-people",
+        label: matrixPermissionMenuLabel("Invite People", inviteContext?.permission),
+        action: inviteContext ? () => openMatrixInvitePeople(channel.guild_id, inviteContext) : undefined,
+        disabled: !inviteContext?.canInvite,
+    });
+
+    const context = getMatrixCategoryCreateContext(channel.id);
     if (!context) return;
-    if (!context.canManageSpaceChildren) {
-        children.push(
-            <Menu.MenuGroup key="vc-matrix-create-category-items">
-                <Menu.MenuItem
-                    id="vc-matrix-create-category-no-permission"
-                    label="Matrix creation requires Space permission"
-                    disabled
-                />
-            </Menu.MenuGroup>
-        );
-        return;
-    }
-    children.push(
-        <Menu.MenuGroup key="vc-matrix-create-category-items">
-            <Menu.MenuItem
-                id="vc-matrix-create-category-channel"
-                label="Create Matrix channel"
-                action={() => openMatrixSpaceChildModal(
-                    context.parentSpaceId,
-                    context.parentLabel,
-                    "room",
-                    true
-                )}
-            />
-        </Menu.MenuGroup>
-    );
+    removeMatrixMenuItems(children, ["create-voice-channel"]);
+    replaceMatrixMenuAction({
+        children,
+        stockIds: ["create-text-channel", "create-channel"],
+        matrixId: "vc-matrix-create-category-channel",
+        label: matrixPermissionMenuLabel("Create Channel", context.permission),
+        action: () => openMatrixSpaceChildModal(context, "room", true),
+        disabled: !context.canManageSpaceChildren,
+    });
+};
+
+const matrixUserInviteToServerMenuPatch: NavContextMenuPatchCallback = children => {
+    const prefix = "invite-to-server--";
+    removeMatrixMenuItemsWhere(children, id => typeof id === "string"
+        && id.startsWith(prefix)
+        && isMatrixGuildId(id.slice(prefix.length)));
 };
 
 const matrixGroupLeaveMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
@@ -797,6 +893,7 @@ export default definePlugin({
         "guild-header-popout": matrixGuildCreateMenuPatch,
         "channel-context": matrixCategoryCreateMenuPatch,
         "gdm-context": matrixGroupLeaveMenuPatch,
+        "user-context": matrixUserInviteToServerMenuPatch,
     },
 
     patches: [

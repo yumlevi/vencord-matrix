@@ -453,6 +453,109 @@
     text-align: center;
 }
 
+.vc-matrix-invite-people {
+    display: grid;
+    gap: 10px;
+}
+
+.vc-matrix-invite-search {
+    align-items: stretch;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.vc-matrix-invite-scope,
+.vc-matrix-invite-notice {
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.vc-matrix-invite-notice {
+    background: var(--background-secondary);
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.vc-matrix-invite-list {
+    display: grid;
+    gap: 4px;
+    max-height: min(55vh, 560px);
+    overflow-y: auto;
+}
+
+.vc-matrix-invite-candidate {
+    align-items: center;
+    background: var(--background-secondary);
+    border-radius: 8px;
+    display: grid;
+    gap: 12px;
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    padding: 10px 12px;
+}
+
+.vc-matrix-invite-avatar {
+    align-items: center;
+    background: var(--brand-500);
+    border-radius: 50%;
+    color: var(--white-500);
+    display: flex;
+    font-size: 16px;
+    font-weight: 700;
+    height: 40px;
+    justify-content: center;
+    overflow: hidden;
+    text-transform: uppercase;
+    width: 40px;
+}
+
+.vc-matrix-invite-identity {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.vc-matrix-invite-identity > strong,
+.vc-matrix-invite-identity > code,
+.vc-matrix-invite-identity > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.vc-matrix-invite-identity > strong,
+.vc-matrix-invite-identity > code {
+    white-space: nowrap;
+}
+
+.vc-matrix-invite-identity > strong {
+    unicode-bidi: plaintext;
+}
+
+.vc-matrix-invite-identity > code {
+    color: var(--text-muted);
+    direction: ltr;
+    font-family: var(--font-code);
+    font-size: 12px;
+    unicode-bidi: isolate;
+}
+
+.vc-matrix-invite-identity > span {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.vc-matrix-invite-row-error {
+    color: var(--text-danger) !important;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.vc-matrix-invite-empty {
+    color: var(--text-muted);
+    padding: 24px 12px;
+    text-align: center;
+}
+
 @media (width <= 720px) {
     .vc-matrix-settings-header,
     .vc-matrix-heading-with-actions,
@@ -482,6 +585,11 @@
         grid-template-columns: 40px minmax(0, 1fr);
     }
 
+    .vc-matrix-invite-candidate {
+        align-items: start;
+        grid-template-columns: 40px minmax(0, 1fr);
+    }
+
     .vc-matrix-access-request-actions {
         grid-column: 1 / -1;
         justify-content: stretch;
@@ -489,5 +597,14 @@
 
     .vc-matrix-access-request-actions > button {
         flex: 1;
+    }
+
+    .vc-matrix-invite-candidate > button {
+        grid-column: 1 / -1;
+        width: 100%;
+    }
+
+    .vc-matrix-invite-search {
+        grid-template-columns: 1fr;
     }
 }

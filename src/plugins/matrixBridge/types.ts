@@ -156,6 +156,15 @@ export type MatrixKnownRoomMembership = MatrixRoomMembership | "leave";
 export type MatrixRoomKind = "space" | "room" | "dm";
 export type MatrixRoomJoinRule = "public" | "invite" | "knock" | "restricted" | "knock_restricted" | "private";
 
+/** A fail-closed, room-version-aware Matrix power-level comparison. */
+export interface MatrixPowerLevelPermissionDTO {
+    /** The current account's effective level, including Hydra creator authority. */
+    current: number | "infinite" | "unverifiable";
+    /** The event threshold, or unverifiable when present Matrix state is malformed. */
+    required: number | "unverifiable";
+    allowed: boolean;
+}
+
 export interface MatrixSpaceChildDTO {
     roomId: string;
     order?: string;
@@ -173,6 +182,10 @@ export interface MatrixRoomDTO {
     roomType?: string;
     /** Whether the current account may add m.space.child state in this Space. */
     canManageSpaceChildren?: boolean;
+    /** Exact power-level comparison underlying canManageSpaceChildren. */
+    spaceChildPermission?: MatrixPowerLevelPermissionDTO;
+    /** Exact power-level comparison for inviting a member to this Space. */
+    invitePermission?: MatrixPowerLevelPermissionDTO;
     /** Whether the current account may change every state event used by Space access settings. */
     canConfigureSpaceAccess?: boolean;
     /** Bounded number of pending membership knocks for a joined Space. */
@@ -236,6 +249,10 @@ export interface MatrixJoinRoomResult {
 
 export interface MatrixRoomActionResult {
     roomId: string;
+    warning?: {
+        code: "MATRIX_DM_CLASSIFICATION_FAILED";
+        message: string;
+    };
 }
 
 export type MatrixSpaceVisibility = "private" | "public";
@@ -328,6 +345,51 @@ export interface MatrixResolveSpaceAccessRequestResult extends MatrixResolveSpac
     accessRequestCount: number;
 }
 
+export type MatrixSpaceInviteCandidateMembership = "none" | "leave" | "knock" | "invite" | "join";
+
+/** A bounded query against the standard Matrix user-directory search endpoint. */
+export interface MatrixSpaceInviteCandidateSearchRequest {
+    spaceId: string;
+    /** Empty is a best-effort initial directory query; servers need not support it. */
+    query: string;
+    /** Defaults to 25 and is capped at 100. */
+    limit?: number;
+}
+
+export interface MatrixSpaceInviteCandidateDTO {
+    userId: string;
+    displayName?: string;
+    avatarUrl?: string;
+    membership: MatrixSpaceInviteCandidateMembership;
+}
+
+export interface MatrixSpaceInviteCandidateSearchResult {
+    spaceId: string;
+    query: string;
+    /** Results are a local-server filter over the homeserver's standard user directory. */
+    scope: "homeserver_user_directory";
+    candidates: MatrixSpaceInviteCandidateDTO[];
+    /** True when either the homeserver or the local response bound truncated results. */
+    limited: boolean;
+    /** The homeserver's own `limited` value. There is no cursor in this API. */
+    directoryLimited: boolean;
+    /** Always false: Matrix user-directory search never proves account completeness. */
+    complete: false;
+    /** Empty search was rejected; issue a non-empty query before searching again. */
+    queryRequired: boolean;
+}
+
+export interface MatrixInviteUserToSpaceRequest {
+    spaceId: string;
+    userId: string;
+}
+
+export interface MatrixInviteUserToSpaceResult extends MatrixInviteUserToSpaceRequest {
+    membership: "invite" | "join";
+    /** False only when the target was already invited or joined at authoritative preflight. */
+    changed: boolean;
+}
+
 /** User-controlled metadata for creating a Matrix Space. */
 export interface MatrixCreateSpaceRequest {
     name: string;
@@ -340,6 +402,7 @@ export interface MatrixCreateSpaceRequest {
 
 export type MatrixCreateSpacePartialCode =
     | "MATRIX_GENERAL_ROOM_CREATE_FAILED"
+    | "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS"
     | "MATRIX_GENERAL_ROOM_LINK_FAILED";
 
 export interface MatrixCreateSpacePartialResult {
@@ -399,6 +462,52 @@ export interface MatrixSpaceHierarchyRoomDTO {
 export interface MatrixSpaceHierarchyDTO {
     spaceId: string;
     rooms: MatrixSpaceHierarchyRoomDTO[];
+}
+
+export interface MatrixSuggestedSpaceChannelDTO {
+    roomId: string;
+    parentSpaceId: string;
+    name: string;
+    kind: "space" | "room";
+    depth: 1 | 2;
+    membership: "join" | "leave";
+    joinRule: MatrixRoomJoinRule;
+    avatarUrl?: string;
+    topic?: string;
+}
+
+/**
+ * A deliberately incomplete, fixed-depth onboarding plan. It contains only
+ * direct suggested rooms or suggested rooms one suggested category below the
+ * joined root Space, routed through the active account's Matrix server.
+ */
+export interface MatrixSuggestedSpaceChannelPlanDTO {
+    spaceId: string;
+    planId: string;
+    scope: "suggested_depth_2_via_account_server";
+    channels: MatrixSuggestedSpaceChannelDTO[];
+    limited: boolean;
+    complete: false;
+}
+
+export interface MatrixJoinSuggestedSpaceChannelsRequest {
+    spaceId: string;
+    planId: string;
+}
+
+export interface MatrixSuggestedSpaceChannelJoinOutcomeDTO {
+    roomId: string;
+    parentSpaceId: string;
+    kind: "space" | "room";
+    status: "joined" | "already_joined" | "rejected" | "blocked_by_parent";
+}
+
+export interface MatrixJoinSuggestedSpaceChannelsResult {
+    spaceId: string;
+    planId: string;
+    outcomes: MatrixSuggestedSpaceChannelJoinOutcomeDTO[];
+    limited: boolean;
+    complete: false;
 }
 
 export type MatrixDiscordStickerFormatType = 1 | 2 | 3 | 4;

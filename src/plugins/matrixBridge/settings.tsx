@@ -31,12 +31,22 @@ import {
     openMatrixRoom,
     openMatrixSpace,
     refreshSnapshot,
+    registerMatrixManagementModal,
     restartBridge,
+    subscribeMatrixSpaceProjection,
+    unregisterMatrixManagementModal,
 } from "./bridge";
 import { matrixErrorCode } from "./errorCode";
+import {
+    suggestedChannelConsentRows,
+    suggestedChannelJoinSummary,
+    suggestedChannelPlanDisclosure,
+    waitForSuggestedChannelPlan,
+} from "./suggestedChannels";
 import type {
     MatrixConfigureSpaceAccessResult,
     MatrixCreateSpaceResult,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMemberDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixPublicRoomDTO,
@@ -47,6 +57,7 @@ import type {
     MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
+    MatrixSuggestedSpaceChannelPlanDTO,
 } from "./types";
 
 type AuthMode = "login" | "register";
@@ -58,6 +69,7 @@ type MatrixSpaceAccessDraft = Pick<MatrixSpaceAccessSummaryDTO, "mode"> & { join
 
 const JOIN_NAME_MAX_LENGTH = 64;
 const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const MATRIX_ROOM_ADDRESS_PATTERN = /^(?:#[^\s:]+:[^\s]+|![^\s:]+(?::[^\s]+)?)$/u;
 const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 
 const MATRIX_SESSION_RESET_CODES = new Set([
@@ -269,6 +281,183 @@ function RoomIdentity({ room }: { room: MatrixRoomLike; }) {
     );
 }
 
+type SuggestedChannelReplanReason = "ambiguous" | "stale";
+
+function useMatrixProjectionRevision() {
+    const [, setRevision] = useState(0);
+    useEffect(() => subscribeMatrixSpaceProjection(() => setRevision(value => value + 1)), []);
+}
+
+function SuggestedChannelsModal({
+    modalProps,
+    initialPlan,
+    expectedUserId,
+    onJoined,
+}: {
+    modalProps: RenderModalProps;
+    initialPlan: MatrixSuggestedSpaceChannelPlanDTO;
+    expectedUserId: string;
+    onJoined: (result: MatrixJoinSuggestedSpaceChannelsResult) => Promise<void>;
+}) {
+    useMatrixProjectionRevision();
+    const [plan, setPlan] = useState(initialPlan);
+    const [busy, setBusy] = useState(false);
+    const [replanReason, setReplanReason] = useState<SuggestedChannelReplanReason>();
+    const [message, setMessage] = useState("");
+    const [error, setError] = useState("");
+    const mounted = useRef(true);
+    const current = isCurrentAccount(expectedUserId);
+    const rows = suggestedChannelConsentRows(plan);
+    const actionableCount = rows.filter(row => row.actionable).length;
+
+    useEffect(() => () => {
+        mounted.current = false;
+    }, []);
+
+    async function refreshDisplayedPlan(reason: SuggestedChannelReplanReason, previousPlanId: string) {
+        if (reason === "ambiguous") {
+            try {
+                await refreshSnapshot();
+            } catch {
+                // The exact-account plan read below is still required before
+                // another confirmation can become available.
+            }
+        }
+        if (!isCurrentAccount(expectedUserId)) return;
+        try {
+            const nextPlan = await Native.suggestedSpaceChannelPlan(plan.spaceId, expectedUserId);
+            if (!mounted.current || !isCurrentAccount(expectedUserId)) return;
+            if (reason === "ambiguous" && nextPlan.planId === previousPlanId) {
+                setReplanReason("ambiguous");
+                setError("The previous join is still unconfirmed. Refresh suggestions later before trying again.");
+                return;
+            }
+            setPlan(nextPlan);
+            setReplanReason(undefined);
+            setError("");
+            setMessage(reason === "ambiguous"
+                ? "The previous join could not be confirmed. Review this refreshed list before confirming again."
+                : "Suggestions changed. Review this refreshed list before confirming again.");
+        } catch {
+            if (!mounted.current || !isCurrentAccount(expectedUserId)) return;
+            setReplanReason(reason);
+            setError(reason === "ambiguous"
+                ? "The previous join is unconfirmed and suggestions could not be refreshed. Try refreshing suggestions later."
+                : "Suggestions changed but could not be refreshed. Try refreshing suggestions again.");
+        }
+    }
+
+    async function performPrimaryAction() {
+        if (busy || !current) return;
+        const displayedPlan = plan;
+        setBusy(true);
+        setError("");
+        try {
+            if (replanReason) {
+                await refreshDisplayedPlan(replanReason, displayedPlan.planId);
+                return;
+            }
+            if (!actionableCount) return;
+            const result = await Native.joinSuggestedSpaceChannels({
+                spaceId: displayedPlan.spaceId,
+                planId: displayedPlan.planId,
+            }, expectedUserId);
+            if (!mounted.current || !isCurrentAccount(expectedUserId)) return;
+            modalProps.onClose();
+            await onJoined(result);
+        } catch (caught) {
+            if (!mounted.current || !isCurrentAccount(expectedUserId)) return;
+            const code = matrixErrorCode(caught);
+            if (code === "MATRIX_SUGGESTED_SPACE_CHANNEL_PLAN_STALE") {
+                await refreshDisplayedPlan("stale", displayedPlan.planId);
+            } else if (code === "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS") {
+                await refreshDisplayedPlan("ambiguous", displayedPlan.planId);
+            } else {
+                setError("The account provider could not join these suggested channels. No unconfirmed retry was started.");
+            }
+        } finally {
+            if (mounted.current) setBusy(false);
+        }
+    }
+
+    const primaryLabel = busy
+        ? replanReason ? "Refreshing..." : "Joining..."
+        : replanReason ? "Refresh suggestions"
+            : actionableCount ? "Join suggested channels" : "Nothing to join";
+    return (
+        <Modal
+            {...modalProps}
+            onClose={busy ? () => undefined : modalProps.onClose}
+            title="Join Suggested Channels?"
+            subtitle="Review the exact provider suggestion list before joining."
+            actions={[
+                {
+                    text: "Cancel",
+                    variant: "secondary",
+                    disabled: busy,
+                    onClick: modalProps.onClose,
+                },
+                {
+                    text: primaryLabel,
+                    variant: "primary",
+                    disabled: busy || !current || (!actionableCount && !replanReason),
+                    onClick: () => void performPrimaryAction(),
+                },
+            ]}
+        >
+            <div className="vc-matrix-section-stack">
+                <Paragraph>{suggestedChannelPlanDisclosure(plan)}</Paragraph>
+                {!current && (
+                    <div className="vc-matrix-error" role="alert">
+                        The signed-in account changed. Close this window and try again.
+                    </div>
+                )}
+                {message && <div className="vc-matrix-invite-notice" role="status">{message}</div>}
+                {error && <div className="vc-matrix-error" role="alert">{error}</div>}
+                <div className="vc-matrix-card-list" role="list" aria-label="Suggested channels">
+                    {rows.map(row => (
+                        <div className="vc-matrix-room-card" role="listitem" key={row.key}>
+                            <div className="vc-matrix-room-identity">
+                                <div className="vc-matrix-room-heading">
+                                    <Heading tag="h5">{row.name}</Heading>
+                                    <span className={`vc-matrix-kind vc-matrix-kind-${row.kindLabel === "Category" ? "space" : "room"}`}>
+                                        {row.kindLabel}
+                                    </span>
+                                </div>
+                                {row.parentLabel && <Paragraph>Under Category: {row.parentLabel}</Paragraph>}
+                                {row.topic && <Paragraph>{row.topic}</Paragraph>}
+                                <Paragraph>{row.status}</Paragraph>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </Modal>
+    );
+}
+
+function openSuggestedChannelsModal(
+    plan: MatrixSuggestedSpaceChannelPlanDTO,
+    expectedUserId: string,
+    onJoined: (result: MatrixJoinSuggestedSpaceChannelsResult) => Promise<void>
+) {
+    if (!isCurrentAccount(expectedUserId) || !plan.channels.some(channel => channel.membership === "leave")) return false;
+    let modalKey = "";
+    modalKey = openModal(
+        modalProps => (
+            <SuggestedChannelsModal
+                modalProps={modalProps}
+                initialPlan={plan}
+                expectedUserId={expectedUserId}
+                onJoined={onJoined}
+            />
+        ),
+        { onCloseCallback: () => unregisterMatrixManagementModal(modalKey) }
+    );
+    registerMatrixManagementModal(modalKey);
+    return true;
+}
+
 function MemberSelect({
     disabled,
     members,
@@ -301,13 +490,17 @@ function MemberSelect({
 
 function CreateMatrixServerModal({
     modalProps,
+    expectedUserId,
     onCreationAmbiguous,
+    onCreationContextChanged,
     onCreationFailed,
     onCreationStarted,
     onCreated,
 }: {
     modalProps: RenderModalProps;
+    expectedUserId: string;
     onCreationAmbiguous(name: string): Promise<boolean>;
+    onCreationContextChanged(name: string): void;
     onCreationFailed(): void;
     onCreationStarted(): void;
     onCreated(result: MatrixCreateSpaceResult, name: string): Promise<boolean>;
@@ -324,6 +517,10 @@ function CreateMatrixServerModal({
 
     async function createServer() {
         if (!cleanName || busy || createStarted.current) return;
+        if (!isCurrentAccount(expectedUserId)) {
+            setCreateError("The signed-in account changed. Close this window and try again.");
+            return;
+        }
         if (matrixSpaceCreationInFlight || matrixSpaceCreationNeedsRefresh) {
             setCreateError(matrixSpaceCreationNeedsRefresh
                 ? "Refresh your server list before trying another creation."
@@ -342,8 +539,22 @@ function CreateMatrixServerModal({
                 topic: topic.trim() || undefined,
                 visibility,
                 createGeneral,
-            });
+            }, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) {
+                matrixSpaceCreationInFlight = false;
+                matrixSpaceCreationNeedsRefresh = true;
+                onCreationContextChanged(cleanName);
+                modalProps.onClose();
+                return;
+            }
         } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) {
+                matrixSpaceCreationInFlight = false;
+                matrixSpaceCreationNeedsRefresh = true;
+                onCreationContextChanged(cleanName);
+                modalProps.onClose();
+                return;
+            }
             if (matrixErrorCode(caught) === "MATRIX_CREATE_SPACE_AMBIGUOUS") {
                 setPhase("checking");
                 let resolved = false;
@@ -533,6 +744,7 @@ export function MatrixSettings() {
     const [roomSearch, setRoomSearch] = useState("");
     const [expandedSpaces, setExpandedSpaces] = useState<Set<string>>(() => new Set());
     const [spaceLoading, setSpaceLoading] = useState<string>();
+    const [suggestedChannelsLoading, setSuggestedChannelsLoading] = useState<string>();
     const [spaceCreationPending, setSpaceCreationPending] = useState(matrixSpaceCreationInFlight);
     const [spaceCreationNeedsRefresh, setSpaceCreationNeedsRefresh] = useState(matrixSpaceCreationNeedsRefresh);
     const [spaceHierarchies, setSpaceHierarchies] = useState<Record<string, MatrixSpaceHierarchyDTO>>({});
@@ -908,13 +1120,20 @@ export function MatrixSettings() {
     }
 
     async function joinPublicRoom(room: MatrixPublicRoomDTO) {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) return;
+        let joined = false;
+        let opened = false;
         await run(async () => {
-            await Native.joinRoom(room.roomId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            await Native.joinRoom(room.roomId, expectedUserId);
+            joined = true;
+            if (!isCurrentAccount(expectedUserId)) return;
             const deadline = Date.now() + 20_000;
-            let opened = false;
             do {
                 try {
                     const snapshot = await beforeDeadline(refreshSnapshot(), deadline);
+                    if (snapshot.account?.userId !== expectedUserId || !isCurrentAccount(expectedUserId)) return;
                     const nextRooms = (snapshot.rooms ?? []) as MatrixRoomDTO[];
                     setRooms(nextRooms);
                     const joinedRoom = nextRooms.find(candidate => candidate.roomId === room.roomId
@@ -932,27 +1151,34 @@ export function MatrixSettings() {
                 const remaining = deadline - Date.now();
                 if (remaining <= 0) break;
                 await new Promise(resolve => setTimeout(resolve, Math.min(1_000, remaining)));
+                if (!isCurrentAccount(expectedUserId)) return;
             } while (Date.now() < deadline);
-
-            if (opened) {
-                setTab("rooms");
-                setNotice(room.roomType === "m.space"
-                    ? "Server joined and opened."
-                    : "Room joined and opened in Discord.");
-            } else {
-                setWarning(`${room.name} was joined, but it is still syncing. Use Refresh in a moment.`);
-            }
         });
+        if (!joined || !isCurrentAccount(expectedUserId)) return;
+        setError("");
+        if (opened) {
+            setTab("rooms");
+            setNotice(room.roomType === "m.space"
+                ? "Server joined and opened."
+                : "Room joined and opened in Discord.");
+        } else {
+            setWarning(`${room.name} was joined, but it is still syncing. Use Refresh in a moment.`);
+        }
     }
 
     async function joinRoomByAddress() {
         const address = roomAddress.trim();
+        const expectedUserId = config?.userId;
         if (!address) {
             setAddressError("Enter a full Matrix room alias or room ID.");
             return;
         }
-        if (!/^[#!][^\s:]+:[^\s]+$/u.test(address)) {
-            setAddressError("Use a full address such as #general:example.org or !room-id:example.org.");
+        if (address.length > 512 || !MATRIX_ROOM_ADDRESS_PATTERN.test(address)) {
+            setAddressError("Use #alias:server, !legacy-id:server, or a domainless room ID such as !opaque.");
+            return;
+        }
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) {
+            setAddressError("Reconnect your account before joining this address.");
             return;
         }
 
@@ -960,18 +1186,22 @@ export function MatrixSettings() {
         setAddressError("");
         setNotice("");
         try {
-            const result = await Native.joinRoomAddress(address);
+            const result = await Native.joinRoomAddress(address, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) {
+                setAddressBusy(false);
+                return;
+            }
             setRoomAddress("");
             setPendingAddressRoomId(result.roomId);
             setNotice("Room joined. Waiting for Matrix to sync it...");
             try {
-                await loadRooms(false);
+                await loadRooms(false, expectedUserId);
             } catch {
                 // The bridge poll will pick up a successful join after /sync.
             }
         } catch (caught) {
             setAddressBusy(false);
-            setAddressError(errorMessage(caught));
+            if (isCurrentAccount(expectedUserId)) setAddressError(errorMessage(caught));
         }
     }
 
@@ -1249,37 +1479,177 @@ export function MatrixSettings() {
         }
     }
 
-    async function refreshSpaceHierarchy(spaceId: string) {
+    async function refreshSpaceHierarchy(spaceId: string, expectedUserId = config?.userId) {
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) return false;
         try {
             const hierarchy = await Native.spaceChildren(spaceId, 200, 8);
+            if (!isCurrentAccount(expectedUserId)) return false;
             setSpaceHierarchies(current => ({ ...current, [spaceId]: hierarchy }));
             setSpaceErrors(current => ({ ...current, [spaceId]: "" }));
+            return true;
         } catch (caught) {
+            if (!isCurrentAccount(expectedUserId)) return false;
             setSpaceErrors(current => ({ ...current, [spaceId]: errorMessage(caught) }));
+            return false;
+        }
+    }
+
+    async function loadSuggestedChannelPlan(spaceId: string, expectedUserId: string) {
+        return await waitForSuggestedChannelPlan(
+            () => Native.suggestedSpaceChannelPlan(spaceId, expectedUserId),
+            () => isCurrentAccount(expectedUserId),
+            caught => matrixErrorCode(caught) === "MATRIX_ROOM_NOT_JOINED"
+        );
+    }
+
+    async function finishSuggestedChannelJoins(
+        result: MatrixJoinSuggestedSpaceChannelsResult,
+        expectedUserId: string
+    ) {
+        if (!isCurrentAccount(expectedUserId)) return;
+        let refreshFailed = false;
+        try {
+            await loadRooms(false, expectedUserId);
+        } catch {
+            refreshFailed = true;
+        }
+        if (!isCurrentAccount(expectedUserId)) return;
+        if (!await refreshSpaceHierarchy(result.spaceId, expectedUserId)) refreshFailed = true;
+        if (!isCurrentAccount(expectedUserId)) return;
+        setError("");
+        const summary = suggestedChannelJoinSummary(result);
+        if (refreshFailed) {
+            setWarning(`${summary} Rooms could not be refreshed yet. Use Refresh to check again.`);
+        } else {
+            setNotice(summary);
+        }
+    }
+
+    async function showSuggestedChannels(spaceId: string) {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId) || suggestedChannelsLoading) return;
+        setSuggestedChannelsLoading(spaceId);
+        setError("");
+        setNoticeText("");
+        try {
+            const plan = await loadSuggestedChannelPlan(spaceId, expectedUserId);
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (!plan) {
+                setWarning("Suggested channels are still syncing. No channels were joined. Try again later.");
+                return;
+            }
+            if (!plan.channels.some(channel => channel.membership === "leave")) {
+                setNotice("There are no new provider-suggested channels to join.");
+                return;
+            }
+            openSuggestedChannelsModal(
+                plan,
+                expectedUserId,
+                result => finishSuggestedChannelJoins(result, expectedUserId)
+            );
+        } catch {
+            if (isCurrentAccount(expectedUserId)) {
+                setWarning("Suggested channels could not be loaded. No channels were joined. Try again later.");
+            }
+        } finally {
+            setSuggestedChannelsLoading(undefined);
         }
     }
 
     async function acceptInvite(roomId: string, spaceId?: string) {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) return;
+        const acceptedRoom = rooms.find(room => room.roomId === roomId)
+            ?? snapshotRooms().find(room => room.roomId === roomId);
+        const acceptedSpace = acceptedRoom ? roomKind(acceptedRoom) === "space" : false;
+        let accepted = false;
+        let refreshFailed = false;
+        let suggestedPlan: MatrixSuggestedSpaceChannelPlanDTO | undefined;
+        let suggestedPlanTimedOut = false;
+        let suggestedPlanFailed = false;
+        let directMessageClassificationFailed = false;
+        setWarning("");
         await run(async () => {
-            await Native.acceptInvite(roomId);
-            await loadRooms(false);
-            if (spaceId) await refreshSpaceHierarchy(spaceId);
-            setNotice("Invitation accepted.");
+            if (!isCurrentAccount(expectedUserId)) return;
+            const result = await Native.acceptInvite(roomId, expectedUserId);
+            accepted = true;
+            directMessageClassificationFailed = result.warning?.code === "MATRIX_DM_CLASSIFICATION_FAILED";
+            if (!isCurrentAccount(expectedUserId)) return;
+            try {
+                await loadRooms(false, expectedUserId);
+            } catch {
+                refreshFailed = true;
+            }
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (spaceId && !await refreshSpaceHierarchy(spaceId, expectedUserId)) refreshFailed = true;
+            if (acceptedSpace) {
+                try {
+                    suggestedPlan = await loadSuggestedChannelPlan(roomId, expectedUserId);
+                    suggestedPlanTimedOut = !suggestedPlan;
+                } catch {
+                    suggestedPlanFailed = true;
+                }
+            }
         });
+        if (!accepted || !isCurrentAccount(expectedUserId)) return;
+        setError("");
+        setNotice("Invitation accepted.");
+        const warnings: string[] = [];
+        if (refreshFailed) warnings.push("Rooms could not be refreshed yet. Use Refresh to check again.");
+        if (directMessageClassificationFailed) {
+            warnings.push("This chat could not be classified as a direct message, so it will appear as a regular chat.");
+        }
+        if (suggestedPlanTimedOut) {
+            warnings.push("Suggested channels are still syncing; no channels were joined. Open server settings later and select Suggested Channels.");
+        } else if (suggestedPlanFailed) {
+            warnings.push("Suggested channels could not be loaded; no channels were joined. Open server settings later and select Suggested Channels.");
+        }
+        if (warnings.length) setWarning(`Invitation was accepted. ${warnings.join(" ")}`);
+        if (suggestedPlan?.channels.some(channel => channel.membership === "leave")) {
+            openSuggestedChannelsModal(
+                suggestedPlan,
+                expectedUserId,
+                result => finishSuggestedChannelJoins(result, expectedUserId)
+            );
+        }
     }
 
     async function rejectInvite(roomId: string, spaceId?: string) {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) return;
+        let declined = false;
+        let refreshFailed = false;
+        setWarning("");
         await run(async () => {
-            await Native.rejectInvite(roomId);
-            await loadRooms(false);
-            if (spaceId) await refreshSpaceHierarchy(spaceId);
-            setNotice("Invitation declined.");
+            if (!isCurrentAccount(expectedUserId)) return;
+            await Native.rejectInvite(roomId, expectedUserId);
+            declined = true;
+            if (!isCurrentAccount(expectedUserId)) return;
+            try {
+                await loadRooms(false, expectedUserId);
+            } catch {
+                refreshFailed = true;
+            }
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (spaceId && !await refreshSpaceHierarchy(spaceId, expectedUserId)) refreshFailed = true;
         });
+        if (!declined || !isCurrentAccount(expectedUserId)) return;
+        setError("");
+        setNotice("Invitation declined.");
+        if (refreshFailed) {
+            setWarning("Invitation was declined, but rooms could not be refreshed yet. Use Refresh to check again.");
+        }
     }
 
     async function joinHierarchyRoom(spaceId: string, room: MatrixSpaceHierarchyRoomDTO) {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) return;
+        let joined = false;
+        let refreshFailed = false;
         await run(async () => {
+            if (!isCurrentAccount(expectedUserId)) return;
             const hierarchy = await Native.spaceChildren(spaceId, 200, 8);
+            if (!isCurrentAccount(expectedUserId)) return;
             setSpaceHierarchies(current => ({ ...current, [spaceId]: hierarchy }));
             const freshRoom = hierarchy.rooms.find(candidate => candidate.roomId === room.roomId);
             const freshMembership = freshRoom && roomMembership(freshRoom);
@@ -1290,16 +1660,31 @@ export function MatrixSettings() {
                 || !canJoinFromHierarchy(freshRoom)) {
                 throw new Error("This room is no longer available to join from the selected server.");
             }
-            await Native.joinRoom(room.roomId);
-            await loadRooms(false);
-            await refreshSpaceHierarchy(spaceId);
-            setNotice(`${roomName(room)} joined and added to Discord.`);
+            await Native.joinRoom(room.roomId, expectedUserId);
+            joined = true;
+            if (!isCurrentAccount(expectedUserId)) return;
+            try {
+                await loadRooms(false, expectedUserId);
+            } catch {
+                refreshFailed = true;
+            }
+            if (!isCurrentAccount(expectedUserId)) return;
+            if (!await refreshSpaceHierarchy(spaceId, expectedUserId)) refreshFailed = true;
         });
+        if (!joined || !isCurrentAccount(expectedUserId)) return;
+        setError("");
+        if (refreshFailed) {
+            setWarning(`${roomName(room)} was joined, but rooms could not be refreshed yet. Use Refresh to check again.`);
+        } else {
+            setNotice(`${roomName(room)} joined and added to Discord.`);
+        }
     }
 
-    async function finishCreatedSpace(result: MatrixCreateSpaceResult, name: string) {
+    async function finishCreatedSpace(result: MatrixCreateSpaceResult, name: string, expectedUserId: string) {
+        if (!isCurrentAccount(expectedUserId)) return false;
         const deadline = Date.now() + 20_000;
         const linkedGeneralRoomId = result.partial?.code === "MATRIX_GENERAL_ROOM_LINK_FAILED"
+            || result.partial?.code === "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS"
             ? undefined
             : result.generalRoomId;
         let opened = false;
@@ -1309,6 +1694,7 @@ export function MatrixSettings() {
             do {
                 try {
                     const snapshot = await beforeDeadline(refreshSnapshot(), deadline);
+                    if (snapshot.account?.userId !== expectedUserId || !isCurrentAccount(expectedUserId)) return false;
                     setRooms((snapshot.rooms ?? []) as MatrixRoomDTO[]);
                     if (linkedGeneralRoomId) {
                         // Only open General after the applied bridge snapshot
@@ -1329,6 +1715,7 @@ export function MatrixSettings() {
                 const remaining = deadline - Date.now();
                 if (remaining <= 0) break;
                 await new Promise(resolve => setTimeout(resolve, Math.min(1_000, remaining)));
+                if (!isCurrentAccount(expectedUserId)) return false;
             } while (Date.now() < deadline);
         } finally {
             setSpaceCreationPending(false);
@@ -1336,10 +1723,13 @@ export function MatrixSettings() {
             setBusy(false);
         }
 
+        if (!isCurrentAccount(expectedUserId)) return false;
         if (result.partial) {
             setWarning(result.partial.code === "MATRIX_GENERAL_ROOM_CREATE_FAILED"
                 ? `${name} was created, but its general chat could not be created. Use Refresh if the server has not appeared; do not create it again.`
-                : `${name} and its general chat were created, but the chat could not be added to the server. The chat remains under Chats; do not create the server again.`);
+                : result.partial.code === "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS"
+                    ? `${name} was created, but the general chat result could not be confirmed and an unlinked chat may exist. Refresh and check before creating another chat; do not create the server again.`
+                    : `${name} and its general chat were created, but the chat could not be added to the server. The chat remains under Chats; do not create the server again.`);
         } else if (!opened) {
             setWarning(`${name} was created, but it is still syncing. Use Refresh in a moment; do not create it again.`);
         } else {
@@ -1348,42 +1738,50 @@ export function MatrixSettings() {
         return opened;
     }
 
-    async function resolveAmbiguousSpaceCreation(name: string, existingSpaceIds: Set<string>) {
-        let resolved = false;
+    async function resolveAmbiguousSpaceCreation(
+        name: string,
+        expectedUserId: string
+    ) {
+        if (!isCurrentAccount(expectedUserId)) return false;
         try {
             const snapshot = await beforeDeadline(refreshSnapshot(), Date.now() + 20_000);
+            if (snapshot.account?.userId !== expectedUserId || !isCurrentAccount(expectedUserId)) return false;
             const nextRooms = (snapshot.rooms ?? []) as MatrixRoomDTO[];
             setRooms(nextRooms);
-            const createdSpace = nextRooms.find(room => !existingSpaceIds.has(room.roomId)
-                && roomMembership(room) === "join"
-                && roomKind(room) === "space"
-                && roomName(room) === name);
-            resolved = Boolean(createdSpace && openMatrixSpace(createdSpace.roomId));
         } catch {
             // The request may still have reached the homeserver. Keep creation
             // blocked until the user explicitly refreshes and inspects the list.
         } finally {
             setSpaceCreationPending(false);
-            setSpaceCreationNeedsRefresh(!resolved);
+            setSpaceCreationNeedsRefresh(true);
             setBusy(false);
         }
 
-        if (resolved) {
-            setNotice(`${name} was created and selected in your Discord server list.`);
-        } else {
-            setWarning(`The request for ${name} timed out and may have succeeded. Refresh and check your server list before trying again.`);
+        if (isCurrentAccount(expectedUserId)) {
+            setWarning(`The request for ${name} may have succeeded. Inspect the refreshed server list before any retry; matching names do not confirm which server was created.`);
         }
-        return resolved;
+        return false;
     }
 
     function openCreateMatrixServer() {
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentAccount(expectedUserId)) {
+            setError("Reconnect your account before creating a server.");
+            return;
+        }
         setError("");
         setNotice("");
-        const existingSpaceIds = new Set(joinedSpaces.map(space => space.roomId));
         openModal(modalProps => (
             <CreateMatrixServerModal
                 modalProps={modalProps}
-                onCreationAmbiguous={name => resolveAmbiguousSpaceCreation(name, existingSpaceIds)}
+                expectedUserId={expectedUserId}
+                onCreationAmbiguous={name => resolveAmbiguousSpaceCreation(name, expectedUserId)}
+                onCreationContextChanged={name => {
+                    setSpaceCreationPending(false);
+                    setSpaceCreationNeedsRefresh(true);
+                    setBusy(false);
+                    setWarning(`The signed-in account changed while ${name} was being created. It may have been created; reconnect that account, refresh, and check before trying again.`);
+                }}
                 onCreationFailed={() => {
                     setSpaceCreationPending(false);
                     setBusy(false);
@@ -1392,7 +1790,7 @@ export function MatrixSettings() {
                     setSpaceCreationPending(true);
                     setBusy(true);
                 }}
-                onCreated={finishCreatedSpace}
+                onCreated={(result, name) => finishCreatedSpace(result, name, expectedUserId)}
             />
         ));
     }
@@ -1910,6 +2308,13 @@ export function MatrixSettings() {
                         <Button disabled={busy || spaceLoading === space.roomId} variant="secondary" onClick={() => void toggleSpace(space.roomId)}>
                             {spaceLoading === space.roomId ? "Loading..." : expanded ? "Hide rooms" : "Browse rooms"}
                         </Button>
+                        <Button
+                            disabled={busy || Boolean(suggestedChannelsLoading)}
+                            variant="secondary"
+                            onClick={() => void showSuggestedChannels(space.roomId)}
+                        >
+                            {suggestedChannelsLoading === space.roomId ? "Loading suggestions..." : "Suggested Channels"}
+                        </Button>
                         {canOpenAccess && (
                             <Button
                                 disabled={busy || spaceAccessLoading === space.roomId}
@@ -2111,7 +2516,7 @@ export function MatrixSettings() {
                     <summary>Advanced: join by full room address</summary>
                     <div className="vc-matrix-section-heading">
                         <Paragraph>
-                            Enter a full Matrix alias or room ID on {accountServer ?? "this account's Matrix server"}.
+                            Enter #alias:server, !legacy-id:server, or a domainless room ID such as !opaque. It will be routed through {accountServer ?? "this account's Matrix server"}.
                         </Paragraph>
                     </div>
                     <label>
@@ -2119,9 +2524,10 @@ export function MatrixSettings() {
                         <TextInput
                             disabled={busy || addressBusy || joinNameBusy || !!pendingAddressRoomId}
                             value={roomAddress}
-                            placeholder={`#general:${accountServer ?? "example.org"}`}
+                            placeholder={`#general:${accountServer ?? "example.org"} or !opaque`}
+                            maxLength={512}
                             onChange={value => {
-                                setRoomAddress(value);
+                                setRoomAddress(value.slice(0, 512));
                                 setAddressError("");
                             }}
                         />

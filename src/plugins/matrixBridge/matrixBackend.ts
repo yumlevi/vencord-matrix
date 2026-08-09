@@ -52,7 +52,11 @@ import type {
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToSpaceRequest,
+    MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
+    MatrixJoinSuggestedSpaceChannelsRequest,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMediaDownloadResult,
     MatrixMemberDTO,
     MatrixMessageContextDTO,
@@ -61,6 +65,7 @@ import type {
     MatrixMessageSearchRequest,
     MatrixMessageSearchResponse,
     MatrixMessageSearchResultDTO,
+    MatrixPowerLevelPermissionDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixPublicRoomDTO,
     MatrixReactionDTO,
@@ -80,8 +85,13 @@ import type {
     MatrixSpaceChildDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
+    MatrixSpaceInviteCandidateDTO,
+    MatrixSpaceInviteCandidateSearchRequest,
+    MatrixSpaceInviteCandidateSearchResult,
     MatrixStickerSendRequest,
     MatrixStickerSendResult,
+    MatrixSuggestedSpaceChannelDTO,
+    MatrixSuggestedSpaceChannelPlanDTO,
     MatrixUrlPreviewDTO,
     MatrixUrlPreviewMediaDTO
 } from "./types";
@@ -100,6 +110,13 @@ const MAX_TIMELINE_MESSAGES = 100;
 const MAX_SNAPSHOT_ROOMS = 250;
 const MAX_ROOM_MEMBERS = 2_000;
 const MAX_SPACE_ACCESS_REQUESTS = 200;
+const DEFAULT_SPACE_INVITE_DIRECTORY_LIMIT = 25;
+const MAX_SPACE_INVITE_DIRECTORY_LIMIT = 100;
+const MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH = 256;
+const SPACE_INVITE_MEMBERSHIP_CONCURRENCY = 6;
+const SUGGESTED_SPACE_CHANNEL_HIERARCHY_LIMIT = 100;
+const MAX_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
+const MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS = 16;
 const MAX_RESOLVED_SPACE_ACCESS_REQUESTS = 1_000;
 const MAX_SNAPSHOT_MESSAGES = 1_000;
 const MAX_SNAPSHOT_MEMBERS = 2_000;
@@ -152,6 +169,9 @@ const ATTACHMENT_GROUP_ID_PATTERN = /^vcgrp_[0-9a-f]{64}$/u;
 const SPACE_CHILD_CREATION_EVENT_TYPE = "dev.vencord.matrix_bridge.space_child_creation";
 const SPACE_CHILD_CREATION_MARKER_PATTERN = /^vccreate_[0-9a-f]{64}$/u;
 const SPACE_JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const SDK_STANDARD_ROOM_VERSIONS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"] as const;
+const SDK_STANDARD_ROOM_VERSIONS_NEWEST_FIRST = [...SDK_STANDARD_ROOM_VERSIONS].reverse();
+const RESTRICTED_ROOM_VERSIONS = new Set<string>(["8", "9", "10", "11", "12"]);
 
 class PublicWorkerError extends Error {
     constructor(public readonly code: string, message: string) {
@@ -245,6 +265,7 @@ interface CachedSearchEvent {
 const reactionTargets = new Map<string, { roomId: string; eventId: string; }>();
 const publicDirectoryTargets = new Set<string>();
 const spaceHierarchyTargets = new Map<string, Map<string, string[]>>();
+const spaceHierarchyRelationTargets = new Map<string, Map<string, Map<string, string[]>>>();
 const pendingHiddenRooms = new Set<string>();
 const resolvedSpaceAccessRequests = new Map<string, { roomId: string; userId: string; }>();
 interface SpaceAccessMemberLoad {
@@ -424,12 +445,26 @@ function validateServerName(value: unknown): string {
     return serverName;
 }
 
-function validateRoomAddress(value: unknown): { address: string; kind: "alias" | "roomId"; serverName: string; } {
+function validateRoomAddress(value: unknown): {
+    address: string;
+    kind: "alias" | "roomId";
+    serverName?: string;
+} {
     const address = validateString(value, "room address", 1_024);
     const sigil = address[0];
     const delimiter = address.indexOf(":", 1);
-    if ((sigil !== "#" && sigil !== "!") || delimiter <= 1
-        || /[\s\u0000-\u001f\u007f]/u.test(address.slice(1, delimiter))) {
+    if (sigil !== "#" && sigil !== "!") {
+        fail("MATRIX_INVALID_ROOM_ADDRESS", "Enter a full Matrix room alias or room ID.");
+    }
+    if (delimiter < 0) {
+        if (sigil !== "!" || address.length <= 1 || /[\s\u0000-\u001f\u007f:]/u.test(address.slice(1))) {
+            fail("MATRIX_INVALID_ROOM_ADDRESS", "Enter a full Matrix room alias or room ID.");
+        }
+        // Room v12 IDs are opaque and deliberately have no server-name suffix.
+        // They are still submitted only to this configured homeserver.
+        return { address, kind: "roomId" };
+    }
+    if (delimiter <= 1 || /[\s\u0000-\u001f\u007f]/u.test(address.slice(1, delimiter))) {
         fail("MATRIX_INVALID_ROOM_ADDRESS", "Enter a full Matrix room alias or room ID.");
     }
     return {
@@ -1780,6 +1815,10 @@ function hierarchyTargetServers(roomId: string): string[] | undefined {
 
 function removeHierarchyTarget(roomId: string): void {
     for (const targets of spaceHierarchyTargets.values()) targets.delete(roomId);
+    for (const relations of spaceHierarchyRelationTargets.values()) {
+        relations.delete(roomId);
+        for (const targets of relations.values()) targets.delete(roomId);
+    }
 }
 
 function normalizeJoinRule(value: unknown): MatrixRoomJoinRule | undefined {
@@ -2013,6 +2052,133 @@ function userPowerLevel(
         : usersDefault;
 }
 
+function isHydraRoomVersion(roomVersion: string): boolean {
+    // Keep this aligned with matrix-js-sdk's fail-safe room-version policy:
+    // the only versions known not to use Hydra creator semantics are 1-11.
+    return !/^(?:[1-9]|10|11)$/u.test(roomVersion);
+}
+
+function createEventUserPowerLevel(
+    room: Room,
+    userId: string,
+    roomVersion: string
+): ParsedMatrixPowerLevel {
+    const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
+    if (!createEvent) return invalidMatrixPowerLevel();
+    const rawContent: unknown = createEvent.getContent();
+    if (!rawContent || typeof rawContent !== "object" || Array.isArray(rawContent)) {
+        return invalidMatrixPowerLevel();
+    }
+    const content = rawContent as Record<string, unknown>;
+    const rawSender = createEvent.getSender();
+    let sender: string;
+    try {
+        sender = validateUserId(rawSender);
+    } catch {
+        return invalidMatrixPowerLevel();
+    }
+
+    if (!isHydraRoomVersion(roomVersion)) {
+        // The authenticated create-event sender is authoritative in every
+        // room version. Room v11 removed the redundant content.creator field.
+        return { valid: true, value: sender === userId ? 100 : 0 };
+    }
+
+    const rawAdditionalCreators = Object.hasOwn(content, "additional_creators")
+        ? content.additional_creators
+        : [];
+    if (!Array.isArray(rawAdditionalCreators) || rawAdditionalCreators.length > 1_000) {
+        return invalidMatrixPowerLevel();
+    }
+    const creators = new Set<string>([sender]);
+    try {
+        for (const creator of rawAdditionalCreators) creators.add(validateUserId(creator));
+    } catch {
+        return invalidMatrixPowerLevel();
+    }
+    return { valid: true, value: creators.has(userId) ? Infinity : 0 };
+}
+
+function effectiveUserPowerLevel(
+    room: Room,
+    content: Record<string, unknown>,
+    userId: string,
+    roomVersion: string
+): ParsedMatrixPowerLevel {
+    // Matrix-js-sdk currently leaves member.powerLevel at zero when a room has
+    // no m.room.power_levels event. Derive the room-version creator defaults
+    // from authenticated creation state instead, and fail closed when that
+    // state is missing or malformed.
+    if (!room.currentState.getStateEvents(EventType.RoomPowerLevels, "")) {
+        return createEventUserPowerLevel(room, userId, roomVersion);
+    }
+    const memberLevel = room.getMember(userId)?.powerLevel;
+    if (memberLevel === Infinity) return { valid: true, value: Infinity };
+    return userPowerLevel(content, userId, roomVersion);
+}
+
+function stateEventPowerLevel(
+    content: Record<string, unknown>,
+    eventType: string,
+    roomVersion: string
+): ParsedMatrixPowerLevel {
+    const stateDefault = defaultedMatrixPowerLevel(content, "state_default", 50, roomVersion);
+    if (!stateDefault.valid || !Object.hasOwn(content, "events")) return stateDefault;
+    const { events } = content;
+    if (!events || typeof events !== "object" || Array.isArray(events)) return invalidMatrixPowerLevel();
+    const levels = events as Record<string, unknown>;
+    return Object.hasOwn(levels, eventType)
+        ? parseMatrixPowerLevel(levels[eventType], roomVersion)
+        : stateDefault;
+}
+
+function powerLevelPermissionDTO(
+    current: ParsedMatrixPowerLevel,
+    required: ParsedMatrixPowerLevel
+): MatrixPowerLevelPermissionDTO {
+    const currentDTO: MatrixPowerLevelPermissionDTO["current"] = !current.valid
+        ? "unverifiable"
+        : current.value === Infinity ? "infinite" : current.value;
+    const requiredDTO: MatrixPowerLevelPermissionDTO["required"] = required.valid
+        ? required.value
+        : "unverifiable";
+    return {
+        current: currentDTO,
+        required: requiredDTO,
+        allowed: current.valid && required.valid && current.value >= required.value
+    };
+}
+
+function roomPowerLevelPermission(
+    room: Room,
+    requiredLevel: (content: Record<string, unknown>, roomVersion: string) => ParsedMatrixPowerLevel
+): MatrixPowerLevelPermissionDTO {
+    if (!activeCredentials || room.getMember(activeCredentials.userId)?.membership !== "join") {
+        return { current: "unverifiable", required: "unverifiable", allowed: false };
+    }
+    const roomVersion = room.getVersion();
+    const state = roomPowerLevelContent(room);
+    if (!state.valid) return { current: "unverifiable", required: "unverifiable", allowed: false };
+    return powerLevelPermissionDTO(
+        effectiveUserPowerLevel(room, state.content, activeCredentials.userId, roomVersion),
+        requiredLevel(state.content, roomVersion)
+    );
+}
+
+function spaceChildPermission(room: Room): MatrixPowerLevelPermissionDTO {
+    return roomPowerLevelPermission(room, (content, roomVersion) =>
+        stateEventPowerLevel(content, EventType.SpaceChild, roomVersion));
+}
+
+function spaceInvitePermission(room: Room): MatrixPowerLevelPermissionDTO {
+    return roomPowerLevelPermission(room, (content, roomVersion) =>
+        defaultedMatrixPowerLevel(content, "invite", 0, roomVersion));
+}
+
+function permissionIsUnverifiable(permission: MatrixPowerLevelPermissionDTO): boolean {
+    return permission.current === "unverifiable" || permission.required === "unverifiable";
+}
+
 function spaceAccessPermissions(
     room: Room,
     targetUserId?: string
@@ -2024,14 +2190,12 @@ function spaceAccessPermissions(
     const powerLevelState = roomPowerLevelContent(room);
     if (!powerLevelState.valid) return { canApprove: false, canDeny: false };
     const powerLevels = powerLevelState.content;
-    const senderLevel = userPowerLevel(powerLevels, activeCredentials.userId, roomVersion);
+    const senderLevel = effectiveUserPowerLevel(room, powerLevels, activeCredentials.userId, roomVersion);
     const inviteLevel = defaultedMatrixPowerLevel(powerLevels, "invite", 0, roomVersion);
     const kickLevel = defaultedMatrixPowerLevel(powerLevels, "kick", 50, roomVersion);
     const targetLevel = targetUserId == null
         ? undefined
-        : room.getMember(targetUserId)?.powerLevel === Infinity
-            ? { valid: true, value: Infinity }
-            : userPowerLevel(powerLevels, targetUserId, roomVersion);
+        : effectiveUserPowerLevel(room, powerLevels, targetUserId, roomVersion);
     if (!senderLevel.valid || !inviteLevel.valid || !kickLevel.valid || targetLevel?.valid === false) {
         return { canApprove: false, canDeny: false };
     }
@@ -2050,9 +2214,7 @@ function canConfigureSpaceAccess(room: Room): boolean {
     const powerLevelState = roomPowerLevelContent(room);
     if (!powerLevelState.valid) return false;
     const powerLevels = powerLevelState.content;
-    const senderLevel = sender.powerLevel === Infinity
-        ? { valid: true, value: Infinity }
-        : userPowerLevel(powerLevels, activeCredentials.userId, roomVersion);
+    const senderLevel = effectiveUserPowerLevel(room, powerLevels, activeCredentials.userId, roomVersion);
     const stateDefault = defaultedMatrixPowerLevel(powerLevels, "state_default", 50, roomVersion);
     if (!senderLevel.valid || !stateDefault.valid) return false;
     let eventLevels: Record<string, unknown> | undefined;
@@ -2194,15 +2356,17 @@ function normalizeRoom(
 
     if (roomType) result.roomType = roomType;
     if (result.kind === "space") {
-        result.canManageSpaceChildren = membership === "join"
-            && activeCredentials != null
-            && room.currentState.maySendStateEvent(EventType.SpaceChild, activeCredentials.userId);
+        const childPermission = spaceChildPermission(room);
+        result.canManageSpaceChildren = childPermission.allowed;
+        result.spaceChildPermission = childPermission;
         if (membership === "join") {
             const permissions = spaceAccessPermissions(room);
+            const invitePermission = spaceInvitePermission(room);
+            result.invitePermission = invitePermission;
             result.canConfigureSpaceAccess = canConfigureSpaceAccess(room);
             result.accessRequestCount = currentSpaceAccessRequestCount(room);
             result.accessRequestCountComplete = room.membersLoaded();
-            result.canApproveAccessRequests = permissions.canApprove;
+            result.canApproveAccessRequests = permissions.canApprove && invitePermission.allowed;
             result.canDenyAccessRequests = permissions.canDeny;
         }
     }
@@ -2559,6 +2723,7 @@ async function disposeClient(clearStores: boolean): Promise<void> {
     reactionTargets.clear();
     publicDirectoryTargets.clear();
     spaceHierarchyTargets.clear();
+    spaceHierarchyRelationTargets.clear();
     pendingHiddenRooms.clear();
     resolvedSpaceAccessRequests.clear();
     urlPreviewMedia.clear();
@@ -3087,28 +3252,60 @@ async function publicRooms(
     };
 }
 
-async function joinRoom(command: Extract<MatrixWorkerCommand, { type: "joinRoom"; }>): Promise<MatrixJoinRoomResult> {
+async function joinRoomWithConvergence(
+    roomId: string,
+    viaServers: string[] | undefined,
+    mutationDispatched: () => void
+): Promise<MatrixJoinRoomResult> {
+    if (matrixClient!.getRoom(roomId)?.getMyMembership() === "join") return { roomId };
+    try {
+        mutationDispatched();
+        const room = await matrixClient!.joinRoom(roomId, viaServers?.length ? { viaServers } : undefined);
+        const joinedRoomId = validateRoomId(room.roomId);
+        if (joinedRoomId !== roomId) fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
+    } catch (error) {
+        if (error instanceof PublicWorkerError && error.code === "MATRIX_ROOM_JOIN_MISMATCH") throw error;
+        let converged = false;
+        try { converged = await exactOwnJoinedRoom(roomId); } catch { }
+        if (!converged) {
+            if (isDefinitiveMatrixMutationRejection(error)) {
+                fail("MATRIX_ROOM_JOIN_REJECTED", "The Matrix homeserver rejected the room join.");
+            }
+            fail(
+                "MATRIX_ROOM_JOIN_AMBIGUOUS",
+                "Matrix could not confirm whether the room was joined. Refresh rooms before trying again."
+            );
+        }
+    }
+    pendingHiddenRooms.delete(roomId);
+    return { roomId };
+}
+
+async function joinRoom(
+    command: Extract<MatrixWorkerCommand, { type: "joinRoom"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixJoinRoomResult> {
     if (!matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
     const roomId = validateRoomId(command.roomId);
     const hierarchyServers = hierarchyTargetServers(roomId);
     if (!publicDirectoryTargets.has(roomId) && !hierarchyServers) {
         fail("MATRIX_ROOM_NOT_IN_DIRECTORY", "Refresh the public room directory or its parent space before joining this room.");
     }
-    const room = await matrixClient.joinRoom(roomId, hierarchyServers?.length ? { viaServers: hierarchyServers } : undefined);
-    const joinedRoomId = validateRoomId(room.roomId);
-    if (joinedRoomId !== roomId) fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
+    const result = await joinRoomWithConvergence(roomId, hierarchyServers, mutationDispatched);
     removeHierarchyTarget(roomId);
-    pendingHiddenRooms.delete(roomId);
     // MatrixClient.joinRoom may return a placeholder Room before /sync supplies
     // membership, state, and timeline. ClientEvent.Room will emit the real DTO.
-    return { roomId: joinedRoomId };
+    return result;
 }
 
-async function joinRoomAddress(command: Extract<MatrixWorkerCommand, { type: "joinRoomAddress"; }>): Promise<MatrixJoinRoomResult> {
+async function joinRoomAddress(
+    command: Extract<MatrixWorkerCommand, { type: "joinRoomAddress"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixJoinRoomResult> {
     if (!matrixClient || !activeCredentials) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
     const requested = validateRoomAddress(command.address);
     const accountServer = activeServerName();
-    if (requested.serverName !== accountServer) {
+    if (requested.serverName != null && requested.serverName !== accountServer) {
         fail("MATRIX_ROOM_SERVER_MISMATCH", "Only rooms on the configured Matrix server can be joined.");
     }
 
@@ -3120,26 +3317,17 @@ async function joinRoomAddress(command: Extract<MatrixWorkerCommand, { type: "jo
             fail("MATRIX_ALIAS_INVALID", "The homeserver returned an invalid room alias result.");
         }
         const target = validateRoomAddress(resolved.room_id);
-        if (target.kind !== "roomId" || target.serverName !== accountServer) {
+        if (target.kind !== "roomId" || (target.serverName != null && target.serverName !== accountServer)) {
             fail("MATRIX_ROOM_SERVER_MISMATCH", "The room alias resolves outside the configured Matrix server.");
         }
         roomId = target.address;
-
-        if (resolved.servers != null) {
-            if (!Array.isArray(resolved.servers) || resolved.servers.length > 100) {
-                fail("MATRIX_ALIAS_INVALID", "The homeserver returned invalid room routing servers.");
-            }
-            const validated = resolved.servers.map(validateServerName);
-            viaServers = [...new Set(validated)].slice(0, 3);
-        }
+        // Never let an alias response steer the join through arbitrary remote
+        // `servers`. The local alias and its local/domainless target are routed
+        // only through the active account's Matrix server.
+        viaServers = [accountServer];
     }
 
-    const room = await matrixClient.joinRoom(roomId, viaServers?.length ? { viaServers } : undefined);
-    const joined = validateRoomAddress(room.roomId);
-    if (joined.kind !== "roomId" || joined.address !== roomId || joined.serverName !== accountServer) {
-        fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
-    }
-    return { roomId: joined.address };
+    return await joinRoomWithConvergence(roomId, viaServers, mutationDispatched);
 }
 
 function hierarchySpaceChildren(value: unknown): MatrixSpaceChildDTO[] {
@@ -3256,14 +3444,13 @@ function hierarchyRoutingServers(value: unknown): Map<string, Map<string, string
     return result;
 }
 
-async function spaceChildren(
-    command: Extract<MatrixWorkerCommand, { type: "spaceChildren"; }>
+async function loadSpaceHierarchy(
+    space: Room,
+    limit: number,
+    maxDepth: number
 ): Promise<MatrixSpaceHierarchyDTO> {
-    const space = getRoom(command.spaceId);
-    if (!space.isSpaceRoom()) fail("MATRIX_ROOM_NOT_SPACE", "The selected Matrix room is not a space.");
-    const limit = Number.isSafeInteger(command.limit) ? Math.min(Math.max(command.limit, 1), 200) : 200;
-    const maxDepth = Number.isSafeInteger(command.maxDepth) ? Math.min(Math.max(command.maxDepth, 1), 16) : 8;
     spaceHierarchyTargets.delete(space.roomId);
+    spaceHierarchyRelationTargets.delete(space.roomId);
     const response = await matrixClient!.getRoomHierarchy(space.roomId, limit, maxDepth, false);
     if (!response || !Array.isArray(response.rooms)) {
         fail("MATRIX_HIERARCHY_INVALID", "The homeserver returned an invalid space hierarchy.");
@@ -3290,6 +3477,7 @@ async function spaceChildren(
 
     const byId = new Map(rooms.map(room => [room.roomId, room]));
     const authorizedTargets = new Map<string, string[]>();
+    const authorizedRelations = new Map<string, Map<string, string[]>>();
     for (const parent of rooms) {
         if (parent.kind !== "space") continue;
         const localParent = matrixClient!.getRoom(parent.roomId);
@@ -3302,12 +3490,17 @@ async function spaceChildren(
             if (!childRoom.parentIds.includes(parent.roomId) && childRoom.parentIds.length < 1_000) {
                 childRoom.parentIds.push(parent.roomId);
             }
+            const viaServers = routingServers.get(parent.roomId)?.get(childRoom.roomId)
+                ?? localRoutingServers?.get(childRoom.roomId);
+            if (viaServers) {
+                let parentTargets = authorizedRelations.get(parent.roomId);
+                if (!parentTargets) authorizedRelations.set(parent.roomId, parentTargets = new Map());
+                parentTargets.set(childRoom.roomId, viaServers);
+            }
             if (childRoom.membership === "join" || childRoom.membership === "invite") continue;
             if (childRoom.joinRule === "public"
                 || childRoom.joinRule === "restricted"
                 || childRoom.joinRule === "knock_restricted") {
-                const viaServers = routingServers.get(parent.roomId)?.get(childRoom.roomId)
-                    ?? localRoutingServers?.get(childRoom.roomId);
                 if (viaServers) authorizedTargets.set(childRoom.roomId, viaServers);
             }
         }
@@ -3316,7 +3509,275 @@ async function spaceChildren(
         room.parentIds = [...new Set(room.parentIds)].sort().slice(0, 1_000);
     }
     spaceHierarchyTargets.set(space.roomId, authorizedTargets);
+    spaceHierarchyRelationTargets.set(space.roomId, authorizedRelations);
     return { spaceId: space.roomId, rooms };
+}
+
+async function spaceChildren(
+    command: Extract<MatrixWorkerCommand, { type: "spaceChildren"; }>
+): Promise<MatrixSpaceHierarchyDTO> {
+    const space = getRoom(command.spaceId);
+    if (!space.isSpaceRoom()) fail("MATRIX_ROOM_NOT_SPACE", "The selected Matrix room is not a space.");
+    const limit = Number.isSafeInteger(command.limit) ? Math.min(Math.max(command.limit, 1), 200) : 200;
+    const maxDepth = Number.isSafeInteger(command.maxDepth) ? Math.min(Math.max(command.maxDepth, 1), 16) : 8;
+    return await loadSpaceHierarchy(space, limit, maxDepth);
+}
+
+function suggestedChannelJoinRule(
+    value: MatrixRoomJoinRule | undefined
+): MatrixSuggestedSpaceChannelDTO["joinRule"] | undefined {
+    return value === "public" || value === "restricted" || value === "knock_restricted"
+        ? value
+        : undefined;
+}
+
+async function suggestedSpaceChannelPlanId(
+    spaceId: string,
+    channels: MatrixSuggestedSpaceChannelDTO[]
+): Promise<string> {
+    const input = new TextEncoder().encode(JSON.stringify([spaceId, channels]));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+    return `vcsp_${Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function joinedOnboardingSpace(spaceIdValue: unknown): Promise<Room> {
+    const spaceId = validateRoomId(spaceIdValue);
+    if (!matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const room = matrixClient.getRoom(spaceId);
+    if (!room?.isSpaceRoom()) fail("MATRIX_SPACE_REQUIRED", "The selected Matrix room is not a Space.");
+    if (room.getMyMembership() === "join") return room;
+    if (!await exactOwnJoinedRoom(spaceId)) {
+        fail("MATRIX_ROOM_NOT_JOINED", "The Matrix Space is not joined.");
+    }
+    // joinRoom can resolve before the sliding/sync membership echo reaches the
+    // SDK Room. The authoritative joined-rooms read above permits hierarchy
+    // discovery without mutating or trusting that stale local membership.
+    return room;
+}
+
+async function buildSuggestedSpaceChannelPlan(spaceIdValue: unknown): Promise<MatrixSuggestedSpaceChannelPlanDTO> {
+    const root = await joinedOnboardingSpace(spaceIdValue);
+    const hierarchy = await loadSpaceHierarchy(root, SUGGESTED_SPACE_CHANNEL_HIERARCHY_LIMIT, 2);
+    const byId = new Map(hierarchy.rooms.map(room => [room.roomId, room]));
+    const rootRoom = byId.get(root.roomId);
+    if (!rootRoom || rootRoom.kind !== "space") {
+        fail("MATRIX_HIERARCHY_INVALID", "Matrix did not return the joined root Space in its hierarchy.");
+    }
+    const relationTargets = spaceHierarchyRelationTargets.get(root.roomId);
+    const accountServer = activeServerName();
+    const channels: MatrixSuggestedSpaceChannelDTO[] = [];
+    const plannedRoomIds = new Set<string>();
+    let plannedJoins = 0;
+    let limited = hierarchy.rooms.length >= SUGGESTED_SPACE_CHANNEL_HIERARCHY_LIMIT;
+
+    const relationRoom = (
+        parent: MatrixSpaceHierarchyRoomDTO,
+        relation: MatrixSpaceChildDTO,
+        kind: "space" | "room"
+    ): MatrixSpaceHierarchyRoomDTO | undefined => {
+        if (relation.suggested !== true) return undefined;
+        const child = byId.get(relation.roomId);
+        if (!child) {
+            limited = true;
+            return undefined;
+        }
+        const viaServers = relationTargets?.get(parent.roomId)?.get(child.roomId);
+        if (child.roomId === parent.roomId || child.roomId === root.roomId
+            || child.kind !== kind || !viaServers?.includes(accountServer) || child.membership === "invite") {
+            return undefined;
+        }
+        return child.membership === "join" || suggestedChannelJoinRule(child.joinRule)
+            ? child
+            : undefined;
+    };
+    const addChannel = (
+        room: MatrixSpaceHierarchyRoomDTO,
+        parentSpaceId: string,
+        depth: 1 | 2,
+        includeJoined = false
+    ): boolean => {
+        if (plannedRoomIds.has(room.roomId)) return false;
+        if (room.membership === "join" && !includeJoined) return true;
+        const joinRule = room.membership === "join" && includeJoined
+            ? room.joinRule
+            : suggestedChannelJoinRule(room.joinRule);
+        if (!joinRule) return false;
+        const needsJoin = room.membership !== "join";
+        if (channels.length >= MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS
+            || (needsJoin && plannedJoins >= MAX_SUGGESTED_SPACE_CHANNEL_JOINS)) {
+            limited = true;
+            return false;
+        }
+        channels.push({
+            roomId: room.roomId,
+            parentSpaceId,
+            name: room.name,
+            kind: room.kind === "space" ? "space" : "room",
+            depth,
+            membership: room.membership === "join" ? "join" : "leave",
+            joinRule,
+            ...(room.avatarUrl ? { avatarUrl: room.avatarUrl } : {}),
+            ...(room.topic ? { topic: room.topic } : {})
+        });
+        plannedRoomIds.add(room.roomId);
+        if (needsJoin) plannedJoins++;
+        return true;
+    };
+
+    for (const relation of rootRoom.spaceChildren) {
+        const directRoom = relationRoom(rootRoom, relation, "room");
+        if (directRoom) {
+            addChannel(directRoom, root.roomId, 1);
+            continue;
+        }
+        const category = relationRoom(rootRoom, relation, "space");
+        if (!category) continue;
+        const nestedRooms: MatrixSpaceHierarchyRoomDTO[] = [];
+        for (const nestedRelation of category.spaceChildren) {
+            const nestedRoom = relationRoom(category, nestedRelation, "room");
+            if (nestedRoom) nestedRooms.push(nestedRoom);
+        }
+        const unjoinedNestedRooms = nestedRooms.filter(room =>
+            room.membership !== "join" && !plannedRoomIds.has(room.roomId));
+        if (!unjoinedNestedRooms.length) continue;
+        const requiredJoinSlots = (category.membership === "join" ? 0 : 1) + 1;
+        if (channels.length + 2 > MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS
+            || plannedJoins + requiredJoinSlots > MAX_SUGGESTED_SPACE_CHANNEL_JOINS) {
+            limited = true;
+            continue;
+        }
+        if (!addChannel(category, root.roomId, 1, true)) continue;
+        for (const nestedRoom of unjoinedNestedRooms) addChannel(nestedRoom, category.roomId, 2);
+    }
+
+    const planId = await suggestedSpaceChannelPlanId(root.roomId, channels);
+    return {
+        spaceId: root.roomId,
+        planId,
+        scope: "suggested_depth_2_via_account_server",
+        channels,
+        limited,
+        complete: false
+    };
+}
+
+async function suggestedSpaceChannelPlan(
+    command: Extract<MatrixWorkerCommand, { type: "suggestedSpaceChannelPlan"; }>
+): Promise<MatrixSuggestedSpaceChannelPlanDTO> {
+    return await buildSuggestedSpaceChannelPlan(command.spaceId);
+}
+
+function validateJoinSuggestedSpaceChannelsRequest(value: unknown): MatrixJoinSuggestedSpaceChannelsRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The suggested-channel join request is invalid.");
+    }
+    const input = value as Partial<MatrixJoinSuggestedSpaceChannelsRequest>;
+    if (Object.keys(input).length !== 2 || !Object.hasOwn(input, "spaceId") || !Object.hasOwn(input, "planId")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The suggested-channel join request is invalid.");
+    }
+    const planId = validateString(input.planId, "suggested-channel plan", 69);
+    if (!/^vcsp_[0-9a-f]{64}$/u.test(planId)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The suggested-channel plan is invalid.");
+    }
+    return { spaceId: validateRoomId(input.spaceId), planId };
+}
+
+async function joinSuggestedSpaceChannels(
+    command: Extract<MatrixWorkerCommand, { type: "joinSuggestedSpaceChannels"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixJoinSuggestedSpaceChannelsResult> {
+    const request = validateJoinSuggestedSpaceChannelsRequest(command.request);
+    const plan = await buildSuggestedSpaceChannelPlan(request.spaceId);
+    if (plan.planId !== request.planId) {
+        fail(
+            "MATRIX_SUGGESTED_SPACE_CHANNEL_PLAN_STALE",
+            "The Space's suggested channels changed. Review the refreshed list before joining."
+        );
+    }
+    const outcomes: MatrixJoinSuggestedSpaceChannelsResult["outcomes"] = [];
+    const rejectedParents = new Set<string>();
+    const accountServer = activeServerName();
+    let dispatched = false;
+
+    for (const channel of plan.channels) {
+        if (rejectedParents.has(channel.parentSpaceId)) {
+            outcomes.push({
+                roomId: channel.roomId,
+                parentSpaceId: channel.parentSpaceId,
+                kind: channel.kind,
+                status: "blocked_by_parent"
+            });
+            continue;
+        }
+        if (matrixClient!.getRoom(channel.roomId)?.getMyMembership() === "join") {
+            outcomes.push({
+                roomId: channel.roomId,
+                parentSpaceId: channel.parentSpaceId,
+                kind: channel.kind,
+                status: "already_joined"
+            });
+            continue;
+        }
+        const viaServers = spaceHierarchyRelationTargets.get(plan.spaceId)
+            ?.get(channel.parentSpaceId)?.get(channel.roomId);
+        if (!viaServers?.includes(accountServer)) {
+            fail(
+                "MATRIX_SUGGESTED_SPACE_CHANNEL_PLAN_STALE",
+                "A suggested Space channel is no longer routed through this account's Matrix server."
+            );
+        }
+        try {
+            if (!dispatched) {
+                mutationDispatched();
+                dispatched = true;
+            }
+            const joined = await matrixClient!.joinRoom(channel.roomId, { viaServers: [accountServer] });
+            if (validateRoomId(joined.roomId) !== channel.roomId) {
+                fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
+            }
+            pendingHiddenRooms.delete(channel.roomId);
+            outcomes.push({
+                roomId: channel.roomId,
+                parentSpaceId: channel.parentSpaceId,
+                kind: channel.kind,
+                status: "joined"
+            });
+        } catch (error) {
+            if (error instanceof PublicWorkerError && error.code === "MATRIX_ROOM_JOIN_MISMATCH") throw error;
+            let converged = false;
+            try { converged = await exactOwnJoinedRoom(channel.roomId); } catch { }
+            if (converged) {
+                pendingHiddenRooms.delete(channel.roomId);
+                outcomes.push({
+                    roomId: channel.roomId,
+                    parentSpaceId: channel.parentSpaceId,
+                    kind: channel.kind,
+                    status: "joined"
+                });
+                continue;
+            }
+            if (!isDefinitiveMatrixMutationRejection(error)) {
+                fail(
+                    "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS",
+                    "Matrix could not confirm every suggested-channel join. Refresh the server before trying again."
+                );
+            }
+            outcomes.push({
+                roomId: channel.roomId,
+                parentSpaceId: channel.parentSpaceId,
+                kind: channel.kind,
+                status: "rejected"
+            });
+            if (channel.kind === "space") rejectedParents.add(channel.roomId);
+        }
+    }
+    return {
+        spaceId: plan.spaceId,
+        planId: plan.planId,
+        outcomes,
+        limited: plan.limited,
+        complete: false
+    };
 }
 
 function requireMembership(roomIdValue: unknown, expected: "join" | "invite"): Room {
@@ -3367,36 +3828,98 @@ async function addDirectRoom(userIdValue: unknown, roomIdValue: unknown): Promis
     await matrixClient.setAccountData(EventType.Direct, content);
 }
 
+async function exactOwnJoinedRoom(roomId: string): Promise<boolean> {
+    const response: unknown = await matrixClient!.getJoinedRooms();
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+        fail("MATRIX_JOINED_ROOMS_INVALID", "Matrix returned an invalid joined-room response.");
+    }
+    const joinedRooms = (response as { joined_rooms?: unknown; }).joined_rooms;
+    if (!Array.isArray(joinedRooms) || joinedRooms.length > 100_000) {
+        fail("MATRIX_JOINED_ROOMS_INVALID", "Matrix returned an invalid joined-room response.");
+    }
+    let found = false;
+    for (const joinedRoomId of joinedRooms) {
+        const validated = validateRoomId(joinedRoomId);
+        if (validated === roomId) found = true;
+    }
+    return found;
+}
+
 async function acceptInvite(
-    command: Extract<MatrixWorkerCommand, { type: "acceptInvite"; }>
+    command: Extract<MatrixWorkerCommand, { type: "acceptInvite"; }>,
+    mutationDispatched: () => void
 ): Promise<MatrixRoomActionResult> {
     const room = requireMembership(command.roomId, "invite");
     const { roomId } = room;
     const directInviter = optionalUserId(room.getDMInviter());
-    const joined = await matrixClient!.joinRoom(roomId);
-    const joinedRoomId = validateRoomId(joined.roomId);
-    if (joinedRoomId !== roomId) fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
+    let warning: MatrixRoomActionResult["warning"];
+    try {
+        mutationDispatched();
+        const joined = await matrixClient!.joinRoom(roomId);
+        const joinedRoomId = validateRoomId(joined.roomId);
+        if (joinedRoomId !== roomId) {
+            fail("MATRIX_ROOM_JOIN_MISMATCH", "The homeserver joined an unexpected room.");
+        }
+    } catch (error) {
+        if (error instanceof PublicWorkerError && error.code === "MATRIX_ROOM_JOIN_MISMATCH") throw error;
+        let converged = false;
+        try {
+            converged = await exactOwnJoinedRoom(roomId);
+        } catch {
+            // The original response still determines whether a retry is safe.
+        }
+        if (!converged) {
+            if (isDefinitiveMatrixMutationRejection(error)) {
+                fail(
+                    "MATRIX_ROOM_INVITE_ACCEPT_REJECTED",
+                    "The Matrix homeserver rejected the invitation acceptance. The room was not joined."
+                );
+            }
+            fail(
+                "MATRIX_ROOM_INVITE_ACCEPT_AMBIGUOUS",
+                "Matrix could not confirm whether the invitation was accepted. Refresh rooms before trying again."
+            );
+        }
+    }
     // is_direct only survives on the invite membership event. Persist it after
     // the join succeeds so a failed join cannot leave a stale m.direct entry.
     if (directInviter && directInviter !== activeCredentials?.userId) {
         try {
             await addDirectRoom(directInviter, roomId);
         } catch {
-            fail(
-                "MATRIX_DM_CLASSIFICATION_FAILED",
-                "The room was joined, but Matrix could not save its direct-message classification."
-            );
+            warning = {
+                code: "MATRIX_DM_CLASSIFICATION_FAILED",
+                message: "The room was joined, but Matrix could not save its direct-message classification."
+            };
         }
     }
     pendingHiddenRooms.delete(roomId);
-    return { roomId };
+    return { roomId, ...(warning ? { warning } : {}) };
 }
 
 async function rejectInvite(
-    command: Extract<MatrixWorkerCommand, { type: "rejectInvite"; }>
+    command: Extract<MatrixWorkerCommand, { type: "rejectInvite"; }>,
+    mutationDispatched: () => void
 ): Promise<MatrixRoomActionResult> {
     const room = requireMembership(command.roomId, "invite");
-    await matrixClient!.leave(room.roomId);
+    try {
+        mutationDispatched();
+        await matrixClient!.leave(room.roomId);
+    } catch (error) {
+        // A sync membership transition is server-authored convergence evidence.
+        if (matrixClient!.getRoom(room.roomId)?.getMyMembership() !== "leave") {
+            if (isDefinitiveMatrixMutationRejection(error)) {
+                fail(
+                    "MATRIX_ROOM_INVITE_REJECTION_REJECTED",
+                    "The Matrix homeserver rejected the invitation decline. The invitation may still be pending."
+                );
+            }
+            fail(
+                "MATRIX_ROOM_INVITE_REJECTION_AMBIGUOUS",
+                "Matrix could not confirm whether the invitation was declined. Refresh rooms before trying again."
+            );
+        }
+    }
     pendingHiddenRooms.add(room.roomId);
     emit({ type: "snapshot", snapshot: snapshot() });
     return { roomId: room.roomId };
@@ -3409,6 +3932,7 @@ async function leaveRoom(
     await matrixClient!.leave(room.roomId);
     pendingHiddenRooms.add(room.roomId);
     spaceHierarchyTargets.delete(room.roomId);
+    spaceHierarchyRelationTargets.delete(room.roomId);
     removeHierarchyTarget(room.roomId);
     forgetResolvedSpaceAccessRequestsForRoom(room.roomId);
     emit({ type: "snapshot", snapshot: snapshot() });
@@ -4082,6 +4606,251 @@ async function resolveSpaceAccessRequest(
     return result;
 }
 
+function validateSpaceInviteCandidateSearchRequest(value: unknown): Required<MatrixSpaceInviteCandidateSearchRequest> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search is invalid.");
+    }
+    const input = value as Partial<MatrixSpaceInviteCandidateSearchRequest>;
+    if (!Object.keys(input).every(key => key === "spaceId" || key === "query" || key === "limit")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search contains unsupported fields.");
+    }
+    const query = validateString(
+        input.query,
+        "Space invite search query",
+        MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH,
+        true
+    ).trim();
+    if (/[\u0000-\u001f\u007f]/u.test(query)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search query is invalid.");
+    }
+    const limit = input.limit ?? DEFAULT_SPACE_INVITE_DIRECTORY_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_SPACE_INVITE_DIRECTORY_LIMIT) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search limit is invalid.");
+    }
+    return { spaceId: validateRoomId(input.spaceId), query, limit };
+}
+
+function validateInviteUserToSpaceRequest(value: unknown): MatrixInviteUserToSpaceRequest {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite is invalid.");
+    }
+    const input = value as Partial<MatrixInviteUserToSpaceRequest>;
+    if (!Object.keys(input).every(key => key === "spaceId" || key === "userId")) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite contains unsupported fields.");
+    }
+    return { spaceId: validateRoomId(input.spaceId), userId: validateUserId(input.userId) };
+}
+
+function localServerUserId(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length > 512
+        || !/^@[^\s:\u0000-\u001f\u007f]+:[^\s\u0000-\u001f\u007f]+$/u.test(value)) {
+        return undefined;
+    }
+    const separator = value.indexOf(":", 1);
+    try {
+        const userId = validateUserId(value);
+        const serverName = validateServerName(value.slice(separator + 1));
+        return serverName === activeServerName() ? userId : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function requireLocalServerUserId(value: unknown): string {
+    const userId = validateUserId(value);
+    const localUserId = localServerUserId(userId);
+    if (!localUserId) {
+        fail("MATRIX_REMOTE_USER_REJECTED", "Only users on this account's Matrix server can be invited here.");
+    }
+    return localUserId;
+}
+
+type ExactSpaceInviteMembership = MatrixSpaceInviteCandidateDTO["membership"] | "ban";
+
+async function exactSpaceInviteMembership(roomId: string, userId: string): Promise<ExactSpaceInviteMembership> {
+    try {
+        const content = await matrixClient!.getStateEvent(roomId, EventType.RoomMember, userId);
+        if (!content || typeof content !== "object" || Array.isArray(content)) {
+            fail("MATRIX_SPACE_MEMBERSHIP_INVALID", "Matrix returned invalid Space membership state.");
+        }
+        const { membership }: { membership?: unknown } = content;
+        if (membership === "leave" || membership === "knock" || membership === "invite"
+            || membership === "join" || membership === "ban") {
+            return membership;
+        }
+        fail("MATRIX_SPACE_MEMBERSHIP_INVALID", "Matrix returned invalid Space membership state.");
+    } catch (error) {
+        if (matrixErrorCode(error) === "M_NOT_FOUND") return "none";
+        throw error;
+    }
+}
+
+function emptyUserDirectoryQueryUnsupported(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const status = (error as { httpStatus?: unknown; }).httpStatus;
+    if (status !== 400) return false;
+    const code = matrixErrorCode(error);
+    return code == null || code === "M_BAD_JSON" || code === "M_INVALID_PARAM"
+        || code === "M_MISSING_PARAM" || code === "M_UNKNOWN";
+}
+
+async function mapSpaceInviteCandidates(
+    candidates: Array<{ userId: string; displayName?: string; avatarUrl?: string; }>,
+    roomId: string
+): Promise<Array<MatrixSpaceInviteCandidateDTO | undefined>> {
+    const results = new Array<MatrixSpaceInviteCandidateDTO | undefined>(candidates.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from(
+        { length: Math.min(SPACE_INVITE_MEMBERSHIP_CONCURRENCY, candidates.length) },
+        async () => {
+            while (nextIndex < candidates.length) {
+                const index = nextIndex++;
+                const candidate = candidates[index];
+                const membership = await exactSpaceInviteMembership(roomId, candidate.userId);
+                if (membership === "ban") continue;
+                results[index] = { ...candidate, membership };
+            }
+        }
+    ));
+    return results;
+}
+
+async function searchSpaceInviteCandidates(
+    command: Extract<MatrixWorkerCommand, { type: "searchSpaceInviteCandidates"; }>
+): Promise<MatrixSpaceInviteCandidateSearchResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const request = validateSpaceInviteCandidateSearchRequest(command.request);
+    const space = joinedSpace(request.spaceId);
+    const permission = spaceInvitePermission(space);
+    if (permissionIsUnverifiable(permission)) {
+        fail(
+            "MATRIX_SPACE_INVITE_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify this Space's invite power levels."
+        );
+    }
+    if (!permission.allowed) {
+        fail("MATRIX_SPACE_INVITE_FORBIDDEN", "You do not have permission to invite users to this Matrix Space.");
+    }
+
+    let directory: Awaited<ReturnType<MatrixClient["searchUserDirectory"]>>;
+    try {
+        directory = await matrixClient.searchUserDirectory({ term: request.query, limit: request.limit });
+    } catch (error) {
+        if (request.query === "" && emptyUserDirectoryQueryUnsupported(error)) {
+            return {
+                spaceId: space.roomId,
+                query: request.query,
+                scope: "homeserver_user_directory",
+                candidates: [],
+                limited: false,
+                directoryLimited: false,
+                complete: false,
+                queryRequired: true
+            };
+        }
+        throw error;
+    }
+    if (!directory || typeof directory !== "object" || !Array.isArray(directory.results)
+        || typeof directory.limited !== "boolean") {
+        fail("MATRIX_USER_DIRECTORY_INVALID", "Matrix returned an invalid user-directory response.");
+    }
+
+    const locallyLimited = directory.results.length > request.limit;
+    const unique = new Set<string>();
+    const localCandidates: Array<{ userId: string; displayName?: string; avatarUrl?: string; }> = [];
+    for (const raw of directory.results.slice(0, request.limit)) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const userId = localServerUserId(raw.user_id);
+        if (!userId || userId === activeCredentials.userId || unique.has(userId)) continue;
+        unique.add(userId);
+        const candidate: { userId: string; displayName?: string; avatarUrl?: string; } = { userId };
+        const displayName = publicRoomText(raw.display_name, 256);
+        const avatarUrl = mediaUrl(raw.avatar_url, 96, 96);
+        if (displayName) candidate.displayName = displayName;
+        if (avatarUrl) candidate.avatarUrl = avatarUrl;
+        localCandidates.push(candidate);
+    }
+    const memberships = await mapSpaceInviteCandidates(localCandidates, space.roomId);
+    const candidates = memberships.filter((candidate): candidate is MatrixSpaceInviteCandidateDTO => candidate != null);
+    return {
+        spaceId: space.roomId,
+        query: request.query,
+        scope: "homeserver_user_directory",
+        candidates,
+        limited: directory.limited || locallyLimited,
+        directoryLimited: directory.limited,
+        complete: false,
+        queryRequired: false
+    };
+}
+
+async function inviteUserToSpace(
+    command: Extract<MatrixWorkerCommand, { type: "inviteUserToSpace"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixInviteUserToSpaceResult> {
+    if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    const input = validateInviteUserToSpaceRequest(command.request);
+    const request = { ...input, userId: requireLocalServerUserId(input.userId) };
+    const space = joinedSpace(request.spaceId);
+    if (request.userId === activeCredentials.userId) {
+        fail("MATRIX_SPACE_INVITE_SELF", "You cannot invite your own Matrix account to this Space.");
+    }
+    const permission = spaceInvitePermission(space);
+    if (permissionIsUnverifiable(permission)) {
+        fail(
+            "MATRIX_SPACE_INVITE_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify this Space's invite power levels."
+        );
+    }
+    if (!permission.allowed) {
+        fail("MATRIX_SPACE_INVITE_FORBIDDEN", "You do not have permission to invite users to this Matrix Space.");
+    }
+
+    const before = await exactSpaceInviteMembership(space.roomId, request.userId);
+    if (before === "invite" || before === "join") {
+        return { ...request, membership: before, changed: false };
+    }
+    if (before === "ban") {
+        fail("MATRIX_SPACE_INVITE_BANNED", "That Matrix user is banned from this Space.");
+    }
+
+    try {
+        mutationDispatched();
+        await matrixClient.invite(space.roomId, request.userId);
+    } catch (error) {
+        let actual: ExactSpaceInviteMembership | undefined;
+        try {
+            actual = await exactSpaceInviteMembership(space.roomId, request.userId);
+        } catch {
+            // The original mutation failure determines whether retry is safe.
+        }
+        if (actual === "invite" || actual === "join") {
+            try { emitRoom(space); } catch { }
+            return { ...request, membership: actual, changed: true };
+        }
+        if (isDefinitiveMatrixMutationRejection(error)) {
+            fail(
+                "MATRIX_SPACE_INVITE_REJECTED",
+                "The Matrix homeserver rejected the invite. No new invite was sent."
+            );
+        }
+        fail(
+            "MATRIX_SPACE_INVITE_AMBIGUOUS",
+            "Matrix could not confirm the invite. It may already be pending; refresh before trying again."
+        );
+    }
+
+    let membership: MatrixInviteUserToSpaceResult["membership"] = "invite";
+    try {
+        const actual = await exactSpaceInviteMembership(space.roomId, request.userId);
+        if (actual === "invite" || actual === "join") membership = actual;
+    } catch {
+        // A successful /invite response already proves invite-or-invited state.
+    }
+    try { emitRoom(space); } catch { }
+    return { ...request, membership, changed: true };
+}
+
 function validateSpaceAliasResolution(value: unknown): { roomId: string; servers: unknown[]; } {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         fail("MATRIX_SPACE_ACCESS_INVALID", "Matrix returned an invalid Space alias response.");
@@ -4251,45 +5020,138 @@ function validateCreateSpaceRequest(value: unknown): Required<Pick<MatrixCreateS
     return { name, topic, visibility, createGeneral };
 }
 
+function roomVersionSupportsCreation(version: string, restrictedRequired: boolean): boolean {
+    return (SDK_STANDARD_ROOM_VERSIONS as readonly string[]).includes(version)
+        && (!restrictedRequired || RESTRICTED_ROOM_VERSIONS.has(version));
+}
+
+async function selectCreationRoomVersion(restrictedRequired: boolean): Promise<string> {
+    let capabilities: unknown;
+    try {
+        capabilities = await matrixClient!.getCapabilities();
+    } catch {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            "Matrix could not verify a compatible room version before creation. No room was created."
+        );
+    }
+    if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            "Matrix returned invalid room-version capabilities. No room was created."
+        );
+    }
+    const capability = (capabilities as Record<string, unknown>)["m.room_versions"];
+    if (!capability || typeof capability !== "object" || Array.isArray(capability)) {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            "The Matrix homeserver did not advertise compatible room versions. No room was created."
+        );
+    }
+    const { default: defaultVersion, available } = capability as { default?: unknown; available?: unknown; };
+    if (typeof defaultVersion !== "string" || defaultVersion.length > 32
+        || !available || typeof available !== "object" || Array.isArray(available)) {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            "Matrix returned invalid room-version capabilities. No room was created."
+        );
+    }
+    const versions = available as Record<string, unknown>;
+    const entries = Object.entries(versions);
+    if (entries.length > 128 || entries.some(([version, stability]) =>
+        !version || version.length > 32 || (stability !== "stable" && stability !== "unstable"))) {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            "Matrix returned invalid room-version capabilities. No room was created."
+        );
+    }
+    if (roomVersionSupportsCreation(defaultVersion, restrictedRequired)
+        && (versions[defaultVersion] === "stable" || versions[defaultVersion] === "unstable")) {
+        return defaultVersion;
+    }
+    const fallback = SDK_STANDARD_ROOM_VERSIONS_NEWEST_FIRST.find(version =>
+        roomVersionSupportsCreation(version, restrictedRequired) && versions[version] === "stable");
+    if (!fallback) {
+        fail(
+            "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED",
+            restrictedRequired
+                ? "This Matrix homeserver does not advertise a stable room version that supports restricted Space children. No room was created."
+                : "This Matrix homeserver does not advertise a compatible stable room version. No room was created."
+        );
+    }
+    return fallback;
+}
+
+function roomCreationPowerLevels(roomVersion: string) {
+    const common = {
+        users_default: 0,
+        events_default: 0,
+        state_default: 50,
+        ban: 50,
+        kick: 50,
+        redact: 50,
+        invite: 50
+    };
+    return roomVersion === "12"
+        ? {
+            ...common,
+            // Hydra creators have infinite authority and MUST NOT appear in
+            // `users`. v12 also requires tombstone above state_default.
+            events: { [EventType.RoomTombstone]: 150 }
+        }
+        : { ...common, users: { [activeCredentials!.userId]: 100 } };
+}
+
 async function createSpace(
-    command: Extract<MatrixWorkerCommand, { type: "createSpace"; }>
+    command: Extract<MatrixWorkerCommand, { type: "createSpace"; }>,
+    mutationDispatched: () => void
 ): Promise<MatrixCreateSpaceResult> {
     if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
     const request = validateCreateSpaceRequest(command.request);
     const isPublic = request.visibility === "public";
     const viaServer = activeServerName();
-    const created = await matrixClient.createRoom({
-        name: request.name,
-        topic: request.topic,
-        visibility: isPublic ? Visibility.Public : Visibility.Private,
-        preset: isPublic ? Preset.PublicChat : Preset.PrivateChat,
-        creation_content: { type: RoomType.Space },
-        // Spell out the security-relevant defaults instead of depending on a
-        // homeserver's preset implementation. The creator remains the sole
-        // administrator (PL100) until they invite or promote someone.
-        power_level_content_override: {
-            users: { [activeCredentials.userId]: 100 },
-            users_default: 0,
-            events_default: 0,
-            state_default: 50,
-            ban: 50,
-            kick: 50,
-            redact: 50,
-            invite: 50
-        },
-        initial_state: [{
-            type: EventType.RoomJoinRules,
-            state_key: "",
-            content: { join_rule: isPublic ? JoinRule.Public : JoinRule.Invite }
-        }, {
-            type: EventType.RoomHistoryVisibility,
-            state_key: "",
-            // Directory visibility and public joinability do not require
-            // exposing the Space's state history to anonymous users.
-            content: { history_visibility: HistoryVisibility.Joined }
-        }]
-    });
-    const roomId = validateRoomId(created.room_id);
+    // Select before the first non-idempotent request. A requested private
+    // #general needs restricted joins, so its selected version must be v8+.
+    const roomVersion = await selectCreationRoomVersion(!isPublic && request.createGeneral);
+    let roomId: string;
+    try {
+        mutationDispatched();
+        const created = await matrixClient.createRoom({
+            name: request.name,
+            topic: request.topic,
+            visibility: isPublic ? Visibility.Public : Visibility.Private,
+            preset: isPublic ? Preset.PublicChat : Preset.PrivateChat,
+            room_version: roomVersion,
+            creation_content: { type: RoomType.Space },
+            // Spell out the security-relevant defaults instead of depending on a
+            // homeserver's preset implementation. The creator remains the sole
+            // administrator (PL100) until they invite or promote someone.
+            power_level_content_override: roomCreationPowerLevels(roomVersion),
+            initial_state: [{
+                type: EventType.RoomJoinRules,
+                state_key: "",
+                content: { join_rule: isPublic ? JoinRule.Public : JoinRule.Invite }
+            }, {
+                type: EventType.RoomHistoryVisibility,
+                state_key: "",
+                // Directory visibility and public joinability do not require
+                // exposing the Space's state history to anonymous users.
+                content: { history_visibility: HistoryVisibility.Joined }
+            }]
+        });
+        roomId = validateRoomId(created.room_id);
+    } catch (error) {
+        if (isDefinitiveCreateRoomRejection(error)) {
+            fail(
+                "MATRIX_CREATE_SPACE_REJECTED",
+                "The Matrix homeserver rejected Space creation. No Space was created."
+            );
+        }
+        fail(
+            "MATRIX_CREATE_SPACE_AMBIGUOUS",
+            "Matrix could not confirm Space creation. A Space may exist; refresh before trying again."
+        );
+    }
     const result: MatrixCreateSpaceResult = { roomId };
 
     if (request.createGeneral) {
@@ -4337,24 +5199,20 @@ async function createSpace(
                 // each occupying a separate homeserver-directory entry.
                 visibility: Visibility.Private,
                 preset: isPublic ? Preset.PublicChat : Preset.PrivateChat,
-                power_level_content_override: {
-                    users: { [activeCredentials.userId]: 100 },
-                    users_default: 0,
-                    events_default: 0,
-                    state_default: 50,
-                    ban: 50,
-                    kick: 50,
-                    redact: 50,
-                    invite: 50
-                },
+                room_version: roomVersion,
+                power_level_content_override: roomCreationPowerLevels(roomVersion),
                 initial_state: initialState
             });
             generalRoomId = validateRoomId(general.room_id);
             result.generalRoomId = generalRoomId;
-        } catch {
+        } catch (error) {
             result.partial = {
-                code: "MATRIX_GENERAL_ROOM_CREATE_FAILED",
-                message: "The Matrix Space was created, but its general chat could not be created."
+                code: isDefinitiveCreateRoomRejection(error)
+                    ? "MATRIX_GENERAL_ROOM_CREATE_FAILED"
+                    : "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS",
+                message: isDefinitiveCreateRoomRejection(error)
+                    ? "The Matrix Space was created, but the homeserver rejected its general chat."
+                    : "The Matrix Space was created, but the general-chat result is unconfirmed. It may exist unlinked; refresh before making another."
             } satisfies MatrixCreateSpacePartialResult;
         }
 
@@ -4419,7 +5277,8 @@ function validateCreateSpaceChildRequest(value: unknown): MatrixCreateSpaceChild
 }
 
 async function createSpaceChild(
-    command: Extract<MatrixWorkerCommand, { type: "createSpaceChild"; }>
+    command: Extract<MatrixWorkerCommand, { type: "createSpaceChild"; }>,
+    mutationDispatched: () => void
 ): Promise<MatrixCreateSpaceChildResult> {
     if (!activeCredentials || !matrixClient) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
     const request = validateCreateSpaceChildRequest(command.request);
@@ -4431,7 +5290,14 @@ async function createSpaceChild(
     if (!parent.isSpaceRoom()) {
         fail("MATRIX_SPACE_REQUIRED", "The selected Matrix room is not a Space.");
     }
-    if (!parent.currentState.maySendStateEvent(EventType.SpaceChild, activeCredentials.userId)) {
+    const childPermission = spaceChildPermission(parent);
+    if (permissionIsUnverifiable(childPermission)) {
+        fail(
+            "MATRIX_SPACE_CHILD_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify this Space's room-link power levels."
+        );
+    }
+    if (!childPermission.allowed) {
         fail(
             "MATRIX_SPACE_CHILD_FORBIDDEN",
             "You do not have permission to add rooms to this Matrix Space."
@@ -4443,6 +5309,7 @@ async function createSpaceChild(
     const visibility = normalizeJoinRule(parent.getJoinRule()) === "public" ? "public" : "private";
     const isPublic = visibility === "public";
     const viaServer = activeServerName();
+    const roomVersion = await selectCreationRoomVersion(!isPublic);
     const initialState: Array<{
         type: string;
         state_key: string;
@@ -4486,6 +5353,7 @@ async function createSpaceChild(
 
     let roomId: string;
     try {
+        mutationDispatched();
         const created = await matrixClient.createRoom({
             name: request.name,
             topic: request.topic,
@@ -4493,17 +5361,9 @@ async function createSpaceChild(
             // so neither public nor private children are listed independently.
             visibility: Visibility.Private,
             preset: isPublic ? Preset.PublicChat : Preset.PrivateChat,
+            room_version: roomVersion,
             ...(request.kind === "space" ? { creation_content: { type: RoomType.Space } } : {}),
-            power_level_content_override: {
-                users: { [activeCredentials.userId]: 100 },
-                users_default: 0,
-                events_default: 0,
-                state_default: 50,
-                ban: 50,
-                kick: 50,
-                redact: 50,
-                invite: 50
-            },
+            power_level_content_override: roomCreationPowerLevels(roomVersion),
             initial_state: initialState
         });
         roomId = validateRoomId(created.room_id);
@@ -4570,7 +5430,14 @@ function requireSpaceChildLinkPermission(parentSpaceId: unknown, childRoomId: un
     if (parent.roomId === child.roomId || !spaceChildParentEvent(child, parent.roomId)) {
         fail("MATRIX_SPACE_CHILD_PARENT_MISMATCH", "The Matrix room does not have the selected parent Space.");
     }
-    if (!parent.currentState.maySendStateEvent(EventType.SpaceChild, activeCredentials.userId)) {
+    const childPermission = spaceChildPermission(parent);
+    if (permissionIsUnverifiable(childPermission)) {
+        fail(
+            "MATRIX_SPACE_CHILD_PERMISSION_UNVERIFIABLE",
+            "Matrix could not verify this Space's room-link power levels."
+        );
+    }
+    if (!childPermission.allowed) {
         fail(
             "MATRIX_SPACE_CHILD_FORBIDDEN",
             "You do not have permission to link rooms in this Matrix Space."
@@ -6626,7 +7493,8 @@ async function downloadMedia(command: Extract<MatrixWorkerCommand, { type: "down
 
 async function handleCommand(
     command: MatrixWorkerCommand,
-    progress: (stage: MatrixWorkerStartupStage) => void = () => undefined
+    progress: (stage: MatrixWorkerStartupStage) => void = () => undefined,
+    mutationDispatched: () => void = () => undefined
 ): Promise<MatrixWorkerResult> {
     switch (command.type) {
         case "login": return await login(command);
@@ -6637,21 +7505,25 @@ async function handleCommand(
         case "logout": await logout(); return undefined;
         case "snapshot": return snapshot();
         case "publicRooms": return await publicRooms(command);
-        case "joinRoom": return await joinRoom(command);
-        case "joinRoomAddress": return await joinRoomAddress(command);
-        case "acceptInvite": return await acceptInvite(command);
-        case "rejectInvite": return await rejectInvite(command);
+        case "joinRoom": return await joinRoom(command, mutationDispatched);
+        case "joinRoomAddress": return await joinRoomAddress(command, mutationDispatched);
+        case "acceptInvite": return await acceptInvite(command, mutationDispatched);
+        case "rejectInvite": return await rejectInvite(command, mutationDispatched);
         case "leaveRoom": return await leaveRoom(command);
-        case "createSpace": return await createSpace(command);
+        case "createSpace": return await createSpace(command, mutationDispatched);
         case "getSpaceAccess": return await getSpaceAccess(command);
         case "configureSpaceAccess": return await configureSpaceAccess(command);
         case "requestSpaceAccess": return await requestSpaceAccess(command);
         case "getSpaceAccessRequests": return await getSpaceAccessRequests(command);
         case "resolveSpaceAccessRequest": return await resolveSpaceAccessRequest(command);
-        case "createSpaceChild": return await createSpaceChild(command);
+        case "searchSpaceInviteCandidates": return await searchSpaceInviteCandidates(command);
+        case "inviteUserToSpace": return await inviteUserToSpace(command, mutationDispatched);
+        case "createSpaceChild": return await createSpaceChild(command, mutationDispatched);
         case "reconcileSpaceChildCreate": return await reconcileSpaceChildCreate(command);
         case "repairSpaceChildLink": return await repairSpaceChildLink(command);
         case "spaceChildren": return await spaceChildren(command);
+        case "suggestedSpaceChannelPlan": return await suggestedSpaceChannelPlan(command);
+        case "joinSuggestedSpaceChannels": return await joinSuggestedSpaceChannels(command, mutationDispatched);
         case "openDirectMessage": return await openDirectMessage(command);
         case "downloadMedia": return await downloadMedia(command);
         case "urlPreview": return await urlPreview(command);
@@ -6758,6 +7630,13 @@ function lifecycleCommand(command: MatrixWorkerCommand): boolean {
         || command.type === "start" || command.type === "suspend" || command.type === "logout";
 }
 
+function mutationSignalCommand(command: MatrixWorkerCommand): boolean {
+    return command.type === "createSpace" || command.type === "createSpaceChild"
+        || command.type === "inviteUserToSpace" || command.type === "acceptInvite"
+        || command.type === "rejectInvite" || command.type === "joinSuggestedSpaceChannels"
+        || command.type === "joinRoom" || command.type === "joinRoomAddress";
+}
+
 function concurrentLane(command: MatrixWorkerCommand): BoundedLane | undefined {
     switch (command.type) {
         case "downloadMedia": return mediaLane;
@@ -6765,6 +7644,7 @@ function concurrentLane(command: MatrixWorkerCommand): BoundedLane | undefined {
         case "snapshot":
         case "messageContext":
         case "searchMessages":
+        case "searchSpaceInviteCandidates":
         case "urlPreview": return metadataLane;
         default: return undefined;
     }
@@ -6876,8 +7756,15 @@ function executeOrdered(request: MatrixWorkerRequest, lifecycle: boolean): void 
                 if (generation !== schedulerGeneration) throw sessionChangedError();
             }
             window.MatrixBridgeWorkerHost.respond({ kind: "started", id: request.id });
+            let mutationReported = false;
             const result = await handleCommand(request.command, stage => {
                 window.MatrixBridgeWorkerHost.respond({ kind: "progress", id: request.id, stage });
+            }, () => {
+                if (!mutationSignalCommand(request.command) || mutationReported) {
+                    throw new PublicWorkerError("MATRIX_PROTOCOL_ERROR", "The Matrix mutation boundary was invalid.");
+                }
+                mutationReported = true;
+                window.MatrixBridgeWorkerHost.respond({ kind: "mutation", id: request.id });
             });
             // An ordered mutation which already started is allowed to finish
             // before the lifecycle command queued behind it. Rejecting its

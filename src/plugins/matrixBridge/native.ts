@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -66,7 +67,11 @@ import type {
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToSpaceRequest,
+    MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
+    MatrixJoinSuggestedSpaceChannelsRequest,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixLoginRequest,
     MatrixMediaDownloadResult,
     MatrixMemberDTO,
@@ -75,6 +80,7 @@ import type {
     MatrixMessageSearchRequest,
     MatrixMessageSearchResponse,
     MatrixMessageSearchResultDTO,
+    MatrixPowerLevelPermissionDTO,
     MatrixPublicRoomDirectoryDTO,
     MatrixPublicRoomDTO,
     MatrixReactionDTO,
@@ -95,8 +101,13 @@ import type {
     MatrixSpaceChildDTO,
     MatrixSpaceHierarchyDTO,
     MatrixSpaceHierarchyRoomDTO,
+    MatrixSpaceInviteCandidateDTO,
+    MatrixSpaceInviteCandidateSearchRequest,
+    MatrixSpaceInviteCandidateSearchResult,
     MatrixStickerSendRequest,
     MatrixStickerSendResult,
+    MatrixSuggestedSpaceChannelDTO,
+    MatrixSuggestedSpaceChannelPlanDTO,
     MatrixUrlPreviewDTO,
     MatrixUrlPreviewMediaDTO
 } from "./types";
@@ -129,10 +140,20 @@ const SECURE_VIEW_STYLE = "matrixSecureView.css";
 const ACCOUNT_DIR = join(DATA_DIR, "matrixBridge");
 const ACCOUNT_FILE = join(ACCOUNT_DIR, "account.enc");
 const SPACE_CHILD_CREATES_FILE = join(ACCOUNT_DIR, "space-child-creates.enc");
+const DEFAULT_SPACE_INVITE_DIRECTORY_LIMIT = 25;
+const MAX_SPACE_INVITE_DIRECTORY_LIMIT = 100;
+const MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH = 256;
+const MAX_CONCURRENT_SPACE_INVITE_SEARCHES = 8;
+const MAX_CONCURRENT_SPACE_INVITE_SEARCHES_PER_RENDERER = 3;
+const MAX_IN_FLIGHT_SPACE_INVITES = 128;
+const MAX_IN_FLIGHT_ROOM_INVITE_ACTIONS = 128;
+const MAX_IN_FLIGHT_ROOM_JOINS = 128;
+const MAX_IN_FLIGHT_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
 const MAX_EVENT_QUEUE = 256;
 const MAX_SHELL_EVENT_QUEUE_BYTES = 4 * 1024 * 1024;
 const LONG_POLL_MS = 25_000;
 const COMMAND_TIMEOUT_MS = 90_000;
+const SUGGESTED_SPACE_CHANNEL_JOIN_TIMEOUT_MS = 5 * 60_000;
 const COMMAND_QUEUE_TIMEOUT_MS = 5 * 60_000;
 const STARTUP_OVERALL_TIMEOUT_MS = 10 * 60_000;
 const STARTUP_STAGE_TIMEOUT_MS: Readonly<Record<MatrixWorkerStartupStage, number>> = {
@@ -211,6 +232,7 @@ interface PendingWorkerRequest {
     timer: ReturnType<typeof setTimeout>;
     commandType: MatrixWorkerCommand["type"];
     started: boolean;
+    mutationDispatched: boolean;
     startupBinding?: MatrixAccountBinding;
     startupCryptoDeadline?: number;
     startupDeadline?: number;
@@ -322,8 +344,15 @@ let privateIdentityTail: Promise<void> = Promise.resolve();
 let spaceChildCreateStateTail: Promise<void> = Promise.resolve();
 let spaceChildCreateStateLoaded = false;
 let spaceChildCreateStateError: Error | null = null;
+let concurrentSpaceInviteSearches = 0;
+const spaceInviteSearchesByRenderer = new Map<number, number>();
+const spaceInvitesInFlight = new Set<string>();
+const roomInviteActionsInFlight = new Set<string>();
+const roomJoinsInFlight = new Set<string>();
+const suggestedSpaceChannelJoinsInFlight = new Set<string>();
 const privateAccountDrainWaiters = new Set<() => void>();
 const accountBoundOperationDrainWaiters = new Set<() => void>();
+const privateAccountRequestContext = new AsyncLocalStorage<boolean>();
 
 const pendingWorkerRequests = new Map<string, PendingWorkerRequest>();
 const rendererEventQueue: MatrixBridgeEvent[] = [];
@@ -766,7 +795,12 @@ function serverNameFromMatrixIdentifier(identifier: string): string {
 
 function validateLocalRoomAddress(value: unknown, serverName: string): string {
     const address = validateString(value, "roomAddress", 1_024).trim();
-    if (!/^[#!][^\s:]+:[^\s]+$/u.test(address)) {
+    if (/^![^\s:\u0000-\u001f\u007f]+$/u.test(address)) {
+        // Opaque room-v12 IDs are domainless and are routed through the
+        // configured account homeserver by the isolated backend.
+        return address;
+    }
+    if (!/^[#!][^\s:\u0000-\u001f\u007f]+:[^\s\u0000-\u001f\u007f]+$/u.test(address)) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "Enter a full room alias or room ID.");
     }
     if (serverNameFromMatrixIdentifier(address) !== serverName) {
@@ -1264,6 +1298,31 @@ function protocolNotificationCount(value: unknown, label: string): number | unde
     return value;
 }
 
+function validateProtocolPowerLevelPermission(
+    value: unknown,
+    label: string
+): MatrixPowerLevelPermissionDTO {
+    const raw = protocolObjectKeys(value, label, ["current", "required", "allowed"]);
+    const currentValid = raw.current === "infinite" || raw.current === "unverifiable"
+        || (typeof raw.current === "number" && Number.isSafeInteger(raw.current));
+    const requiredValid = raw.required === "unverifiable"
+        || (typeof raw.required === "number" && Number.isSafeInteger(raw.required));
+    if (!currentValid || !requiredValid || typeof raw.allowed !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", `The Matrix ${label} response was invalid.`);
+    }
+    const comparable = raw.current !== "unverifiable" && raw.required !== "unverifiable";
+    const expectedAllowed = comparable && (raw.current === "infinite"
+        || Number(raw.current) >= Number(raw.required));
+    if (raw.allowed !== expectedAllowed) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", `The Matrix ${label} response was inconsistent.`);
+    }
+    return {
+        current: raw.current as MatrixPowerLevelPermissionDTO["current"],
+        required: raw.required as MatrixPowerLevelPermissionDTO["required"],
+        allowed: raw.allowed
+    };
+}
+
 function validateProtocolRoom(value: unknown): MatrixRoomDTO {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix room response was invalid.");
@@ -1321,11 +1380,27 @@ function validateProtocolRoom(value: unknown): MatrixRoomDTO {
         }
         room.canManageSpaceChildren = raw.canManageSpaceChildren;
     }
+    if (raw.spaceChildPermission !== undefined) {
+        if (kind !== "space") {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "A non-Space room exposed Space-child permission state.");
+        }
+        room.spaceChildPermission = validateProtocolPowerLevelPermission(
+            raw.spaceChildPermission,
+            "Space-child permission"
+        );
+        if (room.canManageSpaceChildren !== room.spaceChildPermission.allowed) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space-child permission response was inconsistent.");
+        }
+    }
+    if (kind === "space" && (room.canManageSpaceChildren == null || room.spaceChildPermission == null)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space-child permission response was missing.");
+    }
     const hasAccessProjection = raw.canConfigureSpaceAccess !== undefined
         || raw.accessRequestCount !== undefined
         || raw.accessRequestCountComplete !== undefined
         || raw.canApproveAccessRequests !== undefined
-        || raw.canDenyAccessRequests !== undefined;
+        || raw.canDenyAccessRequests !== undefined
+        || raw.invitePermission !== undefined;
     if (kind === "space" && raw.membership === "join") {
         if (typeof raw.canConfigureSpaceAccess !== "boolean"
             || !Number.isSafeInteger(raw.accessRequestCount)
@@ -1340,6 +1415,10 @@ function validateProtocolRoom(value: unknown): MatrixRoomDTO {
         room.accessRequestCountComplete = raw.accessRequestCountComplete;
         room.canApproveAccessRequests = raw.canApproveAccessRequests;
         room.canDenyAccessRequests = raw.canDenyAccessRequests;
+        room.invitePermission = validateProtocolPowerLevelPermission(raw.invitePermission, "Space invite permission");
+        if (room.canApproveAccessRequests !== room.invitePermission.allowed) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite permission response was inconsistent.");
+        }
     } else if (hasAccessProjection) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "A non-joined Matrix Space exposed access-request state.");
     }
@@ -1521,14 +1600,33 @@ function validateWorkerEvent(value: unknown): MatrixWorkerEvent {
 }
 
 function validateRoomActionResult(value: unknown, expectedRoomId: string): MatrixRoomActionResult {
-    if (!value || typeof value !== "object") {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix room action response was invalid.");
-    }
-    const roomId = protocolRoomId((value as Partial<MatrixRoomActionResult>).roomId);
+    const raw = protocolObjectKeys(
+        value,
+        "room action response",
+        ["roomId", "warning"],
+        ["roomId"]
+    );
+    const roomId = protocolRoomId(raw.roomId);
     if (roomId !== expectedRoomId) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix room action returned an unexpected room.");
     }
-    return { roomId };
+    if (raw.warning == null) return { roomId };
+    const warning = protocolObjectKeys(
+        raw.warning,
+        "room action warning",
+        ["code", "message"],
+        ["code", "message"]
+    );
+    if (warning.code !== "MATRIX_DM_CLASSIFICATION_FAILED") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix room action warning was invalid.");
+    }
+    return {
+        roomId,
+        warning: {
+            code: warning.code,
+            message: protocolText(warning.message, "room action warning message", 512)
+        }
+    };
 }
 
 function validateHierarchyRoom(value: unknown): MatrixSpaceHierarchyRoomDTO {
@@ -1583,6 +1681,137 @@ function validateSpaceHierarchy(value: unknown, expectedSpaceId: string): Matrix
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix space hierarchy contained duplicate rooms.");
     }
     return { spaceId, rooms };
+}
+
+function protocolSuggestedSpaceChannel(
+    value: unknown,
+    spaceId: string,
+    priorCategories: Set<string>,
+    seen: Set<string>
+): MatrixSuggestedSpaceChannelDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "suggested Space channel",
+        ["roomId", "parentSpaceId", "name", "kind", "depth", "membership", "joinRule", "avatarUrl", "topic"],
+        ["roomId", "parentSpaceId", "name", "kind", "depth", "membership", "joinRule"]
+    );
+    const roomId = protocolRoomId(raw.roomId);
+    const parentSpaceId = protocolRoomId(raw.parentSpaceId);
+    const joinRule = protocolJoinRule(raw.joinRule);
+    if (roomId === spaceId || roomId === parentSpaceId || seen.has(roomId)
+        || (raw.kind !== "space" && raw.kind !== "room")
+        || (raw.depth !== 1 && raw.depth !== 2) || (raw.membership !== "join" && raw.membership !== "leave")
+        || !joinRule
+        || (raw.membership === "leave" && joinRule !== "public"
+            && joinRule !== "restricted" && joinRule !== "knock_restricted")
+        || (raw.depth === 1 ? parentSpaceId !== spaceId : !priorCategories.has(parentSpaceId))
+        || (raw.kind === "space" && raw.depth !== 1)
+        || (raw.membership === "join" && raw.kind !== "space")) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The suggested Matrix Space channel response was invalid.");
+    }
+    seen.add(roomId);
+    if (raw.kind === "space") priorCategories.add(roomId);
+    const result: MatrixSuggestedSpaceChannelDTO = {
+        roomId,
+        parentSpaceId,
+        name: protocolText(raw.name, "suggested Space channel name", 1_024),
+        kind: raw.kind,
+        depth: raw.depth,
+        membership: raw.membership,
+        joinRule
+    };
+    if (raw.avatarUrl != null) result.avatarUrl = protocolMediaUrl(raw.avatarUrl);
+    if (raw.topic != null) result.topic = protocolText(raw.topic, "suggested Space channel topic", 2_048);
+    return result;
+}
+
+function validateProtocolSuggestedSpaceChannelPlan(
+    value: unknown,
+    expectedSpaceId: string
+): MatrixSuggestedSpaceChannelPlanDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "suggested Space channel plan",
+        ["spaceId", "planId", "scope", "channels", "limited", "complete"],
+        ["spaceId", "planId", "scope", "channels", "limited", "complete"]
+    );
+    const spaceId = protocolRoomId(raw.spaceId);
+    const planId = protocolString(raw.planId, "suggested Space channel plan ID", 69);
+    if (spaceId !== expectedSpaceId || !/^vcsp_[0-9a-f]{64}$/u.test(planId)
+        || raw.scope !== "suggested_depth_2_via_account_server"
+        || !Array.isArray(raw.channels) || raw.channels.length > 16
+        || typeof raw.limited !== "boolean" || raw.complete !== false) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The suggested Matrix Space channel plan was invalid.");
+    }
+    const categories = new Set<string>();
+    const seen = new Set<string>();
+    const channels = raw.channels.map(channel =>
+        protocolSuggestedSpaceChannel(channel, spaceId, categories, seen));
+    return {
+        spaceId,
+        planId,
+        scope: "suggested_depth_2_via_account_server",
+        channels,
+        limited: raw.limited,
+        complete: false
+    };
+}
+
+function validateJoinSuggestedSpaceChannelsRequest(value: unknown): MatrixJoinSuggestedSpaceChannelsRequest {
+    const raw = exactObjectKeys(value, "suggested Space channel join", ["spaceId", "planId"]);
+    const planId = validateString(raw.planId, "suggested Space channel plan ID", 69);
+    if (!/^vcsp_[0-9a-f]{64}$/u.test(planId)) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The suggested Matrix Space channel plan is invalid.");
+    }
+    return { spaceId: validateRoomId(raw.spaceId), planId };
+}
+
+function validateProtocolJoinSuggestedSpaceChannelsResult(
+    value: unknown,
+    request: MatrixJoinSuggestedSpaceChannelsRequest
+): MatrixJoinSuggestedSpaceChannelsResult {
+    const raw = protocolObjectKeys(
+        value,
+        "suggested Space channel join result",
+        ["spaceId", "planId", "outcomes", "limited", "complete"],
+        ["spaceId", "planId", "outcomes", "limited", "complete"]
+    );
+    const spaceId = protocolRoomId(raw.spaceId);
+    const planId = protocolString(raw.planId, "suggested Space channel plan ID", 69);
+    if (spaceId !== request.spaceId || planId !== request.planId || !Array.isArray(raw.outcomes)
+        || raw.outcomes.length > 16 || typeof raw.limited !== "boolean" || raw.complete !== false) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The suggested Matrix Space channel join result was invalid.");
+    }
+    const seen = new Set<string>();
+    const outcomes = raw.outcomes.map(value => {
+        const outcome = protocolObjectKeys(
+            value,
+            "suggested Space channel join outcome",
+            ["roomId", "parentSpaceId", "kind", "status"],
+            ["roomId", "parentSpaceId", "kind", "status"]
+        );
+        const roomId = protocolRoomId(outcome.roomId);
+        const parentSpaceId = protocolRoomId(outcome.parentSpaceId);
+        if (seen.has(roomId) || (outcome.kind !== "space" && outcome.kind !== "room")
+            || (outcome.status !== "joined" && outcome.status !== "already_joined"
+                && outcome.status !== "rejected" && outcome.status !== "blocked_by_parent")) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The suggested Matrix Space channel join outcome was invalid.");
+        }
+        seen.add(roomId);
+        return {
+            roomId,
+            parentSpaceId,
+            kind: outcome.kind as "space" | "room",
+            status: outcome.status as MatrixJoinSuggestedSpaceChannelsResult["outcomes"][number]["status"]
+        };
+    });
+    return {
+        spaceId,
+        planId,
+        outcomes,
+        limited: raw.limited,
+        complete: false
+    };
 }
 
 function validateStickerSendRequest(value: unknown): MatrixStickerSendRequest {
@@ -2007,6 +2236,17 @@ async function runAccountLifecycleTransition<T>(operation: () => Promise<T>): Pr
     accountLifecycleTransitions++;
     markAccountLifecycleChange();
     try {
+        // A secure-view request may have authenticated its exact stored/worker
+        // binding before an ordinary settings login or logout reached this
+        // transition. Freeze the old worker until every such request releases;
+        // otherwise an unbound private command could land on the replacement
+        // account. New private requests are rejected while the transition flag
+        // is set. requireStarted() has a leased fast path (and fails closed if
+        // the worker is unavailable), so a request being drained never queues a
+        // lifecycle restart behind the transition that is waiting for it.
+        if (privateAccountRequests > 0) {
+            await new Promise<void>(resolve => privateAccountDrainWaiters.add(resolve));
+        }
         if (accountBoundOperations > 0) {
             await new Promise<void>(resolve => accountBoundOperationDrainWaiters.add(resolve));
         }
@@ -2318,7 +2558,19 @@ function ambiguousAccessMutationError(error: unknown): boolean {
         || error.name === "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS");
 }
 
-async function bestEffortAccessMutationRefresh(
+function ambiguousRoomInviteMutationError(error: unknown): boolean {
+    return error instanceof Error && (error.name === "MATRIX_ROOM_INVITE_ACCEPT_AMBIGUOUS"
+        || error.name === "MATRIX_ROOM_INVITE_REJECTION_AMBIGUOUS"
+        || error.name === "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS"
+        || error.name === "MATRIX_ROOM_JOIN_AMBIGUOUS");
+}
+
+function ambiguousCreateMutationError(error: unknown): boolean {
+    return error instanceof Error && (error.name === "MATRIX_CREATE_SPACE_AMBIGUOUS"
+        || error.name === "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS");
+}
+
+async function bestEffortMutationRefresh(
     event: IpcMainInvokeEvent,
     state: SecureViewState
 ): Promise<void> {
@@ -2329,7 +2581,7 @@ async function bestEffortAccessMutationRefresh(
         // shell's next read through a fresh snapshot cut, and log only the
         // sanitized public code (never account or event data).
         shellSnapshotDirty = true;
-        console.warn(`[MatrixBridge] Access mutation succeeded or is ambiguous, but convergence refresh failed (${errorDTO(error).code}).`);
+        console.warn(`[MatrixBridge] A mutation succeeded or is ambiguous, but convergence refresh failed (${errorDTO(error).code}).`);
     }
 }
 
@@ -2340,11 +2592,45 @@ async function runPrivateAccessMutation<T>(
 ): Promise<T> {
     try {
         const result = await mutation();
-        await bestEffortAccessMutationRefresh(event, state);
+        await bestEffortMutationRefresh(event, state);
         return result;
     } catch (error) {
         if (ambiguousAccessMutationError(error)) {
-            await bestEffortAccessMutationRefresh(event, state);
+            await bestEffortMutationRefresh(event, state);
+        }
+        throw error;
+    }
+}
+
+async function runPrivateRoomInviteMutation<T>(
+    event: IpcMainInvokeEvent,
+    state: SecureViewState,
+    mutation: () => Promise<T>
+): Promise<T> {
+    try {
+        const result = await mutation();
+        await bestEffortMutationRefresh(event, state);
+        return result;
+    } catch (error) {
+        if (ambiguousRoomInviteMutationError(error)) {
+            await bestEffortMutationRefresh(event, state);
+        }
+        throw error;
+    }
+}
+
+async function runPrivateCreateMutation<T>(
+    event: IpcMainInvokeEvent,
+    state: SecureViewState,
+    mutation: () => Promise<T>
+): Promise<T> {
+    try {
+        const result = await mutation();
+        await bestEffortMutationRefresh(event, state);
+        return result;
+    } catch (error) {
+        if (ambiguousCreateMutationError(error)) {
+            await bestEffortMutationRefresh(event, state);
         }
         throw error;
     }
@@ -2991,9 +3277,48 @@ function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]
                 "MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS",
                 "Matrix could not confirm the access decision. It may already be resolved; refresh before acting again."
             );
+        case "inviteUserToSpace":
+            return bridgeError(
+                "MATRIX_SPACE_INVITE_AMBIGUOUS",
+                "Matrix could not confirm the invite. It may already be pending; refresh before trying again."
+            );
+        case "acceptInvite":
+            return bridgeError(
+                "MATRIX_ROOM_INVITE_ACCEPT_AMBIGUOUS",
+                "Matrix could not confirm whether the invitation was accepted. Refresh rooms before trying again."
+            );
+        case "rejectInvite":
+            return bridgeError(
+                "MATRIX_ROOM_INVITE_REJECTION_AMBIGUOUS",
+                "Matrix could not confirm whether the invitation was declined. Refresh rooms before trying again."
+            );
+        case "joinSuggestedSpaceChannels":
+            return bridgeError(
+                "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS",
+                "Matrix could not confirm every suggested-channel join. Refresh the server before trying again."
+            );
+        case "joinRoom":
+        case "joinRoomAddress":
+            return bridgeError(
+                "MATRIX_ROOM_JOIN_AMBIGUOUS",
+                "Matrix could not confirm whether the room was joined. Refresh rooms before trying again."
+            );
         default:
             return undefined;
     }
+}
+
+function mutationSignalCommandType(commandType: MatrixWorkerCommand["type"]): boolean {
+    return commandType === "createSpace" || commandType === "createSpaceChild"
+        || commandType === "inviteUserToSpace" || commandType === "acceptInvite"
+        || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
+        || commandType === "joinRoom" || commandType === "joinRoomAddress";
+}
+
+function accessMutationRequiresDispatchSignal(commandType: MatrixWorkerCommand["type"]): boolean {
+    return commandType === "inviteUserToSpace" || commandType === "acceptInvite"
+        || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
+        || commandType === "joinRoom" || commandType === "joinRoomAddress";
 }
 
 function rejectWorker(reason: Error): void {
@@ -3005,14 +3330,25 @@ function rejectWorker(reason: Error): void {
     for (const request of pendingWorkerRequests.values()) {
         clearTimeout(request.timer);
         const interruptedAccessMutation = request.started
+            && (!accessMutationRequiresDispatchSignal(request.commandType) || request.mutationDispatched)
             ? interruptedAccessMutationError(request.commandType)
             : undefined;
-        request.reject(request.started && request.commandType === "createSpaceChild"
+        request.reject(request.mutationDispatched && request.commandType === "createSpaceChild"
             ? bridgeError(
                 "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS",
                 "Matrix room creation was interrupted and may have succeeded. Reconcile the parent Space before trying again."
             )
-            : interruptedAccessMutation ?? reason);
+            : request.commandType === "createSpaceChild"
+                ? bridgeError(
+                    "MATRIX_CREATE_SPACE_CHILD_PRE_DISPATCH_FAILED",
+                    "Matrix room creation stopped before the homeserver mutation was dispatched. No room was created."
+                )
+                : request.mutationDispatched && request.commandType === "createSpace"
+                    ? bridgeError(
+                        "MATRIX_CREATE_SPACE_AMBIGUOUS",
+                        "Matrix Space creation was interrupted and may have succeeded. Refresh your Spaces before trying again."
+                    )
+                    : interruptedAccessMutation ?? reason);
     }
     pendingWorkerRequests.clear();
 }
@@ -3036,32 +3372,51 @@ function hasLiveWorker(): boolean {
     return Boolean(workerWindow && !workerWindow.isDestroyed() && workerReady);
 }
 
-function commandTimer(commandType: MatrixWorkerCommand["type"], queued: boolean): ReturnType<typeof setTimeout> {
+function commandTimer(
+    commandType: MatrixWorkerCommand["type"],
+    queued: boolean,
+    mutationDispatched = false
+): ReturnType<typeof setTimeout> {
     return setTimeout(() => {
-        const createSpaceMayHaveSucceeded = !queued && commandType === "createSpace";
-        const createSpaceChildMayHaveSucceeded = !queued && commandType === "createSpaceChild";
-        const interruptedAccessMutation = !queued ? interruptedAccessMutationError(commandType) : undefined;
-        const error = queued
-            ? bridgeError(
+        const createSpaceMayHaveSucceeded = !queued && mutationDispatched && commandType === "createSpace";
+        const createSpaceChildMayHaveSucceeded = !queued && mutationDispatched && commandType === "createSpaceChild";
+        const interruptedAccessMutation = !queued
+            && (!accessMutationRequiresDispatchSignal(commandType) || mutationDispatched)
+            ? interruptedAccessMutationError(commandType)
+            : undefined;
+        let error: Error;
+        if (queued) {
+            error = bridgeError(
                 "MATRIX_COMMAND_QUEUE_TIMEOUT",
                 `The Matrix ${commandType} operation could not start; its backend was restarted.`
-            )
-            : createSpaceChildMayHaveSucceeded
-                ? bridgeError(
-                    "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS",
-                    "Matrix room creation timed out and may have succeeded. Refresh the parent Space before trying again."
-                )
-                : createSpaceMayHaveSucceeded
-                    ? bridgeError(
-                        "MATRIX_CREATE_SPACE_AMBIGUOUS",
-                        "Matrix Space creation timed out and may have succeeded. Refresh your Spaces before trying again."
-                    )
-                    : interruptedAccessMutation ?? bridgeError(
-                        "MATRIX_COMMAND_TIMEOUT",
-                        `The Matrix ${commandType} operation timed out; its backend was restarted.`
-                    );
+            );
+        } else if (createSpaceChildMayHaveSucceeded) {
+            error = bridgeError(
+                "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS",
+                "Matrix room creation timed out and may have succeeded. Refresh the parent Space before trying again."
+            );
+        } else if (createSpaceMayHaveSucceeded) {
+            error = bridgeError(
+                "MATRIX_CREATE_SPACE_AMBIGUOUS",
+                "Matrix Space creation timed out and may have succeeded. Refresh your Spaces before trying again."
+            );
+        } else if (commandType === "createSpaceChild") {
+            error = bridgeError(
+                "MATRIX_CREATE_SPACE_CHILD_PRE_DISPATCH_TIMEOUT",
+                "Matrix room creation timed out before dispatch. No room was created."
+            );
+        } else {
+            error = interruptedAccessMutation ?? bridgeError(
+                "MATRIX_COMMAND_TIMEOUT",
+                `The Matrix ${commandType} operation timed out; its backend was restarted.`
+            );
+        }
         failWorker(error);
-    }, queued ? COMMAND_QUEUE_TIMEOUT_MS : COMMAND_TIMEOUT_MS);
+    }, queued
+        ? COMMAND_QUEUE_TIMEOUT_MS
+        : mutationDispatched && commandType === "joinSuggestedSpaceChannels"
+            ? SUGGESTED_SPACE_CHANNEL_JOIN_TIMEOUT_MS
+            : COMMAND_TIMEOUT_MS);
 }
 
 function startupTimeoutError(stage: MatrixWorkerStartupStage): Error {
@@ -3230,6 +3585,15 @@ function handleWorkerMessage(message: MatrixWorkerMessage): void {
             : commandTimer(pending.commandType, false);
         return;
     }
+    if (message.kind === "mutation") {
+        if (!pending.started || pending.mutationDispatched || !mutationSignalCommandType(pending.commandType)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The isolated Matrix backend returned an invalid mutation boundary.");
+        }
+        pending.mutationDispatched = true;
+        clearTimeout(pending.timer);
+        pending.timer = commandTimer(pending.commandType, false, true);
+        return;
+    }
     if (message.kind === "progress") {
         const currentIndex = pending.startupStage == null
             ? -1
@@ -3278,6 +3642,14 @@ function handleWorkerMessage(message: MatrixWorkerMessage): void {
         return;
     }
     const error = bridgeError(message.error.code, message.error.message);
+    if (pending.commandType === "createSpace" && pending.mutationDispatched
+        && error.name !== "MATRIX_CREATE_SPACE_REJECTED") {
+        pending.reject(bridgeError(
+            "MATRIX_CREATE_SPACE_AMBIGUOUS",
+            "Matrix could not confirm Space creation after dispatch. A Space may exist; refresh before trying again."
+        ));
+        return;
+    }
     if (isSessionRecoveryError(message.error) && activeWorkerBinding) {
         latchActiveSessionFailure(message.error);
         failWorker(error);
@@ -3464,6 +3836,7 @@ async function callWorker<T extends MatrixWorkerResult>(command: MatrixWorkerCom
             timer,
             commandType: command.type,
             started: false,
+            mutationDispatched: false,
             ...(command.type === "start" ? { startupBinding: accountBinding(command.account)! } : {})
         });
         workerWindow!.webContents.send(MATRIX_WORKER_COMMAND, { id, command });
@@ -3555,6 +3928,26 @@ function isAuthenticationResult(result: MatrixWorkerResult): result is { credent
 }
 
 async function requireStarted(): Promise<void> {
+    // Secure-view account requests are already counted by
+    // beginPrivateAccountRequest(). Let a healthy request finish on that exact
+    // worker while an identity transition waits for the count to drain. Never
+    // enqueue a worker restart from inside the drained request: doing so would
+    // deadlock behind the transition, and could otherwise resume on a new
+    // account after the view's authorization check.
+    if (privateAccountRequestContext.getStore() === true && !pluginSuspended && !logoutInProgress) {
+        const account = await readStoredAccount();
+        const binding = accountBinding(account);
+        if (account && (currentStatus.state === "ready" || currentStatus.state === "syncing")
+            && hasLiveWorker() && sameAccountBinding(activeWorkerBinding, binding)) {
+            return;
+        }
+        if (privateAccountRequests > 0) {
+            throw bridgeError(
+                "MATRIX_SESSION_CHANGED",
+                "The Matrix account worker changed during an isolated account request. Refresh and try again."
+            );
+        }
+    }
     // Starting is a lifecycle transition too. Serializing it with explicit
     // start/login/logout prevents two ordinary renderer calls from issuing
     // competing worker `start` commands and canceling the poller's startup.
@@ -3994,44 +4387,144 @@ async function publicRooms(_: IpcMainInvokeEvent): Promise<MatrixPublicRoomDirec
     return validateProtocolPublicRoomDirectory(result);
 }
 
-async function joinRoom(_: IpcMainInvokeEvent, roomId: string): Promise<MatrixJoinRoomResult> {
-    await requireStarted();
-    const targetRoomId = validateRoomId(roomId);
-    const result = await callWorker<MatrixJoinRoomResult>({ type: "joinRoom", roomId: targetRoomId });
-    if (!result || typeof result !== "object" || typeof result.roomId !== "string") {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix join response was invalid.");
+async function runRoomJoin<T>(
+    binding: MatrixAccountBinding,
+    target: string,
+    operation: () => Promise<T>
+): Promise<T> {
+    const operationKey = JSON.stringify([
+        binding.homeserver,
+        binding.userId,
+        binding.deviceId,
+        binding.storageKey,
+        target
+    ]);
+    if (roomJoinsInFlight.has(operationKey)) {
+        throw bridgeError("MATRIX_ROOM_JOIN_IN_PROGRESS", "That Matrix room is already being joined.");
     }
-    const joinedRoomId = validateRoomId(result.roomId);
-    if (joinedRoomId !== targetRoomId) {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix join response did not match the requested room.");
+    if (roomJoinsInFlight.size >= MAX_IN_FLIGHT_ROOM_JOINS) {
+        throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many room joins pending.");
     }
-    return { roomId: joinedRoomId };
+    roomJoinsInFlight.add(operationKey);
+    try {
+        return await operation();
+    } finally {
+        roomJoinsInFlight.delete(operationKey);
+    }
 }
 
-async function joinRoomAddress(_: IpcMainInvokeEvent, address: string): Promise<MatrixJoinRoomResult> {
-    const account = await readStoredAccount();
-    if (!account) throw bridgeError("MATRIX_ACCOUNT_MISSING", "No Matrix account is configured.");
-    await requireStarted();
-    const localAddress = validateLocalRoomAddress(address, serverNameFromMatrixIdentifier(account.userId));
-    const result = await callWorker<MatrixJoinRoomResult>({ type: "joinRoomAddress", address: localAddress });
-    if (!result || typeof result !== "object" || typeof result.roomId !== "string") {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix join response was invalid.");
-    }
-    return { roomId: validateRoomId(result.roomId) };
+async function joinRoom(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    expectedUserId: string
+): Promise<MatrixJoinRoomResult> {
+    const targetRoomId = validateRoomId(roomId);
+    return await withExpectedMatrixAccount(expectedUserId, binding =>
+        runRoomJoin(binding, targetRoomId, async () => {
+            const result = await callWorker<MatrixJoinRoomResult>({ type: "joinRoom", roomId: targetRoomId });
+            try {
+                if (!result || typeof result !== "object" || typeof result.roomId !== "string") throw new Error();
+                const joinedRoomId = validateRoomId(result.roomId);
+                if (joinedRoomId !== targetRoomId) throw new Error();
+                return { roomId: joinedRoomId };
+            } catch {
+                throw bridgeError(
+                    "MATRIX_ROOM_JOIN_AMBIGUOUS",
+                    "Matrix joined a room but returned an invalid confirmation. Refresh rooms before trying again."
+                );
+            }
+        }));
 }
 
-async function acceptInvite(_: IpcMainInvokeEvent, roomId: string): Promise<MatrixRoomActionResult> {
-    await requireStarted();
-    const targetRoomId = validateRoomId(roomId);
-    const result = await callWorker<MatrixRoomActionResult>({ type: "acceptInvite", roomId: targetRoomId });
-    return validateRoomActionResult(result, targetRoomId);
+async function joinRoomAddress(
+    _: IpcMainInvokeEvent,
+    address: string,
+    expectedUserId: string
+): Promise<MatrixJoinRoomResult> {
+    return await withExpectedMatrixAccount(expectedUserId, binding => {
+        const localAddress = validateLocalRoomAddress(address, serverNameFromMatrixIdentifier(binding.userId));
+        return runRoomJoin(binding, localAddress, async () => {
+            const result = await callWorker<MatrixJoinRoomResult>({
+                type: "joinRoomAddress",
+                address: localAddress
+            });
+            try {
+                if (!result || typeof result !== "object" || typeof result.roomId !== "string") throw new Error();
+                const joinedRoomId = validateRoomId(result.roomId);
+                const accountServer = serverNameFromMatrixIdentifier(binding.userId);
+                if (localAddress.startsWith("!")
+                    ? joinedRoomId !== localAddress
+                    : joinedRoomId.includes(":")
+                        && serverNameFromMatrixIdentifier(joinedRoomId) !== accountServer) {
+                    throw new Error();
+                }
+                return { roomId: joinedRoomId };
+            } catch {
+                throw bridgeError(
+                    "MATRIX_ROOM_JOIN_AMBIGUOUS",
+                    "Matrix joined a room but returned an invalid confirmation. Refresh rooms before trying again."
+                );
+            }
+        });
+    });
 }
 
-async function rejectInvite(_: IpcMainInvokeEvent, roomId: string): Promise<MatrixRoomActionResult> {
-    await requireStarted();
+async function roomInviteAction(
+    commandType: "acceptInvite" | "rejectInvite",
+    roomId: string,
+    expectedUserId: string
+): Promise<MatrixRoomActionResult> {
     const targetRoomId = validateRoomId(roomId);
-    const result = await callWorker<MatrixRoomActionResult>({ type: "rejectInvite", roomId: targetRoomId });
-    return validateRoomActionResult(result, targetRoomId);
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const operationKey = JSON.stringify([
+            binding.homeserver,
+            binding.userId,
+            binding.deviceId,
+            binding.storageKey,
+            targetRoomId
+        ]);
+        if (roomInviteActionsInFlight.has(operationKey)) {
+            throw bridgeError("MATRIX_ROOM_INVITE_ACTION_IN_PROGRESS", "That Matrix invitation is already being handled.");
+        }
+        if (roomInviteActionsInFlight.size >= MAX_IN_FLIGHT_ROOM_INVITE_ACTIONS) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending invitation actions.");
+        }
+        roomInviteActionsInFlight.add(operationKey);
+        try {
+            const result = await callWorker<MatrixRoomActionResult>({ type: commandType, roomId: targetRoomId });
+            try {
+                return validateRoomActionResult(result, targetRoomId);
+            } catch {
+                throw commandType === "acceptInvite"
+                    ? bridgeError(
+                        "MATRIX_ROOM_INVITE_ACCEPT_AMBIGUOUS",
+                        "Matrix accepted the invitation but returned an invalid confirmation. Refresh rooms before trying again."
+                    )
+                    : bridgeError(
+                        "MATRIX_ROOM_INVITE_REJECTION_AMBIGUOUS",
+                        "Matrix declined the invitation but returned an invalid confirmation. Refresh rooms before trying again."
+                    );
+            }
+        } finally {
+            roomInviteActionsInFlight.delete(operationKey);
+        }
+    });
+}
+
+async function acceptInvite(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    expectedUserId: string
+): Promise<MatrixRoomActionResult> {
+    return await roomInviteAction("acceptInvite", roomId, expectedUserId);
+}
+
+async function rejectInvite(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    expectedUserId: string
+): Promise<MatrixRoomActionResult> {
+    return await roomInviteAction("rejectInvite", roomId, expectedUserId);
 }
 
 async function leaveRoom(
@@ -4092,45 +4585,67 @@ function validateCreateSpaceRequest(value: unknown): MatrixCreateSpaceRequest {
 
 async function createSpace(
     _: IpcMainInvokeEvent,
-    request: MatrixCreateSpaceRequest
+    request: MatrixCreateSpaceRequest,
+    expectedUserId: string
 ): Promise<MatrixCreateSpaceResult> {
-    await requireStarted();
     const validatedRequest = validateCreateSpaceRequest(request);
-    const result = await callWorker<MatrixCreateSpaceResult>({
-        type: "createSpace",
-        request: validatedRequest
+    return await withExpectedMatrixAccount(expectedUserId, async () => {
+        if (createSpaceInFlight) {
+            throw bridgeError(
+                "MATRIX_CREATE_SPACE_IN_PROGRESS",
+                "A Matrix Space is already being created."
+            );
+        }
+        createSpaceInFlight = true;
+        try {
+            // Only validation of a resolved worker response is remapped below.
+            // Definitive pre-dispatch capability/argument failures and definitive
+            // worker rejections retain their original safe-to-retry taxonomy.
+            const result = await callWorker<MatrixCreateSpaceResult>({
+                type: "createSpace",
+                request: validatedRequest
+            });
+            try {
+                if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error();
+                const roomId = protocolRoomId(result.roomId);
+                const generalRoomId = result.generalRoomId == null ? undefined : protocolRoomId(result.generalRoomId);
+                let partial: MatrixCreateSpaceResult["partial"];
+                if (result.partial != null) {
+                    if (typeof result.partial !== "object" || Array.isArray(result.partial)) throw new Error();
+                    const code = result.partial.code as MatrixCreateSpacePartialCode;
+                    if (code !== "MATRIX_GENERAL_ROOM_CREATE_FAILED"
+                        && code !== "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS"
+                        && code !== "MATRIX_GENERAL_ROOM_LINK_FAILED") {
+                        throw new Error();
+                    }
+                    partial = {
+                        code,
+                        message: protocolString(result.partial.message, "space partial-result message", 300)
+                    };
+                }
+                if (generalRoomId === roomId
+                    || (!validatedRequest.createGeneral && (generalRoomId || partial))
+                    || (validatedRequest.createGeneral && !generalRoomId && !partial)
+                    || ((partial?.code === "MATRIX_GENERAL_ROOM_CREATE_FAILED"
+                        || partial?.code === "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS") && generalRoomId)
+                    || (partial?.code === "MATRIX_GENERAL_ROOM_LINK_FAILED" && !generalRoomId)) {
+                    throw new Error();
+                }
+                return {
+                    roomId,
+                    ...(generalRoomId ? { generalRoomId } : {}),
+                    ...(partial ? { partial } : {})
+                };
+            } catch {
+                throw bridgeError(
+                    "MATRIX_CREATE_SPACE_AMBIGUOUS",
+                    "Matrix created a Space but returned an invalid confirmation. Refresh Spaces before trying again."
+                );
+            }
+        } finally {
+            createSpaceInFlight = false;
+        }
     });
-    if (!result || typeof result !== "object" || Array.isArray(result)) {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix space creation response was invalid.");
-    }
-    const roomId = protocolRoomId(result.roomId);
-    const generalRoomId = result.generalRoomId == null ? undefined : protocolRoomId(result.generalRoomId);
-    let partial: MatrixCreateSpaceResult["partial"];
-    if (result.partial != null) {
-        if (typeof result.partial !== "object" || Array.isArray(result.partial)) {
-            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix space partial result was invalid.");
-        }
-        const code = result.partial.code as MatrixCreateSpacePartialCode;
-        if (code !== "MATRIX_GENERAL_ROOM_CREATE_FAILED" && code !== "MATRIX_GENERAL_ROOM_LINK_FAILED") {
-            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix space partial result was invalid.");
-        }
-        partial = {
-            code,
-            message: protocolString(result.partial.message, "space partial-result message", 300)
-        };
-    }
-    if (generalRoomId === roomId
-        || (!validatedRequest.createGeneral && (generalRoomId || partial))
-        || (validatedRequest.createGeneral && !generalRoomId && !partial)
-        || (partial?.code === "MATRIX_GENERAL_ROOM_CREATE_FAILED" && generalRoomId)
-        || (partial?.code === "MATRIX_GENERAL_ROOM_LINK_FAILED" && !generalRoomId)) {
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix space creation response was inconsistent.");
-    }
-    return {
-        roomId,
-        ...(generalRoomId ? { generalRoomId } : {}),
-        ...(partial ? { partial } : {})
-    };
 }
 
 const SPACE_JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
@@ -4504,6 +5019,223 @@ async function resolveSpaceAccessRequest(
     });
 }
 
+function validateSpaceInviteCandidateSearchRequest(value: unknown): Required<MatrixSpaceInviteCandidateSearchRequest> {
+    const raw = objectRecord(value, "Matrix Space invite search");
+    if (!Object.keys(raw).every(key => key === "spaceId" || key === "query" || key === "limit")) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search contains unsupported fields.");
+    }
+    const query = validateString(
+        raw.query,
+        "Space invite search query",
+        MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH,
+        true
+    ).trim();
+    if (/[\u0000-\u001f\u007f]/u.test(query)) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search query is invalid.");
+    }
+    const limit = raw.limit ?? DEFAULT_SPACE_INVITE_DIRECTORY_LIMIT;
+    if (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > MAX_SPACE_INVITE_DIRECTORY_LIMIT) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite search limit is invalid.");
+    }
+    return { spaceId: validateRoomId(raw.spaceId), query, limit: Number(limit) };
+}
+
+function validateInviteUserToSpaceRequest(value: unknown): MatrixInviteUserToSpaceRequest {
+    const raw = objectRecord(value, "Matrix Space invite");
+    if (Object.keys(raw).length !== 2 || !Object.hasOwn(raw, "spaceId") || !Object.hasOwn(raw, "userId")) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space invite contains invalid fields.");
+    }
+    return { spaceId: validateRoomId(raw.spaceId), userId: validateUserId(raw.userId) };
+}
+
+function validateProtocolSpaceInviteCandidate(
+    value: unknown,
+    expectedServerName: string,
+    expectedUserId: string
+): MatrixSpaceInviteCandidateDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "Space invite candidate",
+        ["userId", "displayName", "avatarUrl", "membership"],
+        ["userId", "membership"]
+    );
+    const userId = protocolUserId(raw.userId);
+    if (userId === expectedUserId || serverNameFromMatrixIdentifier(userId) !== expectedServerName
+        || (raw.membership !== "none" && raw.membership !== "leave" && raw.membership !== "knock"
+            && raw.membership !== "invite" && raw.membership !== "join")) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite candidate response was invalid.");
+    }
+    const candidate: MatrixSpaceInviteCandidateDTO = {
+        userId,
+        membership: raw.membership
+    };
+    if (raw.displayName != null) {
+        const displayName = protocolText(raw.displayName, "Space invite candidate display name", 256);
+        if (/[\u0000-\u001f\u007f]/u.test(displayName)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite candidate response was invalid.");
+        }
+        candidate.displayName = displayName;
+    }
+    if (raw.avatarUrl != null) candidate.avatarUrl = protocolMediaUrl(raw.avatarUrl);
+    return candidate;
+}
+
+function validateProtocolSpaceInviteCandidateSearchResult(
+    value: unknown,
+    request: Required<MatrixSpaceInviteCandidateSearchRequest>,
+    binding: MatrixAccountBinding
+): MatrixSpaceInviteCandidateSearchResult {
+    const raw = protocolObjectKeys(value, "Space invite search", [
+        "spaceId",
+        "query",
+        "scope",
+        "candidates",
+        "limited",
+        "directoryLimited",
+        "complete",
+        "queryRequired"
+    ]);
+    if (protocolRoomId(raw.spaceId) !== request.spaceId
+        || protocolText(raw.query, "Space invite search query", MAX_SPACE_INVITE_DIRECTORY_QUERY_LENGTH, true) !== request.query
+        || raw.scope !== "homeserver_user_directory" || !Array.isArray(raw.candidates)
+        || raw.candidates.length > request.limit || typeof raw.limited !== "boolean"
+        || typeof raw.directoryLimited !== "boolean" || raw.complete !== false
+        || typeof raw.queryRequired !== "boolean" || (raw.directoryLimited && !raw.limited)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite search response was invalid.");
+    }
+    const expectedServerName = serverNameFromMatrixIdentifier(binding.userId);
+    const candidates = raw.candidates.map(candidate => validateProtocolSpaceInviteCandidate(
+        candidate,
+        expectedServerName,
+        binding.userId
+    ));
+    if (new Set(candidates.map(candidate => candidate.userId)).size !== candidates.length
+        || (raw.queryRequired && (request.query !== "" || candidates.length > 0
+            || raw.limited || raw.directoryLimited))) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite search response was inconsistent.");
+    }
+    return {
+        spaceId: request.spaceId,
+        query: request.query,
+        scope: "homeserver_user_directory",
+        candidates,
+        limited: raw.limited,
+        directoryLimited: raw.directoryLimited,
+        complete: false,
+        queryRequired: raw.queryRequired
+    };
+}
+
+function validateProtocolInviteUserToSpaceResult(
+    value: unknown,
+    request: MatrixInviteUserToSpaceRequest,
+    expectedServerName: string
+): MatrixInviteUserToSpaceResult {
+    const raw = protocolObjectKeys(
+        value,
+        "Space invite result",
+        ["spaceId", "userId", "membership", "changed"]
+    );
+    const userId = protocolUserId(raw.userId);
+    if (protocolRoomId(raw.spaceId) !== request.spaceId || userId !== request.userId
+        || serverNameFromMatrixIdentifier(userId) !== expectedServerName
+        || (raw.membership !== "invite" && raw.membership !== "join")
+        || typeof raw.changed !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix Space invite result was invalid.");
+    }
+    return {
+        spaceId: request.spaceId,
+        userId: request.userId,
+        membership: raw.membership,
+        changed: raw.changed
+    };
+}
+
+async function searchSpaceInviteCandidates(
+    event: IpcMainInvokeEvent,
+    request: MatrixSpaceInviteCandidateSearchRequest,
+    expectedUserId: string
+): Promise<MatrixSpaceInviteCandidateSearchResult> {
+    const rendererId = event.sender.id;
+    const rendererCount = spaceInviteSearchesByRenderer.get(rendererId) ?? 0;
+    if (concurrentSpaceInviteSearches >= MAX_CONCURRENT_SPACE_INVITE_SEARCHES
+        || rendererCount >= MAX_CONCURRENT_SPACE_INVITE_SEARCHES_PER_RENDERER) {
+        throw bridgeError(
+            "MATRIX_SPACE_INVITE_SEARCH_BUSY",
+            "Too many Matrix user-directory searches are already running."
+        );
+    }
+    concurrentSpaceInviteSearches++;
+    spaceInviteSearchesByRenderer.set(rendererId, rendererCount + 1);
+    try {
+        return await withExpectedMatrixAccount(expectedUserId, async binding => {
+            const validatedRequest = validateSpaceInviteCandidateSearchRequest(request);
+            const result = await callWorker<MatrixSpaceInviteCandidateSearchResult>({
+                type: "searchSpaceInviteCandidates",
+                request: validatedRequest
+            });
+            return validateProtocolSpaceInviteCandidateSearchResult(result, validatedRequest, binding);
+        });
+    } finally {
+        concurrentSpaceInviteSearches--;
+        const remaining = (spaceInviteSearchesByRenderer.get(rendererId) ?? 1) - 1;
+        if (remaining > 0) spaceInviteSearchesByRenderer.set(rendererId, remaining);
+        else spaceInviteSearchesByRenderer.delete(rendererId);
+    }
+}
+
+async function inviteUserToSpace(
+    _: IpcMainInvokeEvent,
+    request: MatrixInviteUserToSpaceRequest,
+    expectedUserId: string
+): Promise<MatrixInviteUserToSpaceResult> {
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const validatedRequest = validateInviteUserToSpaceRequest(request);
+        if (serverNameFromMatrixIdentifier(validatedRequest.userId)
+            !== serverNameFromMatrixIdentifier(binding.userId)) {
+            throw bridgeError(
+                "MATRIX_REMOTE_USER_REJECTED",
+                "Only users on this account's Matrix server can be invited here."
+            );
+        }
+        const operationKey = JSON.stringify([
+            binding.homeserver,
+            binding.userId,
+            binding.deviceId,
+            binding.storageKey,
+            validatedRequest.spaceId,
+            validatedRequest.userId
+        ]);
+        if (spaceInvitesInFlight.has(operationKey)) {
+            throw bridgeError("MATRIX_SPACE_INVITE_IN_PROGRESS", "That Matrix user is already being invited.");
+        }
+        if (spaceInvitesInFlight.size >= MAX_IN_FLIGHT_SPACE_INVITES) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many pending invites.");
+        }
+        spaceInvitesInFlight.add(operationKey);
+        try {
+            const result = await callWorker<MatrixInviteUserToSpaceResult>({
+                type: "inviteUserToSpace",
+                request: validatedRequest
+            });
+            try {
+                return validateProtocolInviteUserToSpaceResult(
+                    result,
+                    validatedRequest,
+                    serverNameFromMatrixIdentifier(binding.userId)
+                );
+            } catch {
+                throw bridgeError(
+                    "MATRIX_SPACE_INVITE_AMBIGUOUS",
+                    "Matrix sent the invite but returned an invalid confirmation. Refresh before trying again."
+                );
+            }
+        } finally {
+            spaceInvitesInFlight.delete(operationKey);
+        }
+    });
+}
+
 function validateCreateSpaceChildRequest(value: unknown): MatrixCreateSpaceChildRequest {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix Space child details are invalid.");
@@ -4528,14 +5260,11 @@ function validateCreateSpaceChildRequest(value: unknown): MatrixCreateSpaceChild
     return request;
 }
 
-async function createSpaceChild(
-    _: IpcMainInvokeEvent,
-    request: MatrixCreateSpaceChildRequest
+async function createSpaceChildForBinding(
+    request: MatrixCreateSpaceChildRequest,
+    binding: MatrixAccountBinding
 ): Promise<MatrixCreateSpaceChildResult> {
     const validatedRequest = validateCreateSpaceChildRequest(request);
-    await requireStarted();
-    const binding = activeWorkerBinding;
-    if (!binding) throw bridgeError("MATRIX_WORKER_UNAVAILABLE", "The isolated Matrix backend is unavailable.");
     if (createSpaceChildInFlight) {
         throw bridgeError(
             "MATRIX_CREATE_SPACE_CHILD_IN_PROGRESS",
@@ -4543,7 +5272,6 @@ async function createSpaceChild(
         );
     }
 
-    const releaseAccount = beginAccountBoundOperation(binding);
     createSpaceChildInFlight = true;
     try {
         const latchKey = spaceChildCreateLatchKey(binding, validatedRequest.parentSpaceId);
@@ -4587,10 +5315,15 @@ async function createSpaceChild(
             const definitive = error instanceof Error && (
                 error.name === "MATRIX_INVALID_ARGUMENT"
                 || error.name === "MATRIX_NOT_STARTED"
+                || error.name === "MATRIX_WORKER_UNAVAILABLE"
                 || error.name === "MATRIX_ROOM_NOT_JOINED"
                 || error.name === "MATRIX_SPACE_REQUIRED"
                 || error.name === "MATRIX_SPACE_CHILD_FORBIDDEN"
+                || error.name === "MATRIX_SPACE_CHILD_PERMISSION_UNVERIFIABLE"
+                || error.name === "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED"
                 || error.name === "MATRIX_CREATE_SPACE_CHILD_REJECTED"
+                || error.name === "MATRIX_CREATE_SPACE_CHILD_PRE_DISPATCH_FAILED"
+                || error.name === "MATRIX_CREATE_SPACE_CHILD_PRE_DISPATCH_TIMEOUT"
                 || error.name === "MATRIX_BACKEND_BUSY"
                 || error.name === "MATRIX_COMMAND_QUEUE_TIMEOUT"
                 || error.name === "MATRIX_SESSION_CHANGED"
@@ -4676,27 +5409,30 @@ async function createSpaceChild(
         }
         return result;
     } finally {
-        releaseAccount();
         createSpaceChildInFlight = false;
     }
 }
 
-async function repairSpaceChildLink(
+async function createSpaceChild(
     _: IpcMainInvokeEvent,
+    request: MatrixCreateSpaceChildRequest,
+    expectedUserId: string
+): Promise<MatrixCreateSpaceChildResult> {
+    return await withExpectedMatrixAccount(expectedUserId, binding =>
+        createSpaceChildForBinding(request, binding));
+}
+
+async function repairSpaceChildLinkForBinding(
     parentSpaceId: string,
-    childRoomId: string
+    childRoomId: string,
+    binding: MatrixAccountBinding
 ): Promise<MatrixRoomActionResult> {
     const targetParentSpaceId = validateRoomId(parentSpaceId);
     const targetChildRoomId = validateRoomId(childRoomId);
     if (targetParentSpaceId === targetChildRoomId) {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "A Matrix Space cannot be its own child.");
     }
-    await requireStarted();
-    const binding = activeWorkerBinding;
-    if (!binding) throw bridgeError("MATRIX_WORKER_UNAVAILABLE", "The isolated Matrix backend is unavailable.");
-    const releaseAccount = beginAccountBoundOperation(binding);
-    try {
-        const latchKey = spaceChildCreateLatchKey(binding, targetParentSpaceId);
+    const latchKey = spaceChildCreateLatchKey(binding, targetParentSpaceId);
         const pending = await runSpaceChildCreateState(async () => {
         await loadSpaceChildCreateState();
         const value = ambiguousSpaceChildCreates.get(latchKey);
@@ -4731,23 +5467,25 @@ async function repairSpaceChildLink(
             }
         });
         }
-        return validatedResult;
-    } finally {
-        releaseAccount();
-    }
+    return validatedResult;
 }
 
-async function reconcileSpaceChildCreate(
+async function repairSpaceChildLink(
     _: IpcMainInvokeEvent,
-    parentSpaceId: string
+    parentSpaceId: string,
+    childRoomId: string,
+    expectedUserId: string
+): Promise<MatrixRoomActionResult> {
+    return await withExpectedMatrixAccount(expectedUserId, binding =>
+        repairSpaceChildLinkForBinding(parentSpaceId, childRoomId, binding));
+}
+
+async function reconcileSpaceChildCreateForBinding(
+    parentSpaceId: string,
+    binding: MatrixAccountBinding
 ): Promise<MatrixReconcileSpaceChildCreateResult> {
     const targetParentSpaceId = validateRoomId(parentSpaceId);
-    await requireStarted();
-    const binding = activeWorkerBinding;
-    if (!binding) throw bridgeError("MATRIX_WORKER_UNAVAILABLE", "The isolated Matrix backend is unavailable.");
-    const releaseAccount = beginAccountBoundOperation(binding);
-    try {
-        const latchKey = spaceChildCreateLatchKey(binding, targetParentSpaceId);
+    const latchKey = spaceChildCreateLatchKey(binding, targetParentSpaceId);
         const pending = await runSpaceChildCreateState(async () => {
         await loadSpaceChildCreateState();
         const value = ambiguousSpaceChildCreates.get(latchKey);
@@ -4797,10 +5535,16 @@ async function reconcileSpaceChildCreate(
             throw error;
         }
         });
-        return { resolved: true, roomId };
-    } finally {
-        releaseAccount();
-    }
+    return { resolved: true, roomId };
+}
+
+async function reconcileSpaceChildCreate(
+    _: IpcMainInvokeEvent,
+    parentSpaceId: string,
+    expectedUserId: string
+): Promise<MatrixReconcileSpaceChildCreateResult> {
+    return await withExpectedMatrixAccount(expectedUserId, binding =>
+        reconcileSpaceChildCreateForBinding(parentSpaceId, binding));
 }
 
 async function spaceChildren(
@@ -4822,6 +5566,64 @@ async function spaceChildren(
         maxDepth
     });
     return validateSpaceHierarchy(result, targetSpaceId);
+}
+
+async function suggestedSpaceChannelPlan(
+    _: IpcMainInvokeEvent,
+    spaceId: string,
+    expectedUserId: string
+): Promise<MatrixSuggestedSpaceChannelPlanDTO> {
+    const targetSpaceId = validateRoomId(spaceId);
+    return await withExpectedMatrixAccount(expectedUserId, async () => {
+        const result = await callWorker<MatrixSuggestedSpaceChannelPlanDTO>({
+            type: "suggestedSpaceChannelPlan",
+            spaceId: targetSpaceId
+        });
+        return validateProtocolSuggestedSpaceChannelPlan(result, targetSpaceId);
+    });
+}
+
+async function joinSuggestedSpaceChannels(
+    _: IpcMainInvokeEvent,
+    request: MatrixJoinSuggestedSpaceChannelsRequest,
+    expectedUserId: string
+): Promise<MatrixJoinSuggestedSpaceChannelsResult> {
+    const validatedRequest = validateJoinSuggestedSpaceChannelsRequest(request);
+    return await withExpectedMatrixAccount(expectedUserId, async binding => {
+        const operationKey = JSON.stringify([
+            binding.homeserver,
+            binding.userId,
+            binding.deviceId,
+            binding.storageKey,
+            validatedRequest.spaceId
+        ]);
+        if (suggestedSpaceChannelJoinsInFlight.has(operationKey)) {
+            throw bridgeError(
+                "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_IN_PROGRESS",
+                "Suggested channels are already being joined for this Matrix Space."
+            );
+        }
+        if (suggestedSpaceChannelJoinsInFlight.size >= MAX_IN_FLIGHT_SUGGESTED_SPACE_CHANNEL_JOINS) {
+            throw bridgeError("MATRIX_BACKEND_BUSY", "The Matrix backend has too many suggested-channel joins pending.");
+        }
+        suggestedSpaceChannelJoinsInFlight.add(operationKey);
+        try {
+            const result = await callWorker<MatrixJoinSuggestedSpaceChannelsResult>({
+                type: "joinSuggestedSpaceChannels",
+                request: validatedRequest
+            });
+            try {
+                return validateProtocolJoinSuggestedSpaceChannelsResult(result, validatedRequest);
+            } catch {
+                throw bridgeError(
+                    "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS",
+                    "Matrix joined suggested channels but returned an invalid confirmation. Refresh the server before trying again."
+                );
+            }
+        } finally {
+            suggestedSpaceChannelJoinsInFlight.delete(operationKey);
+        }
+    });
 }
 
 async function openDirectMessage(
@@ -5444,6 +6246,13 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
                 ["type", "spaceId"]
             );
             break;
+        case "suggestedSpaceChannelPlan":
+            exactObjectKeys(request, "secure view request", ["type", "spaceId"]);
+            break;
+        case "joinSuggestedSpaceChannels":
+            exactObjectKeys(request, "secure view request", ["type", "request"]);
+            validateJoinSuggestedSpaceChannelsRequest(request.request);
+            break;
         case "openDirectMessage":
             exactObjectKeys(request, "secure view request", ["type", "spaceId", "userId"]);
             break;
@@ -5752,54 +6561,23 @@ async function handlePrivateRequest(
         }
         case "publicRooms":
             return await publicRooms(event);
-        case "joinRoom": {
-            const result = await joinRoom(event, request.roomId);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
-        case "joinRoomAddress": {
-            const result = await joinRoomAddress(event, request.address);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
-        case "acceptInvite": {
-            const result = await acceptInvite(event, request.roomId);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
-        case "rejectInvite": {
-            const result = await rejectInvite(event, request.roomId);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
-        case "leaveRoom": {
-            const expectedUserId = state.boundAccount?.userId;
-            if (!expectedUserId) {
-                throw bridgeError(
-                    "MATRIX_SECURE_VIEW_ACCOUNT_STALE",
-                    "Reload the secure Matrix view before leaving this room."
-                );
-            }
-            const result = await leaveRoom(event, request.roomId, expectedUserId);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
-        case "createSpace": {
-            if (createSpaceInFlight) {
-                throw bridgeError(
-                    "MATRIX_CREATE_SPACE_IN_PROGRESS",
-                    "A Matrix Space is already being created."
-                );
-            }
-            createSpaceInFlight = true;
-            try {
-                const result = await createSpace(event, request.request);
-                await refreshConvergenceSnapshot(event, state);
-                return result;
-            } finally {
-                createSpaceInFlight = false;
-            }
-        }
+        case "joinRoom": return await runPrivateRoomInviteMutation(event, state, () =>
+            joinRoom(event, request.roomId, secureViewExpectedUserId(state)));
+        case "joinRoomAddress": return await runPrivateRoomInviteMutation(event, state, () =>
+            joinRoomAddress(event, request.address, secureViewExpectedUserId(state)));
+        case "acceptInvite": return await runPrivateRoomInviteMutation(event, state, () =>
+            acceptInvite(event, request.roomId, secureViewExpectedUserId(state)));
+        case "rejectInvite": return await runPrivateRoomInviteMutation(event, state, () =>
+            rejectInvite(event, request.roomId, secureViewExpectedUserId(state)));
+        case "suggestedSpaceChannelPlan": return await suggestedSpaceChannelPlan(
+            event, request.spaceId, secureViewExpectedUserId(state)
+        );
+        case "joinSuggestedSpaceChannels": return await runPrivateRoomInviteMutation(event, state, () =>
+            joinSuggestedSpaceChannels(event, request.request, secureViewExpectedUserId(state)));
+        case "leaveRoom": return await runPrivateRoomInviteMutation(event, state, () =>
+            leaveRoom(event, request.roomId, secureViewExpectedUserId(state)));
+        case "createSpace": return await runPrivateCreateMutation(event, state, () =>
+            createSpace(event, request.request, secureViewExpectedUserId(state)));
         case "getSpaceAccess":
             return await getSpaceAccess(event, request.spaceId, secureViewExpectedUserId(state));
         case "configureSpaceAccess": {
@@ -5817,26 +6595,32 @@ async function handlePrivateRequest(
                 event, request.request, secureViewExpectedUserId(state)
             ));
         }
-        case "createSpaceChild": {
-            const result = await createSpaceChild(event, request.request);
-            await refreshConvergenceSnapshot(event, state);
-            return result;
-        }
+        case "createSpaceChild": return await runPrivateCreateMutation(event, state, () =>
+            createSpaceChild(event, request.request, secureViewExpectedUserId(state)));
         case "reconcileSpaceChildCreate": {
-            const result = await reconcileSpaceChildCreate(event, request.parentSpaceId);
-            if (result.resolved) await refreshConvergenceSnapshot(event, state);
+            const result = await reconcileSpaceChildCreate(
+                event,
+                request.parentSpaceId,
+                secureViewExpectedUserId(state)
+            );
+            if (result.resolved) await bestEffortMutationRefresh(event, state);
             return result;
         }
         case "repairSpaceChildLink": {
-            const result = await repairSpaceChildLink(event, request.parentSpaceId, request.childRoomId);
-            await refreshConvergenceSnapshot(event, state);
+            const result = await repairSpaceChildLink(
+                event,
+                request.parentSpaceId,
+                request.childRoomId,
+                secureViewExpectedUserId(state)
+            );
+            await bestEffortMutationRefresh(event, state);
             return result;
         }
         case "spaceChildren":
             return await spaceChildren(event, request.spaceId, request.limit, request.maxDepth);
         case "openDirectMessage": {
             const result = await openDirectMessage(event, request.spaceId, request.userId);
-            await refreshConvergenceSnapshot(event, state);
+            await bestEffortMutationRefresh(event, state);
             return result;
         }
         case "paginate":
@@ -5927,11 +6711,13 @@ async function handleAuthorizedPrivateRequest(
 
     const release = beginPrivateAccountRequest(state);
     try {
-        await requireStoredSecureViewAccount(state);
-        if (secureViewStateForSender(event, state.generation) !== state) {
-            throw bridgeError("MATRIX_SECURE_VIEW_UNTRUSTED", "The secure Matrix view request was rejected.");
-        }
-        return await handlePrivateRequest(event, state, request);
+        return await privateAccountRequestContext.run(true, async () => {
+            await requireStoredSecureViewAccount(state);
+            if (secureViewStateForSender(event, state.generation) !== state) {
+                throw bridgeError("MATRIX_SECURE_VIEW_UNTRUSTED", "The secure Matrix view request was rejected.");
+            }
+            return await handlePrivateRequest(event, state, request);
+        });
     } finally {
         release();
     }
@@ -6209,8 +6995,10 @@ export {
     getSpaceAccess,
     getSpaceAccessRequests,
     getStatus,
+    inviteUserToSpace,
     joinRoom,
     joinRoomAddress,
+    joinSuggestedSpaceChannels,
     leaveRoom,
     login,
     logout,
@@ -6229,12 +7017,14 @@ export {
     requestSpaceAccess,
     resolveSpaceAccessRequest,
     searchMessages,
+    searchSpaceInviteCandidates,
     sendAttachment,
     sendSticker,
     sendText,
     snapshot,
     spaceChildren,
     start,
+    suggestedSpaceChannelPlan,
     suspend,
     typing,
     urlPreview

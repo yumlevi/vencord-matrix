@@ -20,6 +20,8 @@ import type {
     MatrixDirectMessageResult,
     MatrixHistoryPageDTO,
     MatrixJoinRoomResult,
+    MatrixJoinSuggestedSpaceChannelsRequest,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixLoginRequest,
     MatrixMediaDownloadResult,
     MatrixMessageContextDTO,
@@ -42,6 +44,7 @@ import type {
     MatrixSpaceHierarchyDTO,
     MatrixStickerSendRequest,
     MatrixStickerSendResult,
+    MatrixSuggestedSpaceChannelPlanDTO,
     MatrixUrlPreviewDTO
 } from "./types";
 
@@ -213,6 +216,11 @@ export interface MatrixSecureViewRequestMap {
     joinRoomAddress: { input: { address: string; }; output: MatrixJoinRoomResult; };
     acceptInvite: { input: { roomId: string; }; output: MatrixRoomActionResult; };
     rejectInvite: { input: { roomId: string; }; output: MatrixRoomActionResult; };
+    suggestedSpaceChannelPlan: { input: { spaceId: string; }; output: MatrixSuggestedSpaceChannelPlanDTO; };
+    joinSuggestedSpaceChannels: {
+        input: { request: MatrixJoinSuggestedSpaceChannelsRequest; };
+        output: MatrixJoinSuggestedSpaceChannelsResult;
+    };
     leaveRoom: { input: { roomId: string; }; output: MatrixRoomActionResult; };
     createSpace: { input: { request: MatrixCreateSpaceRequest; }; output: MatrixCreateSpaceResult; };
     getSpaceAccess: { input: { spaceId: string; }; output: MatrixSpaceAccessSummaryDTO; };

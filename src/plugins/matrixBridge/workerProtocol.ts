@@ -18,7 +18,11 @@ import type {
     MatrixCreateSpaceResult,
     MatrixDirectMessageResult,
     MatrixHistoryPageDTO,
+    MatrixInviteUserToSpaceRequest,
+    MatrixInviteUserToSpaceResult,
     MatrixJoinRoomResult,
+    MatrixJoinSuggestedSpaceChannelsRequest,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixLoginRequest,
     MatrixMediaDownloadResult,
     MatrixMessageContextDTO,
@@ -37,8 +41,11 @@ import type {
     MatrixSpaceAccessRequestListDTO,
     MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
+    MatrixSpaceInviteCandidateSearchRequest,
+    MatrixSpaceInviteCandidateSearchResult,
     MatrixStickerSendRequest,
     MatrixStickerSendResult,
+    MatrixSuggestedSpaceChannelPlanDTO,
     MatrixUrlPreviewDTO
 } from "./types";
 
@@ -83,6 +90,8 @@ export type MatrixWorkerCommand =
     | { type: "requestSpaceAccess"; joinName: string; }
     | { type: "getSpaceAccessRequests"; spaceId: string; }
     | { type: "resolveSpaceAccessRequest"; request: MatrixResolveSpaceAccessRequest; }
+    | { type: "searchSpaceInviteCandidates"; request: MatrixSpaceInviteCandidateSearchRequest; }
+    | { type: "inviteUserToSpace"; request: MatrixInviteUserToSpaceRequest; }
     | { type: "createSpaceChild"; request: MatrixCreateSpaceChildRequest; creationMarker: string; }
     | { type: "reconcileSpaceChildCreate"; parentSpaceId: string; creationMarker: string; }
     | {
@@ -92,6 +101,8 @@ export type MatrixWorkerCommand =
         creationMarker?: string;
     }
     | { type: "spaceChildren"; spaceId: string; limit: number; maxDepth: number; }
+    | { type: "suggestedSpaceChannelPlan"; spaceId: string; }
+    | { type: "joinSuggestedSpaceChannels"; request: MatrixJoinSuggestedSpaceChannelsRequest; }
     | { type: "openDirectMessage"; spaceId: string; userId: string; }
     | { type: "downloadMedia"; roomId: string; eventId: string; attachmentIndex: number; }
     | { type: "urlPreview"; roomId: string; eventId: string; }
@@ -121,6 +132,8 @@ export type MatrixWorkerResult =
     | MatrixDirectMessageResult
     | MatrixMediaDownloadResult
     | MatrixHistoryPageDTO
+    | MatrixInviteUserToSpaceResult
+    | MatrixJoinSuggestedSpaceChannelsResult
     | MatrixMessageContextDTO
     | MatrixMessageSearchResponse
     | MatrixPublicRoomDirectoryDTO
@@ -130,6 +143,8 @@ export type MatrixWorkerResult =
     | MatrixSpaceAccessRequestListDTO
     | MatrixSpaceAccessSummaryDTO
     | MatrixSpaceHierarchyDTO
+    | MatrixSpaceInviteCandidateSearchResult
+    | MatrixSuggestedSpaceChannelPlanDTO
     | MatrixStickerSendResult
     | MatrixAttachmentSendResult
     | MatrixUrlPreviewDTO
@@ -160,6 +175,8 @@ export type MatrixWorkerMessage =
     | { kind: "ready"; }
     | { kind: "event"; revision: number; event: MatrixWorkerEvent; }
     | { kind: "started"; id: string; }
+    /** Emitted immediately before a homeserver mutation whose lost response is ambiguous. */
+    | { kind: "mutation"; id: string; }
     | { kind: "progress"; id: string; stage: MatrixWorkerStartupStage; }
     | { kind: "response"; id: string; ok: true; result: MatrixWorkerResult; }
     | { kind: "response"; id: string; ok: false; error: MatrixBridgeError; };

@@ -14,11 +14,20 @@ import {
     TextArea,
     TextInput,
     Toasts,
+    useEffect,
     useRef,
     useState,
 } from "@webpack/common";
 
-import { canManageMatrixSpaceChildren, Native, refreshSnapshot } from "./bridge";
+import {
+    getCurrentMatrixSpaceCreateContext,
+    type MatrixSpaceCreateContext,
+    Native,
+    refreshSnapshot,
+    registerMatrixManagementModal,
+    subscribeMatrixSpaceProjection,
+    unregisterMatrixManagementModal,
+} from "./bridge";
 import { matrixErrorCode } from "./errorCode";
 import type {
     MatrixCreateSpaceChildResult,
@@ -29,17 +38,57 @@ type CreationPhase = "idle" | "creating" | "refreshing" | "reconciling" | "repai
 
 let childCreationInFlight = false;
 
-const SPACE_CHILD_PERMISSION_ERROR = "You do not have Matrix permission to add channels or categories to this Space.";
+const SPACE_CHILD_PERMISSION_ERROR = "You do not have permission to add channels or categories to this server.";
+const CONTEXT_CHANGED_ERROR = "This server or signed-in account changed. Close this window and try again.";
 const CREATED_CHILD_SYNC_TIMEOUT_MS = 20_000;
 const CREATED_CHILD_REFRESH_INTERVAL_MS = 750;
 
 function publicError(error: unknown) {
     const code = matrixErrorCode(error);
+    if (code === "MATRIX_RENDERER_CONTEXT_CHANGED") return CONTEXT_CHANGED_ERROR;
     if (code === "MATRIX_SPACE_CHILD_FORBIDDEN") return SPACE_CHILD_PERMISSION_ERROR;
     if (code === "MATRIX_CREATE_SPACE_CHILD_REJECTED") {
-        return "The homeserver rejected room creation. No Matrix room was created.";
+        return "The account provider rejected creation. No channel or category was created.";
     }
-    return error instanceof Error ? error.message : "Matrix could not create this item.";
+    if (code === "MATRIX_CREATE_ROOM_VERSION_UNSUPPORTED") {
+        return "Your account provider cannot create a compatible channel or category. No item was created.";
+    }
+    if (code === "MATRIX_CREATE_SPACE_CHILD_STATE_WRITE_FAILED") {
+        return "The server could not safely record this creation. No retry was started.";
+    }
+    return "The server could not create or link this item. Try again.";
+}
+
+function contextChangedError() {
+    const error = new Error(CONTEXT_CHANGED_ERROR);
+    error.name = "MATRIX_RENDERER_CONTEXT_CHANGED";
+    return error;
+}
+
+function currentContext(expected: MatrixSpaceCreateContext, requirePermission = false) {
+    const current = getCurrentMatrixSpaceCreateContext(expected);
+    if (!current || requirePermission && !current.canManageSpaceChildren) return undefined;
+    return current;
+}
+
+function requireCurrentContext(expected: MatrixSpaceCreateContext, requirePermission = false) {
+    const current = currentContext(expected, requirePermission);
+    if (!current) throw contextChangedError();
+    return current;
+}
+
+function useProjectionRevision() {
+    const [, setRevision] = useState(0);
+    useEffect(() => subscribeMatrixSpaceProjection(() => setRevision(value => value + 1)), []);
+}
+
+function permissionMessage(context: MatrixSpaceCreateContext) {
+    const { current, required } = context.permission;
+    if (current === "unverifiable" || required === "unverifiable") {
+        return "The server could not verify permission to add channels or categories.";
+    }
+    const currentLabel = current === "infinite" ? "\u221e" : current;
+    return `Your server permission level is ${currentLabel}; adding channels or categories requires ${required}.`;
 }
 
 function creationLabel(kind: MatrixSpaceChildKind) {
@@ -63,7 +112,7 @@ function snapshotContainsCreatedChild(
 }
 
 async function waitForCreatedChild(
-    parentSpaceId: string,
+    expected: MatrixSpaceCreateContext,
     childRoomId: string,
     kind: MatrixSpaceChildKind
 ) {
@@ -71,16 +120,20 @@ async function waitForCreatedChild(
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const polling = (async () => {
         while (!stopped) {
+            requireCurrentContext(expected);
             try {
-                const snapshot = await refreshSnapshot();
-                if (snapshotContainsCreatedChild(snapshot, parentSpaceId, childRoomId, kind)) return true;
-            } catch {
+                const snapshot = await refreshSnapshot(expected.generation);
+                requireCurrentContext(expected);
+                if (snapshotContainsCreatedChild(snapshot, expected.parentSpaceId, childRoomId, kind)) return true;
+            } catch (error) {
+                if (!currentContext(expected)) throw contextChangedError();
                 // /createRoom already succeeded. Keep waiting for the normal
                 // sync/event projection instead of turning refresh into a
                 // false create failure that invites a duplicate.
             }
             if (!stopped) {
                 await new Promise(resolve => setTimeout(resolve, CREATED_CHILD_REFRESH_INTERVAL_MS));
+                requireCurrentContext(expected);
             }
         }
         return false;
@@ -89,7 +142,9 @@ async function waitForCreatedChild(
         timeout = setTimeout(() => resolve(false), CREATED_CHILD_SYNC_TIMEOUT_MS);
     });
     try {
-        return await Promise.race([polling, deadline]);
+        const result = await Promise.race([polling, deadline]);
+        requireCurrentContext(expected);
+        return result;
     } finally {
         stopped = true;
         if (timeout !== undefined) clearTimeout(timeout);
@@ -98,17 +153,16 @@ async function waitForCreatedChild(
 
 function CreateSpaceChildModal({
     modalProps,
-    parentLabel,
-    parentSpaceId,
+    expected,
     initialKind,
     lockKind,
 }: {
     modalProps: RenderModalProps;
-    parentLabel: string;
-    parentSpaceId: string;
+    expected: MatrixSpaceCreateContext;
     initialKind: MatrixSpaceChildKind;
     lockKind: boolean;
 }) {
+    useProjectionRevision();
     const [kind, setKind] = useState<MatrixSpaceChildKind>(initialKind);
     const [name, setName] = useState("");
     const [topic, setTopic] = useState("");
@@ -117,50 +171,71 @@ function CreateSpaceChildModal({
     const [needsReconcile, setNeedsReconcile] = useState(false);
     const [pendingRepairRoomId, setPendingRepairRoomId] = useState<string>();
     const started = useRef(false);
+    const mounted = useRef(true);
     const cleanName = name.trim();
     const busy = phase !== "idle";
-    const canManageSpaceChildren = canManageMatrixSpaceChildren(parentSpaceId);
+    const context = currentContext(expected);
+    const canManageSpaceChildren = context?.canManageSpaceChildren === true;
     const formLocked = busy || needsReconcile || Boolean(pendingRepairRoomId) || !canManageSpaceChildren;
+
+    useEffect(() => () => {
+        mounted.current = false;
+    }, []);
 
     async function refreshAndClose(
         successMessage: string,
         childRoomId: string,
         childKind: MatrixSpaceChildKind
     ) {
-        setPhase("refreshing");
+        if (mounted.current) setPhase("refreshing");
         let projected = false;
         try {
-            projected = await waitForCreatedChild(parentSpaceId, childRoomId, childKind);
+            projected = await waitForCreatedChild(expected, childRoomId, childKind);
+            requireCurrentContext(expected);
         } finally {
             childCreationInFlight = false;
-            modalProps.onClose();
+            if (mounted.current) modalProps.onClose();
         }
-
+        if (!currentContext(expected)) return;
         showToast(
             projected
                 ? successMessage
-                : `${successMessage} Matrix is still syncing it into Discord; do not create a duplicate.`,
+                : `${successMessage} The server is still syncing it; do not create a duplicate.`,
             projected ? Toasts.Type.SUCCESS : Toasts.Type.MESSAGE
         );
     }
 
     async function reconcileCreation() {
         if (busy || childCreationInFlight) return;
+        if (!currentContext(expected, true)) {
+            setError(context ? permissionMessage(context) : CONTEXT_CHANGED_ERROR);
+            return;
+        }
         childCreationInFlight = true;
         setPhase("reconciling");
         setError("");
         try {
-            const result = await Native.reconcileSpaceChildCreate(parentSpaceId);
+            requireCurrentContext(expected, true);
+            const result = await Native.reconcileSpaceChildCreate(
+                expected.parentSpaceId,
+                expected.expectedAccountId
+            );
+            requireCurrentContext(expected);
             if (!result.resolved) {
-                setPhase("idle");
-                setError("Matrix has not found the created room yet. Check again later; do not create a replacement.");
+                if (mounted.current) {
+                    setPhase("idle");
+                    setError("The server has not found the created item yet. Check again later; do not create a replacement.");
+                }
                 return;
             }
-            setNeedsReconcile(false);
-            await refreshAndClose("Recovered and linked the Matrix item.", result.roomId, kind);
+            if (mounted.current) setNeedsReconcile(false);
+            await refreshAndClose("Recovered and linked the item.", result.roomId, kind);
+            requireCurrentContext(expected);
         } catch (caught) {
-            setPhase("idle");
-            setError(publicError(caught));
+            if (mounted.current) {
+                setPhase("idle");
+                setError(publicError(caught));
+            }
         } finally {
             childCreationInFlight = false;
         }
@@ -168,20 +243,35 @@ function CreateSpaceChildModal({
 
     async function repairChildLink(roomId = pendingRepairRoomId, operationAlreadyOwned = false) {
         if (!roomId || (!operationAlreadyOwned && (busy || childCreationInFlight))) return;
+        if (!currentContext(expected, true)) {
+            if (mounted.current) setError(context ? permissionMessage(context) : CONTEXT_CHANGED_ERROR);
+            return;
+        }
         if (!operationAlreadyOwned) childCreationInFlight = true;
-        setPhase("repairing");
-        setError("");
+        if (mounted.current) {
+            setPhase("repairing");
+            setError("");
+        }
         try {
-            await Native.repairSpaceChildLink(parentSpaceId, roomId);
-            setPendingRepairRoomId(undefined);
+            requireCurrentContext(expected, true);
+            await Native.repairSpaceChildLink(
+                expected.parentSpaceId,
+                roomId,
+                expected.expectedAccountId
+            );
+            requireCurrentContext(expected);
+            if (mounted.current) setPendingRepairRoomId(undefined);
             await refreshAndClose(
-                `Created and linked the Matrix ${creationLabel(kind)} "${cleanName}".`,
+                `Created and linked the ${creationLabel(kind)} "${cleanName}".`,
                 roomId,
                 kind
             );
+            requireCurrentContext(expected);
         } catch (caught) {
-            setPhase("idle");
-            setError(`The item exists, but its Space link still needs repair. ${publicError(caught)}`);
+            if (mounted.current) {
+                setPhase("idle");
+                setError(`The item exists, but its Space link still needs repair. ${publicError(caught)}`);
+            }
         } finally {
             childCreationInFlight = false;
         }
@@ -189,12 +279,17 @@ function CreateSpaceChildModal({
 
     async function createChild() {
         if (!cleanName || busy || started.current) return;
-        if (!canManageMatrixSpaceChildren(parentSpaceId)) {
-            setError(SPACE_CHILD_PERMISSION_ERROR);
+        const before = currentContext(expected);
+        if (!before) {
+            setError(CONTEXT_CHANGED_ERROR);
+            return;
+        }
+        if (!before.canManageSpaceChildren) {
+            setError(permissionMessage(before));
             return;
         }
         if (childCreationInFlight) {
-            setError("Another Matrix channel or category is already being created.");
+            setError("Another channel or category is already being created.");
             return;
         }
 
@@ -204,31 +299,44 @@ function CreateSpaceChildModal({
         setPhase("creating");
         let result: MatrixCreateSpaceChildResult;
         try {
+            requireCurrentContext(expected, true);
             result = await Native.createSpaceChild({
-                parentSpaceId,
+                parentSpaceId: expected.parentSpaceId,
                 kind,
                 name: cleanName,
                 topic: topic.trim() || undefined,
-            });
+            }, expected.expectedAccountId);
+            requireCurrentContext(expected);
         } catch (caught) {
             const code = matrixErrorCode(caught);
-            if (code === "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS"
-                || code === "MATRIX_CREATE_SPACE_CHILD_RECONCILE_REQUIRED") {
+            if ((code === "MATRIX_CREATE_SPACE_CHILD_AMBIGUOUS"
+                || code === "MATRIX_CREATE_SPACE_CHILD_RECONCILE_REQUIRED")
+                && currentContext(expected)) {
                 started.current = false;
-                setNeedsReconcile(true);
-                setPhase("reconciling");
+                if (mounted.current) {
+                    setNeedsReconcile(true);
+                    setPhase("reconciling");
+                }
                 try {
-                    const reconciled = await Native.reconcileSpaceChildCreate(parentSpaceId);
+                    requireCurrentContext(expected, true);
+                    const reconciled = await Native.reconcileSpaceChildCreate(
+                        expected.parentSpaceId,
+                        expected.expectedAccountId
+                    );
+                    requireCurrentContext(expected);
                     if (reconciled.resolved) {
-                        setNeedsReconcile(false);
-                        await refreshAndClose("Recovered and linked the Matrix item.", reconciled.roomId, kind);
-                    } else {
+                        if (mounted.current) setNeedsReconcile(false);
+                        await refreshAndClose("Recovered and linked the item.", reconciled.roomId, kind);
+                        requireCurrentContext(expected);
+                    } else if (mounted.current) {
                         setPhase("idle");
-                        setError("Creation may have succeeded, but Matrix has not found it yet. Check again later; do not create a replacement.");
+                        setError("Creation may have succeeded, but the server has not found it yet. Check again later; do not create a replacement.");
                     }
                 } catch (reconcileError) {
-                    setPhase("idle");
-                    setError(publicError(reconcileError));
+                    if (mounted.current) {
+                        setPhase("idle");
+                        setError(publicError(reconcileError));
+                    }
                 } finally {
                     childCreationInFlight = false;
                 }
@@ -237,27 +345,38 @@ function CreateSpaceChildModal({
 
             started.current = false;
             childCreationInFlight = false;
-            setPhase("idle");
-            setError(publicError(caught));
+            if (mounted.current) {
+                setPhase("idle");
+                setError(publicError(caught));
+            }
             return;
         }
 
         const label = creationLabel(kind);
         if (result.partial) {
-            setPendingRepairRoomId(result.roomId);
-            started.current = false;
-            setPhase("idle");
+            if (mounted.current) {
+                setPendingRepairRoomId(result.roomId);
+                started.current = false;
+                setPhase("idle");
+            }
             await repairChildLink(result.roomId, true);
+            requireCurrentContext(expected);
         } else {
-            await refreshAndClose(`Created Matrix ${label} "${cleanName}".`, result.roomId, kind);
+            await refreshAndClose(`Created ${label} "${cleanName}".`, result.roomId, kind);
+            requireCurrentContext(expected);
         }
     }
+
+    const permissionError = !context
+        ? CONTEXT_CHANGED_ERROR
+        : !context.canManageSpaceChildren ? permissionMessage(context) : "";
 
     return (
         <Modal
             {...modalProps}
-            title="Create in Matrix Space"
-            subtitle={`Add a channel or category to ${parentLabel}.`}
+            onClose={busy ? () => undefined : modalProps.onClose}
+            title={kind === "space" ? "Create Category" : "Create Channel"}
+            subtitle={`Add it to ${expected.parentLabel}.`}
             actions={[
                 {
                     text: "Cancel",
@@ -343,11 +462,10 @@ function CreateSpaceChildModal({
                     />
                 </label>
                 <p className="vc-matrix-create-security">
-                    Access is inherited from the parent Matrix Space. Private channels are encrypted;
-                    categories are nested Matrix Spaces.
+                    Access is inherited from the parent server. Private channels use end-to-end encryption.
                 </p>
-                {!canManageSpaceChildren && !error && (
-                    <div className="vc-matrix-error" role="alert">{SPACE_CHILD_PERMISSION_ERROR}</div>
+                {permissionError && !error && (
+                    <div className="vc-matrix-error" role="alert">{permissionError}</div>
                 )}
                 {error && <div className="vc-matrix-error" role="alert">{error}</div>}
             </div>
@@ -356,18 +474,24 @@ function CreateSpaceChildModal({
 }
 
 export function openMatrixSpaceChildModal(
-    parentSpaceId: string,
-    parentLabel: string,
+    expectedContext: MatrixSpaceCreateContext,
     initialKind: MatrixSpaceChildKind = "room",
     lockKind = false
 ) {
-    openModal(modalProps => (
-        <CreateSpaceChildModal
-            modalProps={modalProps}
-            parentLabel={parentLabel}
-            parentSpaceId={parentSpaceId}
-            initialKind={initialKind}
-            lockKind={lockKind}
-        />
-    ));
+    const context = getCurrentMatrixSpaceCreateContext(expectedContext);
+    if (!context) return false;
+    let modalKey = "";
+    modalKey = openModal(
+        modalProps => (
+            <CreateSpaceChildModal
+                modalProps={modalProps}
+                expected={context}
+                initialKind={initialKind}
+                lockKind={lockKind}
+            />
+        ),
+        { onCloseCallback: () => unregisterMatrixManagementModal(modalKey) }
+    );
+    registerMatrixManagementModal(modalKey);
+    return true;
 }

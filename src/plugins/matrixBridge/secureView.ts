@@ -11,12 +11,19 @@ import type {
     MatrixSecureViewRoute,
     MatrixSecureViewSecurityState,
 } from "./secureViewProtocol";
+import {
+    suggestedChannelConsentRows,
+    suggestedChannelJoinSummary,
+    suggestedChannelPlanDisclosure,
+    waitForSuggestedChannelPlan,
+} from "./suggestedChannels";
 import type {
     MatrixAttachmentDTO,
     MatrixBridgeEvent,
     MatrixBridgeStatus,
     MatrixConfigureSpaceAccessResult,
     MatrixHistoryPageDTO,
+    MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMessageDTO,
     MatrixMessageSearchResultDTO,
     MatrixPublicRoomDirectoryDTO,
@@ -28,11 +35,12 @@ import type {
     MatrixSpaceAccessRequestListDTO,
     MatrixSpaceAccessSummaryDTO,
     MatrixSpaceHierarchyDTO,
+    MatrixSuggestedSpaceChannelPlanDTO,
     MatrixUrlPreviewDTO,
 } from "./types";
 
 type Child = Node | string | number | false | null | undefined;
-type Overlay = "createSpace" | "directMessage" | "search" | null;
+type Overlay = "createSpace" | "directMessage" | "search" | "suggestedChannels" | null;
 type AuthMode = "login" | "register" | "token";
 type MediaState = "loading" | "ready" | "error";
 type MediaTombstone = "error" | "evicted" | "deferred";
@@ -122,6 +130,7 @@ const MEDIA_DOWNLOAD_CONCURRENCY = 3;
 const URL_PATTERN = /https?:\/\/[^\s<>]+/iu;
 const JOIN_NAME_MAX_LENGTH = 64;
 const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const MATRIX_ROOM_ADDRESS_PATTERN = /^(?:#[^\s:]+:[^\s]+|![^\s:]+(?::[^\s]+)?)$/u;
 const BIDI_FORMATTING_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const host = window.MatrixSecureViewHost;
 function requireRoot() {
@@ -175,6 +184,13 @@ let spaceCreationInFlight = false;
 let joinAddressBusy = false;
 let joinNameBusy = false;
 let directMessageBusy = false;
+let suggestedChannelsLoading: string | undefined;
+let suggestedChannelPlan: MatrixSuggestedSpaceChannelPlanDTO | undefined;
+let suggestedChannelExpectedUserId: string | undefined;
+let suggestedChannelJoinBusy = false;
+let suggestedChannelReplanReason: "ambiguous" | "stale" | undefined;
+let suggestedChannelMessage = "";
+let suggestedChannelError = "";
 let joinAddressValue = "";
 let joinNameValue = "";
 let joinNameError = "";
@@ -584,6 +600,13 @@ function clearSensitiveUiState() {
     joinAddressBusy = false;
     joinNameBusy = false;
     directMessageBusy = false;
+    suggestedChannelsLoading = undefined;
+    suggestedChannelPlan = undefined;
+    suggestedChannelExpectedUserId = undefined;
+    suggestedChannelJoinBusy = false;
+    suggestedChannelReplanReason = undefined;
+    suggestedChannelMessage = "";
+    suggestedChannelError = "";
     joinAddressValue = "";
     joinNameValue = "";
     joinNameError = "";
@@ -1543,67 +1566,277 @@ async function resolveSpaceAccessRequest(spaceId: string, userId: string, decisi
 }
 
 async function joinRoom(roomId: string) {
-    if (!host) return;
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || !isCurrentSecureAccount(expectedUserId)) return;
     const generation = uiGeneration;
+    let result;
     try {
-        const result = await host.request({ type: "joinRoom", roomId });
-        if (generation !== uiGeneration) return;
-        await refresh();
-        if (generation !== uiGeneration) return;
+        result = await host.request({ type: "joinRoom", roomId });
+    } catch (error) {
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (errorCode(error) === "MATRIX_ROOM_JOIN_AMBIGUOUS") {
+            showToast("The server could not confirm whether the room was joined. Refresh before trying again.", "info");
+            await refresh(false, false, false);
+        } else {
+            showToast(errorText(error), "error");
+        }
+        return;
+    }
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    const refreshed = await refresh(false, false, false);
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    if (refreshed) {
         const joined = roomById(result.roomId);
         setRoute({ kind: joined && isSpace(joined) ? "space" : "room", roomId: result.roomId });
-        showToast("Joined on Matrix.", "success");
-    } catch (error) {
-        if (generation === uiGeneration) showToast(errorText(error), "error");
+        showToast("Joined.", "success");
+        if (joined && isSpace(joined)) await showSuggestedChannels(joined.roomId, expectedUserId);
+    } else {
+        showToast("The room was joined, but rooms could not be refreshed yet. Use Refresh to check again.", "info");
     }
 }
 
 async function joinAddress(address: string) {
-    if (!host || !address.trim() || joinAddressBusy) return;
+    const expectedUserId = config?.userId;
+    const normalizedAddress = address.trim();
+    if (!host || !normalizedAddress || joinAddressBusy || !expectedUserId || !isCurrentSecureAccount(expectedUserId)) return;
+    if (normalizedAddress.length > 512 || !MATRIX_ROOM_ADDRESS_PATTERN.test(normalizedAddress)) {
+        showToast("Use #alias:server, !legacy-id:server, or a domainless room ID such as !opaque.", "error");
+        return;
+    }
     const generation = uiGeneration;
     joinAddressBusy = true;
     scheduleRender();
+    let result;
     try {
-        const result = await host.request({ type: "joinRoomAddress", address: address.trim() });
-        if (generation !== uiGeneration) return;
-        await refresh();
-        if (generation !== uiGeneration) return;
-        const joined = roomById(result.roomId);
-        setRoute({ kind: joined && isSpace(joined) ? "space" : "room", roomId: result.roomId });
-        joinAddressValue = "";
-        showToast("Joined on Matrix.", "success");
+        result = await host.request({ type: "joinRoomAddress", address: normalizedAddress });
     } catch (error) {
-        if (generation === uiGeneration) showToast(errorText(error), "error");
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+            if (errorCode(error) === "MATRIX_ROOM_JOIN_AMBIGUOUS") {
+                showToast("The server could not confirm whether the address was joined. Refresh before trying again.", "info");
+                await refresh(false, false, false);
+            } else {
+                showToast(errorText(error), "error");
+            }
+        }
+        if (generation === uiGeneration) joinAddressBusy = false;
+        scheduleRender();
+        return;
+    }
+    try {
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        joinAddressValue = "";
+        const refreshed = await refresh(false, false, false);
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (refreshed) {
+            const joined = roomById(result.roomId);
+            setRoute({ kind: joined && isSpace(joined) ? "space" : "room", roomId: result.roomId });
+            showToast("Joined.", "success");
+            if (joined && isSpace(joined)) await showSuggestedChannels(joined.roomId, expectedUserId);
+        } else {
+            showToast("The address was joined, but rooms could not be refreshed yet. Use Refresh to check again.", "info");
+        }
     } finally {
         if (generation === uiGeneration) joinAddressBusy = false;
         scheduleRender();
     }
 }
 
-async function acceptInvite(roomId: string) {
-    if (!host) return;
+function clearSuggestedChannelOverlayState() {
+    suggestedChannelPlan = undefined;
+    suggestedChannelExpectedUserId = undefined;
+    suggestedChannelJoinBusy = false;
+    suggestedChannelReplanReason = undefined;
+    suggestedChannelMessage = "";
+    suggestedChannelError = "";
+}
+
+async function loadSecureSuggestedChannelPlan(spaceId: string, expectedUserId: string, generation: number) {
+    if (!host) return undefined;
+    return await waitForSuggestedChannelPlan(
+        () => host.request({ type: "suggestedSpaceChannelPlan", spaceId }),
+        () => generation === uiGeneration && isCurrentSecureAccount(expectedUserId),
+        caught => errorCode(caught) === "MATRIX_ROOM_NOT_JOINED"
+    );
+}
+
+async function showSuggestedChannels(
+    spaceId: string,
+    expectedUserId = config?.userId,
+    accepted = false
+) {
+    if (!host || !expectedUserId || !isCurrentSecureAccount(expectedUserId) || suggestedChannelsLoading) return;
     const generation = uiGeneration;
+    suggestedChannelsLoading = spaceId;
+    scheduleRender();
     try {
-        await host.request({ type: "acceptInvite", roomId });
-        if (generation !== uiGeneration) return;
-        await refresh();
-        if (generation !== uiGeneration) return;
+        const plan = await loadSecureSuggestedChannelPlan(spaceId, expectedUserId, generation);
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (!plan) {
+            showToast(accepted
+                ? "Invitation was accepted, but suggested channels are still syncing. No channels were joined. Open server settings later and select Suggested Channels."
+                : "Suggested channels are still syncing. No channels were joined. Try again later.", "info");
+            return;
+        }
+        if (!plan.channels.some(channel => channel.membership === "leave")) {
+            if (!accepted) showToast("There are no new provider-suggested channels to join.", "info");
+            return;
+        }
+        suggestedChannelPlan = plan;
+        suggestedChannelExpectedUserId = expectedUserId;
+        suggestedChannelReplanReason = undefined;
+        suggestedChannelMessage = "";
+        suggestedChannelError = "";
+        overlay = "suggestedChannels";
+    } catch {
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) {
+            showToast(accepted
+                ? "Invitation was accepted, but suggested channels could not be loaded. No channels were joined. Open server settings later and select Suggested Channels."
+                : "Suggested channels could not be loaded. No channels were joined. Try again later.", "info");
+        }
+    } finally {
+        if (generation === uiGeneration) suggestedChannelsLoading = undefined;
+        scheduleRender();
+    }
+}
+
+async function refreshSecureSuggestedPlan(
+    reason: "ambiguous" | "stale",
+    previousPlanId: string,
+    expectedUserId: string,
+    generation: number
+) {
+    if (!host || !suggestedChannelPlan) return;
+    if (reason === "ambiguous") await refresh(false, false, false);
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    try {
+        const nextPlan = await host.request({
+            type: "suggestedSpaceChannelPlan",
+            spaceId: suggestedChannelPlan.spaceId,
+        });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (reason === "ambiguous" && nextPlan.planId === previousPlanId) {
+            suggestedChannelReplanReason = "ambiguous";
+            suggestedChannelError = "The previous join is still unconfirmed. Refresh suggestions later before trying again.";
+            return;
+        }
+        suggestedChannelPlan = nextPlan;
+        suggestedChannelReplanReason = undefined;
+        suggestedChannelError = "";
+        suggestedChannelMessage = reason === "ambiguous"
+            ? "The previous join could not be confirmed. Review this refreshed list before confirming again."
+            : "Suggestions changed. Review this refreshed list before confirming again.";
+    } catch {
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        suggestedChannelReplanReason = reason;
+        suggestedChannelError = reason === "ambiguous"
+            ? "The previous join is unconfirmed and suggestions could not be refreshed. Try refreshing suggestions later."
+            : "Suggestions changed but could not be refreshed. Try refreshing suggestions again.";
+    }
+}
+
+async function finishSecureSuggestedChannelJoins(
+    result: MatrixJoinSuggestedSpaceChannelsResult,
+    expectedUserId: string,
+    generation: number
+) {
+    const summary = suggestedChannelJoinSummary(result);
+    clearSuggestedChannelOverlayState();
+    overlay = null;
+    scheduleRender();
+    const refreshed = await refresh(false, false, false);
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    hierarchies.delete(result.spaceId);
+    void loadHierarchy(result.spaceId);
+    const partial = result.outcomes.some(outcome => outcome.status === "rejected" || outcome.status === "blocked_by_parent");
+    showToast(refreshed ? summary : `${summary} Rooms could not be refreshed yet. Use Refresh to check again.`,
+        refreshed && !partial ? "success" : "info");
+}
+
+async function performSuggestedChannelAction() {
+    if (!host || suggestedChannelJoinBusy || !suggestedChannelPlan || !suggestedChannelExpectedUserId) return;
+    const expectedUserId = suggestedChannelExpectedUserId;
+    const displayedPlan = suggestedChannelPlan;
+    const generation = uiGeneration;
+    if (!isCurrentSecureAccount(expectedUserId)) return;
+    suggestedChannelJoinBusy = true;
+    suggestedChannelError = "";
+    scheduleRender();
+    try {
+        if (suggestedChannelReplanReason) {
+            await refreshSecureSuggestedPlan(
+                suggestedChannelReplanReason,
+                displayedPlan.planId,
+                expectedUserId,
+                generation
+            );
+            return;
+        }
+        if (!displayedPlan.channels.some(channel => channel.membership === "leave")) return;
+        const result = await host.request({
+            type: "joinSuggestedSpaceChannels",
+            request: { spaceId: displayedPlan.spaceId, planId: displayedPlan.planId },
+        });
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        await finishSecureSuggestedChannelJoins(result, expectedUserId, generation);
+    } catch (caught) {
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        const code = errorCode(caught);
+        if (code === "MATRIX_SUGGESTED_SPACE_CHANNEL_PLAN_STALE") {
+            await refreshSecureSuggestedPlan("stale", displayedPlan.planId, expectedUserId, generation);
+        } else if (code === "MATRIX_SUGGESTED_SPACE_CHANNEL_JOIN_AMBIGUOUS") {
+            await refreshSecureSuggestedPlan("ambiguous", displayedPlan.planId, expectedUserId, generation);
+        } else {
+            suggestedChannelError = "The account provider could not join these suggested channels. No unconfirmed retry was started.";
+        }
+    } finally {
+        if (generation === uiGeneration) suggestedChannelJoinBusy = false;
+        scheduleRender();
+    }
+}
+
+async function acceptInvite(roomId: string) {
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || !isCurrentSecureAccount(expectedUserId)) return;
+    const generation = uiGeneration;
+    const invitedRoom = roomById(roomId);
+    let accepted;
+    try {
+        accepted = await host.request({ type: "acceptInvite", roomId });
+    } catch (error) {
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) showToast(errorText(error), "error");
+        return;
+    }
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    const refreshed = await refresh(false, false, false);
+    if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+    if (refreshed) {
         const room = roomById(roomId);
         setRoute({ kind: room && isSpace(room) ? "space" : room && isDirect(room) ? "dm" : "room", roomId });
-    } catch (error) {
-        if (generation === uiGeneration) showToast(errorText(error), "error");
+    } else {
+        showToast("Invitation was accepted, but rooms could not be refreshed yet. Use Refresh to check again.", "info");
+    }
+    if (accepted.warning?.code === "MATRIX_DM_CLASSIFICATION_FAILED") {
+        showToast("Invitation accepted, but this chat could not be classified as a direct message. It will appear as a regular chat.", "info");
+    }
+    if (invitedRoom && isSpace(invitedRoom)) {
+        await showSuggestedChannels(roomId, expectedUserId, true);
     }
 }
 
 async function rejectInvite(roomId: string) {
-    if (!host) return;
+    const expectedUserId = config?.userId;
+    if (!host || !expectedUserId || !isCurrentSecureAccount(expectedUserId)) return;
     const generation = uiGeneration;
     try {
         await host.request({ type: "rejectInvite", roomId });
-        if (generation !== uiGeneration) return;
-        await refresh();
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        const refreshed = await refresh(false, false, false);
+        if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+        if (!refreshed) {
+            showToast("Invitation was declined, but rooms could not be refreshed yet. Use Refresh to check again.", "info");
+        }
     } catch (error) {
-        if (generation === uiGeneration) showToast(errorText(error), "error");
+        if (generation === uiGeneration && isCurrentSecureAccount(expectedUserId)) showToast(errorText(error), "error");
     }
 }
 
@@ -3006,6 +3239,12 @@ function renderSpaceMain(space: MatrixRoomDTO) {
                 hierarchies.delete(space.roomId);
                 void loadHierarchy(space.roomId);
             }),
+            makeButton(
+                suggestedChannelsLoading === space.roomId ? "Loading suggestions..." : "Suggested Channels",
+                "matrix-button",
+                () => void showSuggestedChannels(space.roomId),
+                { disabled: Boolean(suggestedChannelsLoading) }
+            ),
             canOpenAccess ? makeButton(
                 `${accessExpanded ? "Hide access settings" : "Access settings"}${space.accessRequestCount ? ` (${space.accessRequestCount})` : ""}`,
                 "matrix-button",
@@ -3102,8 +3341,9 @@ function renderDiscoverMain() {
     const advanced = element("details", "matrix-card matrix-advanced-join");
     advanced.append(textElement("summary", "", "Advanced: join by full room address"));
     const joinForm = element("form", "matrix-form");
-    joinForm.append(textElement("p", "matrix-subtle", "Use a full Matrix alias or room ID."));
-    const address = input("text", "address", "#room:server.example or !roomId:server.example", joinAddressValue);
+    joinForm.append(textElement("p", "matrix-subtle", "Use #alias:server, !legacy-id:server, or a domainless room ID such as !opaque."));
+    const address = input("text", "address", "#room:server.example or !opaque", joinAddressValue);
+    address.maxLength = 512;
     address.dataset.focusKey = "matrix-join-address";
     address.disabled = joinAddressBusy || joinNameBusy;
     address.addEventListener("input", () => { joinAddressValue = address.value.slice(0, 512); });
@@ -3444,6 +3684,8 @@ function renderCreateSpaceOverlay() {
     form.addEventListener("submit", event => {
         event.preventDefault();
         if (!host || spaceCreationInFlight || spaceCreationBlocked) return;
+        const expectedUserId = config?.userId;
+        if (!expectedUserId || !isCurrentSecureAccount(expectedUserId)) return;
         createSpaceForm.name = name.value.trim();
         createSpaceForm.topic = topic.value.trim();
         createSpaceForm.visibility = visibility.value === "public" ? "public" : "private";
@@ -3460,15 +3702,22 @@ function renderCreateSpaceOverlay() {
                 createGeneral: createSpaceForm.createGeneral,
             },
         }).then(async result => {
-            if (generation !== uiGeneration) return;
+            if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
             overlay = null;
-            await refresh();
-            if (generation !== uiGeneration) return;
+            const refreshed = await refresh(false, false, false);
+            if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
             Object.assign(createSpaceForm, { name: "", topic: "", visibility: "private" as const, createGeneral: true });
-            setRoute({ kind: "space", roomId: result.roomId });
-            if (result.partial) showToast(result.partial.message, "error");
+            if (refreshed) setRoute({ kind: "space", roomId: result.roomId });
+            else showToast("The server was created, but the server list could not be refreshed yet. Use Refresh to check again.", "info");
+            if (result.partial) {
+                showToast(result.partial.code === "MATRIX_GENERAL_ROOM_CREATE_FAILED"
+                    ? "The server was created, but its general chat could not be created."
+                    : result.partial.code === "MATRIX_GENERAL_ROOM_CREATE_AMBIGUOUS"
+                        ? "The server was created, but the general chat result is unconfirmed and an unlinked chat may exist. Refresh and check before creating another chat."
+                        : "The server and general chat were created, but the chat could not be added to the server. It remains available as a separate chat.", "info");
+            }
         }).catch(async error => {
-            if (generation !== uiGeneration) return;
+            if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
             if (errorCode(error) === "MATRIX_CREATE_SPACE_AMBIGUOUS"
                 || errorText(error).includes("MATRIX_CREATE_SPACE_AMBIGUOUS")
                 || errorText(error).includes("may have succeeded")) {
@@ -3476,8 +3725,8 @@ function renderCreateSpaceOverlay() {
                 overlay = null;
                 scheduleRender();
                 await refresh(false);
-                if (generation !== uiGeneration) return;
-                showToast("Matrix could not confirm the result. Verify the refreshed server list before creating again, then press Refresh.", "error");
+                if (generation !== uiGeneration || !isCurrentSecureAccount(expectedUserId)) return;
+                showToast("The server may have been created, but the result could not be confirmed. Refresh and check the server list before trying again.", "error");
                 return;
             }
             showToast(errorText(error), "error");
@@ -3572,7 +3821,72 @@ function renderDirectMessageOverlay() {
     return renderModal("Start a private Matrix chat", body, [submit]);
 }
 
-function renderModal(title: string, body: HTMLElement, footerActions: HTMLElement[] = []) {
+function dismissOverlay() {
+    if (overlay === "suggestedChannels") {
+        if (suggestedChannelJoinBusy) return;
+        clearSuggestedChannelOverlayState();
+    }
+    overlay = null;
+    scheduleRender();
+}
+
+function renderSuggestedChannelsOverlay() {
+    const plan = suggestedChannelPlan;
+    const expectedUserId = suggestedChannelExpectedUserId;
+    const body = element("div", "matrix-modal-body");
+    if (!plan || !expectedUserId) {
+        body.append(textElement("p", "matrix-access-error", "This suggestion list is no longer available."));
+        return renderModal("Join Suggested Channels?", body);
+    }
+    const current = isCurrentSecureAccount(expectedUserId);
+    const rows = suggestedChannelConsentRows(plan);
+    const actionableCount = rows.filter(row => row.actionable).length;
+    body.append(textElement("p", "matrix-subtle", suggestedChannelPlanDisclosure(plan)));
+    if (!current) {
+        body.append(textElement("p", "matrix-access-error", "The signed-in account changed. Close this window and try again."));
+    }
+    if (suggestedChannelMessage) {
+        const message = textElement("p", "matrix-access-warning", suggestedChannelMessage);
+        message.setAttribute("role", "status");
+        body.append(message);
+    }
+    if (suggestedChannelError) {
+        const error = textElement("p", "matrix-access-error", suggestedChannelError);
+        error.setAttribute("role", "alert");
+        body.append(error);
+    }
+    const list = element("div", "matrix-form");
+    list.setAttribute("role", "list");
+    list.setAttribute("aria-label", "Suggested channels");
+    for (const row of rows) {
+        const card = element(
+            "article",
+            "matrix-card",
+            textElement("h3", "", `${row.kindLabel}: ${row.name}`),
+            row.parentLabel ? textElement("p", "matrix-subtle", `Under Category: ${row.parentLabel}`) : null,
+            row.topic ? textElement("p", "matrix-subtle", row.topic) : null,
+            textElement("p", "matrix-subtle", row.status),
+        );
+        card.setAttribute("role", "listitem");
+        list.append(card);
+    }
+    body.append(list);
+    const label = suggestedChannelJoinBusy
+        ? suggestedChannelReplanReason ? "Refreshing..." : "Joining..."
+        : suggestedChannelReplanReason ? "Refresh suggestions"
+            : actionableCount ? "Join suggested channels" : "Nothing to join";
+    const submit = makeButton(label, "matrix-button matrix-button-primary", () => void performSuggestedChannelAction(), {
+        disabled: suggestedChannelJoinBusy || !current || (!actionableCount && !suggestedChannelReplanReason),
+    });
+    return renderModal("Join Suggested Channels?", body, [submit], suggestedChannelJoinBusy);
+}
+
+function renderModal(
+    title: string,
+    body: HTMLElement,
+    footerActions: HTMLElement[] = [],
+    closeLocked = false
+) {
     const overlayElement = element("div", "matrix-overlay");
     overlayElement.setAttribute("role", "presentation");
     const modal = element("section", "matrix-modal");
@@ -3581,18 +3895,12 @@ function renderModal(title: string, body: HTMLElement, footerActions: HTMLElemen
     modal.setAttribute("aria-label", title);
     modal.append(element("header", "matrix-modal-header",
         textElement("h2", "", title),
-        makeButton("Close", "matrix-icon-button", () => {
-            overlay = null;
-            scheduleRender();
-        }, { ariaLabel: "Close" }),
+        makeButton("Close", "matrix-icon-button", dismissOverlay, { ariaLabel: "Close", disabled: closeLocked }),
     ), body);
     if (footerActions.length) modal.append(element("footer", "matrix-modal-footer", ...footerActions));
     overlayElement.append(modal);
     overlayElement.addEventListener("mousedown", event => {
-        if (event.target === overlayElement) {
-            overlay = null;
-            scheduleRender();
-        }
+        if (event.target === overlayElement && !closeLocked) dismissOverlay();
     });
     return overlayElement;
 }
@@ -3750,7 +4058,9 @@ function render() {
     if (overlay && config?.configured && !fatalMessage) {
         root.append(overlay === "search"
             ? renderSearchOverlay()
-            : overlay === "createSpace" ? renderCreateSpaceOverlay() : renderDirectMessageOverlay());
+            : overlay === "createSpace"
+                ? renderCreateSpaceOverlay()
+                : overlay === "directMessage" ? renderDirectMessageOverlay() : renderSuggestedChannelsOverlay());
     }
     if (config?.configured && !fatalMessage && (status?.state === "error" || status?.state === "stopped")) {
         const connectionProblem = element(
@@ -3793,8 +4103,7 @@ function render() {
 document.addEventListener("keydown", event => {
     if (event.key === "Escape" && overlay) {
         event.preventDefault();
-        overlay = null;
-        scheduleRender();
+        dismissOverlay();
     }
 });
 

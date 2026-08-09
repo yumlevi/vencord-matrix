@@ -44,6 +44,61 @@ function parsePowerLevel(value: unknown, roomVersion: string): ParsedPowerLevel 
     }
     return { valid: false, value: 0 };
 }
+function noPowerLevelEventUserLevel(
+    roomVersion: string,
+    sender: unknown,
+    content: unknown,
+    userId: string
+): ParsedPowerLevel {
+    const validUserId = (value: unknown): value is string => typeof value === "string"
+        && /^@[^\s:]+:[^\s]+$/u.test(value);
+    if (!validUserId(sender) || !content || typeof content !== "object" || Array.isArray(content)) {
+        return { valid: false, value: 0 };
+    }
+    const raw = content as Record<string, unknown>;
+    const hydra = !/^(?:[1-9]|10|11)$/u.test(roomVersion);
+    if (!hydra) {
+        return { valid: true, value: sender === userId ? 100 : 0 };
+    }
+    const additional = Object.hasOwn(raw, "additional_creators") ? raw.additional_creators : [];
+    if (!Array.isArray(additional) || additional.length > 1_000 || additional.some(value => !validUserId(value))) {
+        return { valid: false, value: 0 };
+    }
+    return { valid: true, value: sender === userId || additional.includes(userId) ? Infinity : 0 };
+}
+assert.deepEqual(
+    noPowerLevelEventUserLevel("9", "@creator:test", { creator: "@creator:test" }, "@creator:test"),
+    { valid: true, value: 100 },
+    "a v9 creator keeps the implicit 100 power level when m.room.power_levels is absent"
+);
+assert.deepEqual(
+    noPowerLevelEventUserLevel("9", "@creator:test", { creator: "@creator:test" }, "@member:test"),
+    { valid: true, value: 0 }
+);
+assert.deepEqual(
+    noPowerLevelEventUserLevel("11", "@creator:test", {}, "@creator:test"),
+    { valid: true, value: 100 },
+    "a v11 creator is derived from the create-event sender after content.creator was removed"
+);
+assert.deepEqual(
+    noPowerLevelEventUserLevel("12", "@creator:test", {
+        additional_creators: ["@additional:test"],
+    }, "@creator:test"),
+    { valid: true, value: Infinity },
+    "a v12 creation-event sender has implicit infinite power"
+);
+assert.deepEqual(
+    noPowerLevelEventUserLevel("12", "@creator:test", {
+        additional_creators: ["@additional:test"],
+    }, "@additional:test"),
+    { valid: true, value: Infinity },
+    "a v12 additional creator has implicit infinite power"
+);
+assert.equal(
+    noPowerLevelEventUserLevel("12", "@creator:test", { additional_creators: [42] }, "@creator:test").valid,
+    false,
+    "malformed Hydra creation state must fail closed"
+);
 function permissions(
     content: Record<string, unknown>,
     sender: string,
@@ -129,7 +184,12 @@ const powerPermissions = backend.slice(
 assert.match(powerPermissions, /roomVersion === "1" \? Math\.trunc\(value\) : value/u);
 assert.match(powerPermissions, /\^\[1-9\]\$/u);
 assert.match(powerPermissions, /Object\.hasOwn\(content, key\)/u);
-assert.match(powerPermissions, /powerLevel === Infinity/u);
+assert.match(powerPermissions, /memberLevel === Infinity/u);
+assert.match(powerPermissions, /effectiveUserPowerLevel/u);
+assert.match(powerPermissions, /createEventUserPowerLevel/u);
+assert.match(powerPermissions, /additional_creators/u);
+assert.match(powerPermissions, /sender === userId \? 100 : 0/u);
+assert.match(powerPermissions, /return createEventUserPowerLevel\(room, userId, roomVersion\)/u);
 assert.match(powerPermissions, /targetLevel\?\.valid === false/u);
 
 const configurableStateTypes = [
@@ -204,7 +264,7 @@ const configurePermissionCheck = backend.slice(
     backend.indexOf("function currentSpaceAccessRequestCount(")
 );
 assert.doesNotMatch(configurePermissionCheck, /maySendStateEvent/u);
-assert.match(configurePermissionCheck, /sender\.powerLevel === Infinity/u);
+assert.match(configurePermissionCheck, /effectiveUserPowerLevel/u);
 assert.match(configurePermissionCheck, /defaultedMatrixPowerLevel\(powerLevels, "state_default", 50, roomVersion\)/u);
 assert.match(configurePermissionCheck, /Object\.hasOwn\(eventLevels, type\)/u);
 assert.match(configurePermissionCheck, /parseMatrixPowerLevel\(eventLevels\[type\], roomVersion\)/u);
@@ -465,7 +525,7 @@ const privateAccessMutation = native.slice(
     native.indexOf("function secureViewSecurityState(")
 );
 assert.match(privateAccessMutation, /shellSnapshotDirty = true/u);
-assert.match(privateAccessMutation, /const result = await mutation\(\)[\s\S]*await bestEffortAccessMutationRefresh[\s\S]*return result/u);
+assert.match(privateAccessMutation, /const result = await mutation\(\)[\s\S]*await bestEffortMutationRefresh[\s\S]*return result/u);
 assert.match(privateAccessMutation, /MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS/u);
 assert.match(privateAccessMutation, /MATRIX_SPACE_ACCESS_REQUEST_AMBIGUOUS/u);
 assert.match(privateAccessMutation, /MATRIX_SPACE_ACCESS_RESOLUTION_AMBIGUOUS/u);
@@ -474,7 +534,7 @@ const workerInterruption = native.slice(
     native.indexOf("function startupTimeoutError(")
 );
 assert.match(workerInterruption, /request\.started[\s\S]*interruptedAccessMutationError/u);
-assert.match(workerInterruption, /!queued \? interruptedAccessMutationError\(commandType\)/u);
+assert.match(workerInterruption, /const interruptedAccessMutation = !queued[\s\S]*interruptedAccessMutationError\(commandType\)/u);
 
 const loadSpaceAccessUi = settings.slice(
     settings.indexOf("async function loadSpaceAccess("),

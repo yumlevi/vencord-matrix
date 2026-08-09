@@ -25,6 +25,7 @@ import type {
     MatrixMessageSearchResponse,
     MatrixMessageSearchResultDTO,
     MatrixMessageSearchScope,
+    MatrixPowerLevelPermissionDTO,
 } from "./types";
 
 const Native = VencordNative.pluginHelpers.MatrixBridge as PluginNative<typeof import("./native")>;
@@ -170,6 +171,8 @@ export interface MatrixRoomDto {
         suggested?: boolean;
     }>;
     canManageSpaceChildren?: boolean;
+    spaceChildPermission?: MatrixPowerLevelPermissionDTO;
+    invitePermission?: MatrixPowerLevelPermissionDTO;
     accessRequestCount?: number;
     accessRequestCountComplete?: boolean;
     canApproveAccessRequests?: boolean;
@@ -291,6 +294,7 @@ const projectedRoomIdsByGuildId = new Map<string, Set<string>>();
 const leavingMatrixSpaceSessions = new Set<string>();
 const leavingMatrixGroupSessions = new Set<string>();
 const accessRequestProjectionListeners = new Set<(contexts: readonly MatrixAccessRequestContext[]) => void>();
+const matrixSpaceProjectionListeners = new Set<() => void>();
 const spaceCreateContextsByCategoryId = new Map<string, {
     guildId: string;
     parentSpaceId: string;
@@ -307,6 +311,7 @@ const eventIdsByTransaction = new Map<string, string>();
 const roomHistoryById = new Map<string, RoomHistoryState>();
 const paginationRequestsByRoom = new Map<string, number>();
 const matrixSearchModalKeys = new Set<string>();
+const matrixManagementModalKeys = new Set<string>();
 const mediaFocusEventIdsByRoom = new Map<string, string[]>();
 const typingUsersByRoom = new Map<string, Set<string>>();
 const lastOutgoingTyping = new Map<string, number>();
@@ -1821,45 +1826,35 @@ function projectedGuildMemberRecords(space: MatrixRoomDto, rooms: MatrixRoomDto[
 }
 
 interface ProjectedGuildOwner {
-    member?: MatrixMemberDto;
     user: ReturnType<typeof rawCurrentUser>;
 }
 
 function fallbackGuildOwner(space: MatrixRoomDto): ProjectedGuildOwner {
-    // An incomplete member snapshot must still give Discord a resolvable owner
-    // member, but must not falsely grant the local Discord account owner UI.
-    const id = protectSyntheticId(stableSyntheticId("space-owner", space.roomId));
+    // Discord treats owner_id as an unconditional permission bypass. It must
+    // never point at the local Discord identity, even when that account has the
+    // highest Matrix power level. Matrix permissions are projected separately.
+    const currentDiscordUserId = UserStore.getCurrentUser()?.id;
+    let attempt = 0;
+    let id: string;
+    do {
+        const namespace = attempt === 0 ? "space-owner" : `space-owner-${attempt}`;
+        id = stableSyntheticId(namespace, space.roomId);
+        attempt++;
+    } while (id === currentDiscordUserId);
+    protectSyntheticId(id);
     return {
         user: {
             id,
-            username: "matrix_owner",
-            global_name: "Matrix",
-            display_name: "Matrix",
+            username: "server_bridge_placeholder",
+            global_name: "Server bridge placeholder",
+            display_name: "Server bridge placeholder",
             discriminator: "0",
             avatar: null,
-            bot: false,
+            bot: true,
             system: false,
             public_flags: 0,
             flags: 0,
         },
-    };
-}
-
-function projectedGuildOwner(space: MatrixRoomDto, snapshot: MatrixSnapshotDto): ProjectedGuildOwner {
-    const selfMatrixId = accountUserId(snapshot);
-    const joined = (space.members ?? []).filter(member => member.membership === "join");
-    if (!joined.length) return fallbackGuildOwner(space);
-
-    const highestPowerLevel = Math.max(...joined.map(member => member.powerLevel ?? 0));
-    const highest = joined
-        .filter(member => (member.powerLevel ?? 0) === highestPowerLevel)
-        .sort((left, right) => left.userId.localeCompare(right.userId));
-    // Tied administrators are equally authoritative in Matrix. Prefer self so
-    // the local projection uses the real Discord profile when that is valid.
-    const member = highest.find(candidate => candidate.userId === selfMatrixId) ?? highest[0];
-    return {
-        member,
-        user: member.userId === selfMatrixId ? rawCurrentUser() : rawMatrixUser(member),
     };
 }
 
@@ -1884,13 +1879,7 @@ function guildMembers(
 
     const result = [rawGuildMember(rawCurrentUser())];
     const includedMatrixUserIds = new Set(selfMatrixId ? [selfMatrixId] : []);
-    if (owner.member && owner.member.userId !== selfMatrixId) {
-        result.push(rawGuildMember(owner.user, owner.member.displayName));
-        includedMatrixUserIds.add(owner.member.userId);
-        rememberSpaceMember(owner.user.id, space.roomId);
-    } else if (!owner.member && owner.user.id !== result[0].user.id) {
-        result.push(rawGuildMember(owner.user));
-    }
+    if (owner.user.id !== result[0].user.id) result.push(rawGuildMember(owner.user));
 
     for (const member of projectedGuildMemberRecords(space, rooms)) {
         if (includedMatrixUserIds.has(member.userId) || result.length >= MAX_PROJECTED_GUILD_MEMBERS) continue;
@@ -1911,7 +1900,7 @@ function rawGuild(
     snapshot: MatrixSnapshotDto,
     guildId: string
 ) {
-    const owner = projectedGuildOwner(space, snapshot);
+    const owner = fallbackGuildOwner(space);
     const members = guildMembers(space, rooms, snapshot, owner);
     return {
         id: guildId,
@@ -2220,7 +2209,11 @@ export function applySnapshot(
             spaceCreateContextsByCategoryId.set(categoryId, {
                 guildId,
                 parentSpaceId: nestedSpace.roomId,
-                parentLabel: cleanDisplayText(nestedSpace.name, "Matrix category", 100),
+                parentLabel: cleanDisplayText(
+                    nestedSpace.name?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+                    "Category",
+                    100
+                ),
             });
             channels.push(guildCategory(nestedSpace, guildId, categoryId, position));
         }
@@ -2915,6 +2908,8 @@ export function stopBridge() {
     latestSnapshot = undefined;
     for (const modalKey of [...matrixSearchModalKeys]) closeModal(modalKey);
     matrixSearchModalKeys.clear();
+    for (const modalKey of [...matrixManagementModalKeys]) closeModal(modalKey);
+    matrixManagementModalKeys.clear();
     clearMediaHydration();
     for (const [roomId] of typingUsersByRoom) updateTypingUsers(roomId, []);
     typingUsersByRoom.clear();
@@ -3003,6 +2998,14 @@ export function registerMatrixSearchModal(modalKey: string) {
 
 export function unregisterMatrixSearchModal(modalKey: string) {
     matrixSearchModalKeys.delete(modalKey);
+}
+
+export function registerMatrixManagementModal(modalKey: string) {
+    matrixManagementModalKeys.add(modalKey);
+}
+
+export function unregisterMatrixManagementModal(modalKey: string) {
+    matrixManagementModalKeys.delete(modalKey);
 }
 
 export async function clearMatrixRoutePreference() {
@@ -3364,9 +3367,52 @@ export function openMatrixSpace(spaceId: string) {
 }
 
 export interface MatrixSpaceCreateContext {
+    guildId: string;
+    categoryId?: string;
     parentSpaceId: string;
     parentLabel: string;
+    expectedAccountId: string;
+    generation: number;
     canManageSpaceChildren: boolean;
+    permission: MatrixPowerLevelPermissionDTO;
+}
+
+export interface MatrixInviteContext {
+    guildId: string;
+    spaceId: string;
+    label: string;
+    expectedAccountId: string;
+    generation: number;
+    canInvite: boolean;
+    permission: MatrixPowerLevelPermissionDTO;
+}
+
+export type MatrixInviteCandidateMembership = "none" | "leave" | "knock" | "invite" | "join";
+
+export interface MatrixInviteCandidate {
+    userId: string;
+    displayName: string;
+    /** Validated but deliberately not rendered directly; it is still external media. */
+    avatarUrl?: string;
+    membership: MatrixInviteCandidateMembership;
+}
+
+export interface MatrixInviteCandidateList {
+    spaceId: string;
+    query: string;
+    scope: "homeserver_user_directory";
+    candidates: MatrixInviteCandidate[];
+    limited: boolean;
+    directoryLimited: boolean;
+    complete: false;
+    queryRequired: boolean;
+}
+
+export interface MatrixSpaceInviteResult {
+    spaceId: string;
+    userId: string;
+    membership: "invite" | "join";
+    changed: boolean;
 }
 
 export interface MatrixAccessRequestContext {
@@ -3464,6 +3510,18 @@ export function subscribeMatrixAccessRequestProjection(
     return () => accessRequestProjectionListeners.delete(listener);
 }
 
+export function subscribeMatrixSpaceProjection(listener: () => void) {
+    matrixSpaceProjectionListeners.add(listener);
+    try {
+        listener();
+    } catch (error) {
+        logger.warn("Matrix Space projection listener failed", error);
+    }
+    return () => {
+        matrixSpaceProjectionListeners.delete(listener);
+    };
+}
+
 function publishMatrixAccessRequestProjection() {
     const contexts = getMatrixAccessRequestContexts();
     for (const listener of accessRequestProjectionListeners) {
@@ -3471,6 +3529,13 @@ function publishMatrixAccessRequestProjection() {
             listener(contexts);
         } catch (error) {
             logger.warn("Access request projection listener failed", error);
+        }
+    }
+    for (const listener of matrixSpaceProjectionListeners) {
+        try {
+            listener();
+        } catch (error) {
+            logger.warn("Matrix Space projection listener failed", error);
         }
     }
 }
@@ -3656,20 +3721,54 @@ function joinedSpace(spaceId: string) {
         room.roomId === spaceId && isJoinedRoom(room) && isSpaceRoom(room));
 }
 
+function projectedPowerLevelPermission(
+    value: MatrixPowerLevelPermissionDTO | undefined,
+    legacyAllowed: boolean
+): MatrixPowerLevelPermissionDTO {
+    const currentValid = typeof value?.current === "number"
+        ? Number.isSafeInteger(value.current)
+        : value?.current === "infinite" || value?.current === "unverifiable";
+    const requiredValid = typeof value?.required === "number"
+        ? Number.isSafeInteger(value.required)
+        : value?.required === "unverifiable";
+    if (!value || !currentValid || !requiredValid || typeof value.allowed !== "boolean"
+        || value.allowed !== legacyAllowed) {
+        return { current: "unverifiable", required: "unverifiable", allowed: false };
+    }
+    return { current: value.current, required: value.required, allowed: value.allowed };
+}
+
 export function canManageMatrixSpaceChildren(spaceId: string) {
-    return bridgeActive && joinedSpace(spaceId)?.canManageSpaceChildren === true;
+    const space = bridgeActive ? joinedSpace(spaceId) : undefined;
+    return Boolean(space && projectedPowerLevelPermission(
+        space.spaceChildPermission,
+        space.canManageSpaceChildren === true
+    ).allowed);
 }
 
 export function getMatrixSpaceCreateContext(guildId: string): MatrixSpaceCreateContext | undefined {
     if (!bridgeActive || !injectedGuildIds.has(guildId) || !GuildStore.getGuild(guildId)) return undefined;
     const parentSpaceId = spaceIdsByGuildId.get(guildId);
-    if (!parentSpaceId) return undefined;
+    const expectedAccountId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
+    if (!parentSpaceId || !expectedAccountId) return undefined;
     const space = joinedSpace(parentSpaceId);
     if (!space) return undefined;
+    const permission = projectedPowerLevelPermission(
+        space.spaceChildPermission,
+        space.canManageSpaceChildren === true
+    );
     return {
+        guildId,
         parentSpaceId,
-        parentLabel: cleanDisplayText(space.name, "Matrix space", 100),
-        canManageSpaceChildren: space.canManageSpaceChildren === true,
+        parentLabel: cleanDisplayText(
+            space.name?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+            "Server",
+            100
+        ),
+        expectedAccountId,
+        generation: pollGeneration,
+        canManageSpaceChildren: permission.allowed,
+        permission,
     };
 }
 
@@ -3683,11 +3782,292 @@ export function getMatrixCategoryCreateContext(channelId: string): MatrixSpaceCr
         || channel.guild_id !== context.guildId
         || !guildIdsBySpaceId.get(context.parentSpaceId)?.has(context.guildId)
         || !joinedSpace(context.parentSpaceId)) return undefined;
+    const expectedAccountId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
+    const space = joinedSpace(context.parentSpaceId);
+    if (!expectedAccountId || !space) return undefined;
+    const permission = projectedPowerLevelPermission(
+        space.spaceChildPermission,
+        space.canManageSpaceChildren === true
+    );
     return {
+        guildId: context.guildId,
+        categoryId: channelId,
         parentSpaceId: context.parentSpaceId,
-        parentLabel: context.parentLabel,
-        canManageSpaceChildren: canManageMatrixSpaceChildren(context.parentSpaceId),
+        parentLabel: cleanDisplayText(
+            context.parentLabel.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+            "Category",
+            100
+        ),
+        expectedAccountId,
+        generation: pollGeneration,
+        canManageSpaceChildren: permission.allowed,
+        permission,
     };
+}
+
+function sameSpaceCreateBinding(
+    left: MatrixSpaceCreateContext,
+    right: MatrixSpaceCreateContext | undefined
+) {
+    return Boolean(right)
+        && left.guildId === right!.guildId
+        && left.categoryId === right!.categoryId
+        && left.parentSpaceId === right!.parentSpaceId
+        && left.expectedAccountId === right!.expectedAccountId
+        && left.generation === right!.generation;
+}
+
+export function getCurrentMatrixSpaceCreateContext(expected: MatrixSpaceCreateContext) {
+    const current = expected.categoryId
+        ? getMatrixCategoryCreateContext(expected.categoryId)
+        : getMatrixSpaceCreateContext(expected.guildId);
+    return sameSpaceCreateBinding(expected, current) ? current : undefined;
+}
+
+export function isMatrixSpaceCreateContextCurrent(context: MatrixSpaceCreateContext) {
+    return Boolean(getCurrentMatrixSpaceCreateContext(context));
+}
+
+function sameInviteBinding(left: MatrixInviteContext, right: MatrixInviteContext | undefined) {
+    return Boolean(right)
+        && left.guildId === right!.guildId
+        && left.spaceId === right!.spaceId
+        && left.expectedAccountId === right!.expectedAccountId
+        && left.generation === right!.generation;
+}
+
+export function getMatrixInviteContext(guildId: string): MatrixInviteContext | undefined {
+    if (!bridgeActive || !injectedGuildIds.has(guildId) || !GuildStore.getGuild(guildId)) return undefined;
+    const spaceId = spaceIdsByGuildId.get(guildId);
+    const expectedAccountId = latestSnapshot ? accountUserId(latestSnapshot) : undefined;
+    if (!spaceId || !expectedAccountId) return undefined;
+    const space = joinedSpace(spaceId);
+    if (!space) return undefined;
+    const permission = projectedPowerLevelPermission(
+        space.invitePermission,
+        space.canApproveAccessRequests === true
+    );
+    return {
+        guildId,
+        spaceId,
+        label: cleanDisplayText(
+            space.name?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+            "Server",
+            100
+        ),
+        expectedAccountId,
+        generation: pollGeneration,
+        canInvite: permission.allowed,
+        permission,
+    };
+}
+
+export function getCurrentMatrixInviteContext(expected: MatrixInviteContext) {
+    const current = getMatrixInviteContext(expected.guildId);
+    return sameInviteBinding(expected, current) ? current : undefined;
+}
+
+export function isMatrixInviteContextCurrent(context: MatrixInviteContext) {
+    return Boolean(getCurrentMatrixInviteContext(context));
+}
+
+function normalizedInviteQuery(value: unknown) {
+    if (typeof value !== "string") throw new Error("The Matrix directory search was invalid.");
+    const query = value.trim();
+    if (query.length > 256 || /[\u0000-\u001f\u007f]/u.test(query)) {
+        throw new Error("The Matrix directory search was invalid.");
+    }
+    return query;
+}
+
+function normalizedInviteUserId(value: unknown) {
+    if (typeof value !== "string" || value.length < 4 || value.length > 512
+        || !/^@[^\s:\u0000-\u001f\u007f]+:[^\s\u0000-\u001f\u007f]+$/u.test(value)) {
+        throw new Error("The Matrix invite response was invalid.");
+    }
+    return value;
+}
+
+function matrixUserServerName(userId: string) {
+    return userId.slice(userId.indexOf(":") + 1).toLocaleLowerCase("en-US");
+}
+
+function normalizedInviteAvatarUrl(value: unknown) {
+    if (value == null) return undefined;
+    if (typeof value !== "string" || value.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(value)) {
+        throw new Error("The Matrix invite response was invalid.");
+    }
+    let url: URL;
+    try {
+        url = new URL(value);
+    } catch {
+        throw new Error("The Matrix invite response was invalid.");
+    }
+    if (!new Set(["https:", "http:", "mxc:"]).has(url.protocol)
+        || (url.protocol !== "mxc:" && (url.username || url.password))) {
+        throw new Error("The Matrix invite response was invalid.");
+    }
+    return value;
+}
+
+function normalizeInviteCandidateList(
+    value: unknown,
+    context: MatrixInviteContext,
+    query: string
+): MatrixInviteCandidateList {
+    const response = value as Record<string, unknown> | null;
+    const responseKeys = response ? Object.keys(response) : [];
+    const allowedResponseKeys = new Set([
+        "spaceId",
+        "query",
+        "scope",
+        "candidates",
+        "limited",
+        "directoryLimited",
+        "complete",
+        "queryRequired",
+    ]);
+    if (!response || typeof response !== "object"
+        || responseKeys.some(key => !allowedResponseKeys.has(key))
+        || response.spaceId !== context.spaceId
+        || response.query !== query
+        || response.scope !== "homeserver_user_directory"
+        || !Array.isArray(response.candidates)
+        || response.candidates.length > 100
+        || typeof response.limited !== "boolean"
+        || typeof response.directoryLimited !== "boolean"
+        || response.complete !== false
+        || typeof response.queryRequired !== "boolean"
+        || query !== "" && response.queryRequired) {
+        throw new Error("The Matrix directory response was invalid.");
+    }
+
+    const expectedServer = matrixUserServerName(context.expectedAccountId);
+    const seen = new Set<string>();
+    const memberships = new Set<MatrixInviteCandidateMembership>([
+        "none",
+        "leave",
+        "knock",
+        "invite",
+        "join",
+    ]);
+    const candidates = response.candidates.map(value => {
+        const candidate = value as Record<string, unknown> | null;
+        const candidateKeys = candidate ? Object.keys(candidate) : [];
+        if (!candidate || typeof candidate !== "object"
+            || candidateKeys.some(key => !new Set(["userId", "displayName", "avatarUrl", "membership"]).has(key))
+            || !memberships.has(candidate.membership as MatrixInviteCandidateMembership)) {
+            throw new Error("The Matrix directory response was invalid.");
+        }
+        const userId = normalizedInviteUserId(candidate.userId);
+        if (userId === context.expectedAccountId
+            || matrixUserServerName(userId) !== expectedServer
+            || seen.has(userId)) {
+            throw new Error("The Matrix directory response was invalid.");
+        }
+        seen.add(userId);
+        if (candidate.displayName != null && typeof candidate.displayName !== "string") {
+            throw new Error("The Matrix directory response was invalid.");
+        }
+        const visibleUserLabel = userId.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "");
+        return {
+            userId,
+            displayName: cleanDisplayText(
+                candidate.displayName?.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ""),
+                visibleUserLabel || "Account",
+                100
+            ),
+            avatarUrl: normalizedInviteAvatarUrl(candidate.avatarUrl),
+            membership: candidate.membership as MatrixInviteCandidateMembership,
+        };
+    });
+    return {
+        spaceId: context.spaceId,
+        query,
+        scope: "homeserver_user_directory",
+        candidates,
+        limited: response.limited,
+        directoryLimited: response.directoryLimited,
+        complete: false,
+        queryRequired: response.queryRequired,
+    };
+}
+
+export async function searchMatrixSpaceInviteCandidates(
+    context: MatrixInviteContext,
+    queryValue: string,
+    limit = 25
+) {
+    const query = normalizedInviteQuery(queryValue);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !getCurrentMatrixInviteContext(context)) {
+        throw new Error("The Matrix invite context is no longer current.");
+    }
+    const result = await Native.searchSpaceInviteCandidates({
+        spaceId: context.spaceId,
+        query,
+        limit,
+    }, context.expectedAccountId) as unknown;
+    if (!getCurrentMatrixInviteContext(context)) {
+        throw new Error("The Matrix invite context is no longer current.");
+    }
+    return normalizeInviteCandidateList(result, context, query);
+}
+
+export async function inviteMatrixUserToSpace(
+    context: MatrixInviteContext,
+    userIdValue: string
+): Promise<MatrixSpaceInviteResult> {
+    const userId = normalizedInviteUserId(userIdValue);
+    const before = getCurrentMatrixInviteContext(context);
+    if (!before?.canInvite) throw new Error("The Matrix invite context is no longer current.");
+
+    let value: unknown;
+    try {
+        value = await Native.inviteUserToSpace({
+            spaceId: context.spaceId,
+            userId,
+        }, context.expectedAccountId) as unknown;
+    } catch (error) {
+        if (matrixErrorCode(error) === "MATRIX_SPACE_INVITE_AMBIGUOUS"
+            && getCurrentMatrixInviteContext(context)) {
+            try {
+                await refreshSnapshot(context.generation);
+            } catch (refreshError) {
+                logger.warn("Ambiguous Matrix invite refresh failed", refreshError);
+            }
+        }
+        throw error;
+    }
+    if (!getCurrentMatrixInviteContext(context)) {
+        throw new Error("The Matrix invite context is no longer current.");
+    }
+    const result = value as Record<string, unknown> | null;
+    const resultKeys = result ? Object.keys(result) : [];
+    if (!result || typeof result !== "object"
+        || resultKeys.some(key => !new Set(["spaceId", "userId", "membership", "changed"]).has(key))
+        || result.spaceId !== context.spaceId
+        || result.userId !== userId
+        || result.membership !== "invite" && result.membership !== "join"
+        || typeof result.changed !== "boolean") {
+        throw new Error("The Matrix invite response was invalid.");
+    }
+    try {
+        await refreshSnapshot(context.generation);
+    } catch (error) {
+        if (!getCurrentMatrixInviteContext(context)) {
+            throw new Error("The Matrix invite context is no longer current.");
+        }
+        logger.warn("Matrix invite projection refresh failed", error);
+    }
+    if (!getCurrentMatrixInviteContext(context)) {
+        throw new Error("The Matrix invite context is no longer current.");
+    }
+    return {
+        spaceId: context.spaceId,
+        userId,
+        membership: result.membership,
+        changed: result.changed,
+    } as MatrixSpaceInviteResult;
 }
 
 export async function leaveMatrixGuild(guildId: string) {
