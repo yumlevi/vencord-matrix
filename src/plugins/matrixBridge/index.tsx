@@ -1,0 +1,1225 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vencord contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+import "./style.css";
+
+import { findGroupChildrenByChildId, type NavContextMenuPatchCallback } from "@api/ContextMenu";
+import { definePluginSettings } from "@api/Settings";
+import { openPluginModal } from "@components/settings";
+import SettingsPlugin from "@plugins/_core/settings";
+import { removeFromArray } from "@utils/misc";
+import definePlugin, { IconProps, OptionType } from "@utils/types";
+import { ChannelType, StickerFormatType } from "@vencord/discord-types/enums";
+import { findByPropsLazy } from "@webpack";
+import {
+    ConfirmModal,
+    DraftType,
+    FluxDispatcher,
+    Menu,
+    openModal,
+    SelectedChannelStore,
+    SettingsRouter,
+    showToast,
+    StickersStore,
+    Toasts,
+    Tooltip,
+    UploadAttachmentStore,
+    UploadManager
+} from "@webpack/common";
+
+import {
+    activateMatrixChannel,
+    addMatrixReaction,
+    applySnapshot,
+    deleteMatrixMessage,
+    editMatrixMessage,
+    fetchMatrixMessages,
+    getLatestSnapshot,
+    getMatrixCategoryCreateContext,
+    getMatrixGroupLeaveContext,
+    getMatrixSendSessionToken,
+    getMatrixSpaceCreateContext,
+    hasMatrixRecipients,
+    installReadStateProjection,
+    installRestGuard,
+    isMatrixChannelId,
+    isMatrixGuildId,
+    isMatrixMediaUrl,
+    leaveMatrixGroup,
+    leaveMatrixGuild,
+    matrixReceipt,
+    matrixTyping,
+    openMatrixPrivateChannel,
+    removeMatrixReaction,
+    removeReadStateProjection,
+    removeRestGuard,
+    restartBridge,
+    sendMatrixAttachment,
+    sendMatrixMessage,
+    sendMatrixSticker,
+    startBridge,
+    suspendBridge,
+} from "./bridge";
+import { openMatrixSearch } from "./search";
+import { MatrixSettings } from "./settings";
+import { openMatrixSpaceChildModal } from "./spaceCreate";
+import type { MatrixAttachmentGroupDTO } from "./types";
+
+const settings = definePluginSettings({
+    matrix: {
+        type: OptionType.COMPONENT,
+        component: MatrixSettings,
+    },
+});
+
+const MATRIX_SETTINGS_ENTRY_KEY = "vencord_matrix";
+const ChannelSidebarActions = findByPropsLazy("toggleMembersSection");
+let pluginLifecycleGeneration = 0;
+let pendingPluginShutdown: Promise<void> = Promise.resolve();
+
+const MAX_MATRIX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_MATRIX_ATTACHMENT_COUNT = 10;
+const MAX_MATRIX_ATTACHMENT_BATCH_BYTES = 100 * 1024 * 1024;
+const MAX_TOMBSTONE_CHANNELS = 32;
+const MAX_TOMBSTONES_PER_CHANNEL = MAX_MATRIX_ATTACHMENT_COUNT;
+const activeAttachmentBatches = new Set<string>();
+const consumedUploadTombstones = new Map<string, Set<string>>();
+const attachmentGroupAssignments = new Map<string, {
+    sessionToken: string;
+    assignments: Map<string, MatrixAttachmentGroupDTO>;
+}>();
+let tombstoneSafetyLock = false;
+
+type MatrixComposerUpload = ReturnType<typeof UploadAttachmentStore.getUploads>[number];
+
+interface MatrixAttachmentBatchResult {
+    total: number;
+    sent: number;
+    complete: boolean;
+    failedIndex?: number;
+    cleanupFailed?: boolean;
+    contentConsumed: boolean;
+}
+
+function attachmentName(upload: any, file: File) {
+    const source = typeof upload?.filename === "string" && upload.filename
+        ? upload.filename
+        : file.name || "attachment";
+    const clean = source.replace(/[\u0000-\u001f\u007f\\/]+/gu, "_").slice(0, 255) || "attachment";
+    return upload?.spoiler && !clean.startsWith("SPOILER_")
+        ? `SPOILER_${clean}`.slice(0, 255)
+        : clean;
+}
+
+function attachmentMimeType(upload: any, file: File) {
+    const source = typeof file.type === "string" && file.type
+        ? file.type
+        : typeof upload?.mimeType === "string" ? upload.mimeType : "";
+    const candidate = source.split(";", 1)[0].trim().toLowerCase();
+    return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(candidate) ? candidate : undefined;
+}
+
+async function videoMetadata(file: File): Promise<{
+    width?: number;
+    height?: number;
+    durationMs?: number;
+}> {
+    const objectUrl = URL.createObjectURL(file);
+    const element = document.createElement("video");
+    element.muted = true;
+    element.preload = "metadata";
+    try {
+        return await new Promise(resolve => {
+            let settled = false;
+            const finish = (value: { width?: number; height?: number; durationMs?: number; }) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            };
+            const timer = setTimeout(() => finish({}), 5_000);
+            element.onloadedmetadata = () => {
+                const width = Number.isSafeInteger(element.videoWidth) && element.videoWidth > 0
+                    ? element.videoWidth
+                    : undefined;
+                const height = Number.isSafeInteger(element.videoHeight) && element.videoHeight > 0
+                    ? element.videoHeight
+                    : undefined;
+                const durationCandidate = Number.isFinite(element.duration) && element.duration >= 0
+                    ? Math.round(element.duration * 1_000)
+                    : undefined;
+                const durationMs = durationCandidate != null && durationCandidate <= 7 * 24 * 60 * 60_000
+                    ? durationCandidate
+                    : undefined;
+                finish(width && height ? { width, height, durationMs } : { durationMs });
+            };
+            element.onerror = () => finish({});
+            element.src = objectUrl;
+            element.load();
+        });
+    } finally {
+        element.onloadedmetadata = null;
+        element.onerror = null;
+        element.removeAttribute("src");
+        element.load();
+        URL.revokeObjectURL(objectUrl);
+    }
+}
+
+function sameComposerUpload(left: MatrixComposerUpload, right: MatrixComposerUpload) {
+    if (left === right) return true;
+    if (typeof left.id === "string" && left.id && left.id === right.id) return true;
+    return typeof left.uniqueId === "string" && left.uniqueId && left.uniqueId === right.uniqueId;
+}
+
+function composerUploadKey(upload: MatrixComposerUpload) {
+    const id = typeof upload.id === "string" ? upload.id.slice(0, 256) : "";
+    const uniqueId = typeof upload.uniqueId === "string" ? upload.uniqueId.slice(0, 256) : "";
+    return `${id.length}:${id}:${uniqueId}`;
+}
+
+async function attachmentTxnId(channelId: string, upload: MatrixComposerUpload, file: File) {
+    const identity = [
+        channelId,
+        typeof upload.id === "string" ? upload.id.slice(0, 512) : "",
+        typeof upload.uniqueId === "string" ? upload.uniqueId.slice(0, 512) : "",
+        file.name.slice(0, 512),
+        String(file.size),
+        String(file.lastModified)
+    ].join("\0");
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity)));
+    return `vcatt_${Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function attachmentGroupId(transactionIds: string[]) {
+    const digest = new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(transactionIds.join("\0"))
+    ));
+    return `vcgrp_${Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function attachmentGroupPlan(
+    channelId: string,
+    sessionToken: string,
+    uploads: Array<{ upload: MatrixComposerUpload; file: File; }>,
+    transactionIds: string[]
+): Promise<Array<MatrixAttachmentGroupDTO | undefined> | undefined> {
+    const uploadKeys = uploads.map(({ upload }) => composerUploadKey(upload));
+    if (new Set(uploadKeys).size !== uploadKeys.length) {
+        showToast("Discord did not provide unique identities for this attachment batch.", Toasts.Type.FAILURE);
+        return undefined;
+    }
+    let record = attachmentGroupAssignments.get(channelId);
+    if (record?.sessionToken !== sessionToken) {
+        attachmentGroupAssignments.delete(channelId);
+        record = undefined;
+    }
+    let assignments = record?.assignments;
+    if (assignments) {
+        const presentKeys = new Set(uploadKeys);
+        for (const key of assignments.keys()) {
+            if (!presentKeys.has(key)) assignments.delete(key);
+        }
+        if (!assignments.size) {
+            attachmentGroupAssignments.delete(channelId);
+            assignments = undefined;
+        }
+    }
+
+    const existing = uploadKeys.map(key => assignments?.get(key));
+    if (existing.some(Boolean)) {
+        const first = existing.find((group): group is MatrixAttachmentGroupDTO => Boolean(group))!;
+        if (existing.some(group => !group || group.id !== first.id || group.total !== first.total)) {
+            showToast(
+                "Finish or remove the remaining Matrix attachment batch before adding new files.",
+                Toasts.Type.FAILURE
+            );
+            return undefined;
+        }
+        return existing;
+    }
+    if (uploads.length < 2) return uploads.map(() => undefined);
+    if (!assignments) {
+        if (attachmentGroupAssignments.size >= MAX_TOMBSTONE_CHANNELS) {
+            showToast("Too many unfinished Matrix attachment batches are open.", Toasts.Type.FAILURE);
+            return undefined;
+        }
+        assignments = new Map();
+        attachmentGroupAssignments.set(channelId, { sessionToken, assignments });
+    }
+    const id = await attachmentGroupId(transactionIds);
+    const plan = uploadKeys.map((key, index) => {
+        const group = { id, index, total: uploads.length };
+        assignments!.set(key, group);
+        return group;
+    });
+    return plan;
+}
+
+function rememberConsumedUpload(channelId: string, upload: MatrixComposerUpload) {
+    let tombstones = consumedUploadTombstones.get(channelId);
+    if (!tombstones) {
+        if (consumedUploadTombstones.size >= MAX_TOMBSTONE_CHANNELS) {
+            tombstoneSafetyLock = true;
+            return;
+        }
+        consumedUploadTombstones.set(channelId, tombstones = new Set());
+    }
+    const key = composerUploadKey(upload);
+    if (tombstones.size >= MAX_TOMBSTONES_PER_CHANNEL && !tombstones.has(key)) {
+        tombstoneSafetyLock = true;
+        return;
+    }
+    tombstones.add(key);
+}
+
+function uploadWasRemoved(channelId: string, upload: MatrixComposerUpload) {
+    try {
+        return !UploadAttachmentStore
+            .getUploads(channelId, DraftType.ChannelMessage)
+            .some(candidate => sameComposerUpload(candidate, upload));
+    } catch {
+        return false;
+    }
+}
+
+function removeSentUpload(channelId: string, upload: MatrixComposerUpload) {
+    try {
+        // Discord's REMOVE_FILES reducer matches CloudUpload.id exactly, calls
+        // removeFromMsgDraft(), and publishes the shortened store list.
+        UploadManager.removeFiles(channelId, [upload.id], DraftType.ChannelMessage);
+    } catch {
+        // Fall back to replacing the draft list below.
+    }
+    if (uploadWasRemoved(channelId, upload)) return true;
+
+    try {
+        upload.removeFromMsgDraft();
+        const remaining = UploadAttachmentStore
+            .getUploads(channelId, DraftType.ChannelMessage)
+            .filter(candidate => !sameComposerUpload(candidate, upload));
+        UploadManager.setUploads({
+            uploads: remaining,
+            channelId,
+            draftType: DraftType.ChannelMessage,
+            resetState: false
+        });
+    } catch {
+        return false;
+    }
+    return uploadWasRemoved(channelId, upload);
+}
+
+function retryConsumedUploadCleanup(channelId: string, uploads: MatrixComposerUpload[]) {
+    const tombstones = consumedUploadTombstones.get(channelId);
+    if (!tombstones) return true;
+
+    const present = new Set<string>();
+    let blocked = false;
+    for (const upload of uploads) {
+        const key = composerUploadKey(upload);
+        if (!tombstones.has(key)) continue;
+        present.add(key);
+        if (removeSentUpload(channelId, upload)) tombstones.delete(key);
+        else blocked = true;
+    }
+    for (const key of tombstones) {
+        if (!present.has(key)) tombstones.delete(key);
+    }
+    if (!tombstones.size) consumedUploadTombstones.delete(channelId);
+    return !blocked;
+}
+
+async function sendMatrixAttachmentBatch(
+    channelId: string,
+    uploads: Array<{ upload: MatrixComposerUpload; file: File; }>,
+    caption: string | undefined,
+    replyMessageId: string | undefined
+): Promise<MatrixAttachmentBatchResult> {
+    const result: MatrixAttachmentBatchResult = {
+        total: uploads.length,
+        sent: 0,
+        complete: false,
+        contentConsumed: false
+    };
+    const lifecycleGeneration = pluginLifecycleGeneration;
+    const sessionToken = getMatrixSendSessionToken(channelId);
+    if (!sessionToken) {
+        showToast("The Matrix channel is no longer connected.", Toasts.Type.FAILURE);
+        return result;
+    }
+    const sessionIsCurrent = () =>
+        lifecycleGeneration === pluginLifecycleGeneration
+        && getMatrixSendSessionToken(channelId) === sessionToken;
+    const stopForSessionChange = (failedIndex?: number) => {
+        if (attachmentGroupAssignments.get(channelId)?.sessionToken === sessionToken) {
+            attachmentGroupAssignments.delete(channelId);
+        }
+        result.failedIndex = failedIndex;
+        showToast(
+            "The Matrix account or connection changed. Unsent attachments remain in the draft.",
+            Toasts.Type.FAILURE
+        );
+    };
+
+    let transactionIds: string[];
+    let attachmentGroups: Array<MatrixAttachmentGroupDTO | undefined> | undefined;
+    try {
+        if (!sessionIsCurrent()) {
+            stopForSessionChange();
+            return result;
+        }
+        transactionIds = await Promise.all(uploads.map(({ upload, file }) =>
+            attachmentTxnId(channelId, upload, file)));
+        if (!sessionIsCurrent()) {
+            stopForSessionChange();
+            return result;
+        }
+        attachmentGroups = await attachmentGroupPlan(channelId, sessionToken, uploads, transactionIds);
+        if (!sessionIsCurrent()) {
+            stopForSessionChange();
+            return result;
+        }
+    } catch {
+        showToast("Discord could not prepare this attachment batch for Matrix.", Toasts.Type.FAILURE);
+        return result;
+    }
+    if (!attachmentGroups) return result;
+    const plannedUploads = uploads.map((item, index) => ({
+        ...item,
+        txnId: transactionIds[index],
+        attachmentGroup: attachmentGroups![index],
+        originalIndex: index,
+    })).sort((left, right) =>
+        (left.attachmentGroup?.index ?? left.originalIndex)
+        - (right.attachmentGroup?.index ?? right.originalIndex));
+
+    for (let index = 0; index < plannedUploads.length; index++) {
+        const { upload, file, txnId, attachmentGroup } = plannedUploads[index];
+        let bytes: Uint8Array<ArrayBuffer>;
+        try {
+            if (!sessionIsCurrent()) {
+                stopForSessionChange(index);
+                break;
+            }
+            const buffer = await file.arrayBuffer();
+            if (buffer.byteLength !== file.size || buffer.byteLength > MAX_MATRIX_ATTACHMENT_BYTES) throw new Error();
+            bytes = new Uint8Array(buffer);
+        } catch {
+            showToast(`Discord could not read attachment ${index + 1} for Matrix.`, Toasts.Type.FAILURE);
+            result.failedIndex = index;
+            break;
+        }
+        if (!sessionIsCurrent()) {
+            bytes.fill(0);
+            stopForSessionChange(index);
+            break;
+        }
+
+        const declaredMimeType = attachmentMimeType(upload, file);
+        let metadata: Awaited<ReturnType<typeof videoMetadata>> = {};
+        if (upload.isVideo || declaredMimeType?.startsWith("video/")) {
+            try {
+                if (!sessionIsCurrent()) {
+                    bytes.fill(0);
+                    stopForSessionChange(index);
+                    break;
+                }
+                metadata = await videoMetadata(file);
+            } catch {
+                // Dimensions and duration are optional Matrix metadata. A
+                // valid file should still send when the browser cannot probe it.
+            }
+            if (!sessionIsCurrent()) {
+                bytes.fill(0);
+                stopForSessionChange(index);
+                break;
+            }
+        }
+
+        const finalAttachment = index === plannedUploads.length - 1;
+        showToast(`Uploading attachment ${index + 1} of ${plannedUploads.length} to Matrix...`, Toasts.Type.MESSAGE);
+        let sent = false;
+        let sessionChangedAfterSend = false;
+        try {
+            if (!sessionIsCurrent()) {
+                stopForSessionChange(index);
+                break;
+            }
+            sent = await sendMatrixAttachment(channelId, {
+                name: attachmentName(upload, file),
+                txnId,
+                declaredMimeType,
+                bytes,
+                // Caption and reply are attached to the final event. If an
+                // earlier item fails, both remain in the Discord draft and are
+                // therefore delivered exactly once on a later retry.
+                caption: finalAttachment ? caption : undefined,
+                attachmentGroup,
+                ...metadata
+            }, finalAttachment ? replyMessageId : undefined);
+            sessionChangedAfterSend = !sessionIsCurrent();
+        } catch {
+            sessionChangedAfterSend = !sessionIsCurrent();
+            showToast("Matrix attachment send failed.", Toasts.Type.FAILURE);
+        } finally {
+            bytes.fill(0);
+        }
+
+        if (!sent && sessionChangedAfterSend) {
+            stopForSessionChange(index);
+            break;
+        }
+        if (!sent) {
+            result.failedIndex = index;
+            break;
+        }
+        result.sent++;
+        if (finalAttachment) result.contentConsumed = true;
+
+        // Remove only this successful item. Current and later failures remain
+        // visible and retryable, while already-sent files cannot be resent.
+        if (!removeSentUpload(channelId, upload)) {
+            rememberConsumedUpload(channelId, upload);
+            result.failedIndex = index;
+            result.cleanupFailed = true;
+            break;
+        }
+        if (sessionChangedAfterSend) {
+            stopForSessionChange(index + 1 < plannedUploads.length ? index + 1 : undefined);
+            break;
+        }
+    }
+
+    if (result.sent === result.total) attachmentGroupAssignments.delete(channelId);
+    result.complete = result.sent === result.total && !result.cleanupFailed;
+    return result;
+}
+
+function getStickerForMatrix(stickerId: unknown) {
+    if (typeof stickerId !== "string" || !/^[0-9]{17,20}$/u.test(stickerId)) return undefined;
+    try {
+        return StickersStore?.getStickerById(stickerId);
+    } catch {
+        return undefined;
+    }
+}
+
+function MatrixIcon({ height = 28, width = 28, className }: IconProps) {
+    return (
+        <svg aria-hidden="true" className={className} width={width} height={height} viewBox="0 0 28 28" fill="none">
+            <path d="M6 4H3v20h3M22 4h3v20h-3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <path d="M8 19V9h2.7l3.3 4.2L17.3 9H20v10h-3v-5.7L14 17l-3-3.7V19H8Z" fill="currentColor" />
+        </svg>
+    );
+}
+
+function SearchIcon({ height = 24, width = 24 }: IconProps) {
+    return (
+        <svg aria-hidden="true" width={width} height={height} viewBox="0 0 24 24">
+            <path fill="currentColor" d="M10.5 3a7.5 7.5 0 1 0 4.73 13.32l4.22 4.23a1 1 0 0 0 1.42-1.42l-4.23-4.22A7.5 7.5 0 0 0 10.5 3Zm-5.5 7.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0Z" />
+        </svg>
+    );
+}
+
+function MembersIcon({ height = 24, width = 24 }: IconProps) {
+    return (
+        <svg aria-hidden="true" width={width} height={height} viewBox="0 0 24 24">
+            <path fill="currentColor" d="M8 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8.5-1a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM1.5 20.5c0-4 2.7-6.5 6.5-6.5s6.5 2.5 6.5 6.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1Zm13.2.5c.2-.8.3-1.6.2-2.4-.1-1.6-.7-3-1.7-4.1a6 6 0 0 1 3.3-1c3.5 0 6 2.4 6 6a1.5 1.5 0 0 1-1.5 1.5h-6.3Z" />
+        </svg>
+    );
+}
+
+function renderMatrixToolbar(channel: any) {
+    return [
+        channel.type !== ChannelType.DM && (
+            <Tooltip key="matrix-members" text="Show Member List">
+                {tooltipProps => (
+                    <button
+                        {...tooltipProps}
+                        type="button"
+                        className="vc-matrix-search-button"
+                        aria-label="Show member list"
+                        onClick={() => ChannelSidebarActions.toggleMembersSection()}
+                    >
+                        <MembersIcon />
+                    </button>
+                )}
+            </Tooltip>
+        ),
+        <Tooltip key="matrix-search" text="Search">
+            {tooltipProps => (
+                <button
+                    {...tooltipProps}
+                    type="button"
+                    className="vc-matrix-search-button"
+                    aria-label="Search messages"
+                    onClick={() => openMatrixSearch(channel.id)}
+                >
+                    <SearchIcon />
+                </button>
+            )}
+        </Tooltip>,
+    ].filter(Boolean);
+}
+
+function renderMatrixReadOnlyTitle(channel: any) {
+    const name = typeof channel?.name === "string" && channel.name.trim()
+        ? channel.name.trim()
+        : "Group chat";
+    return (
+        <div className="vc-matrix-readonly-title" role="heading" aria-level={1} aria-label={name} title={name}>
+            <span>{name}</span>
+        </div>
+    );
+}
+
+function openMatrixSettings() {
+    try {
+        SettingsRouter.openUserSettings(MATRIX_SETTINGS_ENTRY_KEY);
+    } catch {
+        openPluginModal(MatrixBridgePlugin);
+    }
+}
+
+function confirmLeaveMatrixGuild(guildId: string, label: string) {
+    openModal(modalProps => (
+        <ConfirmModal
+            {...modalProps}
+            title={`Leave ${label}?`}
+            confirmText="Leave Server"
+            cancelText="Cancel"
+            variant="danger"
+            onConfirm={() => void leaveMatrixGuild(guildId)}
+        >
+            This leaves the Matrix Space from this account. Rooms joined separately remain available as Matrix chats.
+        </ConfirmModal>
+    ));
+}
+
+function confirmLeaveMatrixGroup(channelId: string, label: string) {
+    openModal(modalProps => (
+        <ConfirmModal
+            {...modalProps}
+            title={`Leave ${label}?`}
+            confirmText="Leave Group"
+            cancelText="Cancel"
+            variant="danger"
+            onConfirm={() => void leaveMatrixGroup(channelId)}
+        >
+            This leaves the Matrix group chat from this account. You may need another invitation to return.
+        </ConfirmModal>
+    ));
+}
+
+function replaceMatrixGuildLeaveAction(
+    children: Parameters<NavContextMenuPatchCallback>[0],
+    guildId: string,
+    label: string
+) {
+    const replacement = (
+        <Menu.MenuItem
+            key="vc-matrix-leave-server"
+            id="vc-matrix-leave-server"
+            label="Leave Matrix server"
+            color="danger"
+            action={() => confirmLeaveMatrixGuild(guildId, label)}
+        />
+    );
+    const destructiveGroup = findGroupChildrenByChildId(["leave-guild", "delete-guild"], children);
+    if (!destructiveGroup) {
+        children.push(<Menu.MenuGroup key="vc-matrix-leave-server-group">{replacement}</Menu.MenuGroup>);
+        return;
+    }
+
+    const destructiveIds = new Set(["leave-guild", "delete-guild"]);
+    const firstIndex = destructiveGroup.findIndex(child => destructiveIds.has(child?.props?.id));
+    if (firstIndex === -1) return;
+    destructiveGroup.splice(firstIndex, 1, replacement);
+    for (let index = destructiveGroup.length - 1; index >= 0; index--) {
+        if (index !== firstIndex && destructiveIds.has(destructiveGroup[index]?.props?.id)) {
+            destructiveGroup.splice(index, 1);
+        }
+    }
+}
+
+const matrixGuildCreateMenuPatch: NavContextMenuPatchCallback = (children, { guild }) => {
+    const context = guild?.id ? getMatrixSpaceCreateContext(guild.id) : undefined;
+    if (!context) return;
+    if (!context.canManageSpaceChildren) {
+        children.push(
+            <Menu.MenuGroup key="vc-matrix-create-guild-items">
+                <Menu.MenuItem
+                    id="vc-matrix-create-no-permission"
+                    label="Matrix creation requires Space permission"
+                    disabled
+                />
+            </Menu.MenuGroup>
+        );
+        replaceMatrixGuildLeaveAction(children, guild.id, context.parentLabel);
+        return;
+    }
+    children.push(
+        <Menu.MenuGroup key="vc-matrix-create-guild-items">
+            <Menu.MenuItem
+                id="vc-matrix-create-channel"
+                label="Create Matrix channel"
+                action={() => openMatrixSpaceChildModal(
+                    context.parentSpaceId,
+                    context.parentLabel,
+                    "room",
+                    true
+                )}
+            />
+            <Menu.MenuItem
+                id="vc-matrix-create-category"
+                label="Create Matrix category"
+                action={() => openMatrixSpaceChildModal(
+                    context.parentSpaceId,
+                    context.parentLabel,
+                    "space",
+                    true
+                )}
+            />
+        </Menu.MenuGroup>
+    );
+    replaceMatrixGuildLeaveAction(children, guild.id, context.parentLabel);
+};
+
+const matrixCategoryCreateMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
+    const context = channel?.id ? getMatrixCategoryCreateContext(channel.id) : undefined;
+    if (!context) return;
+    if (!context.canManageSpaceChildren) {
+        children.push(
+            <Menu.MenuGroup key="vc-matrix-create-category-items">
+                <Menu.MenuItem
+                    id="vc-matrix-create-category-no-permission"
+                    label="Matrix creation requires Space permission"
+                    disabled
+                />
+            </Menu.MenuGroup>
+        );
+        return;
+    }
+    children.push(
+        <Menu.MenuGroup key="vc-matrix-create-category-items">
+            <Menu.MenuItem
+                id="vc-matrix-create-category-channel"
+                label="Create Matrix channel"
+                action={() => openMatrixSpaceChildModal(
+                    context.parentSpaceId,
+                    context.parentLabel,
+                    "room",
+                    true
+                )}
+            />
+        </Menu.MenuGroup>
+    );
+};
+
+const matrixGroupLeaveMenuPatch: NavContextMenuPatchCallback = (children, { channel }) => {
+    const context = channel?.id ? getMatrixGroupLeaveContext(channel.id) : undefined;
+    if (!context) return;
+    const replacement = (
+        <Menu.MenuItem
+            key="vc-matrix-leave-group"
+            id="vc-matrix-leave-group"
+            label="Leave Matrix group"
+            color="danger"
+            action={() => confirmLeaveMatrixGroup(context.channelId, context.label)}
+        />
+    );
+    const leaveGroup = findGroupChildrenByChildId("leave-channel", children);
+    if (!leaveGroup) {
+        children.push(<Menu.MenuGroup key="vc-matrix-leave-group-container">{replacement}</Menu.MenuGroup>);
+        return;
+    }
+    const leaveIndex = leaveGroup.findIndex(child => child?.props?.id === "leave-channel");
+    if (leaveIndex === -1) return;
+    leaveGroup.splice(leaveIndex, 1, replacement);
+    for (let index = leaveGroup.length - 1; index >= 0; index--) {
+        if (index !== leaveIndex && leaveGroup[index]?.props?.id === "leave-channel") leaveGroup.splice(index, 1);
+    }
+};
+
+function onMatrixSearchShortcut(event: KeyboardEvent) {
+    if (event.defaultPrevented
+        || event.altKey
+        || event.shiftKey
+        || event.key.toLocaleLowerCase() !== "f"
+        || !event.ctrlKey && !event.metaKey) return;
+    const channelId = SelectedChannelStore.getChannelId();
+    if (!channelId || !isMatrixChannelId(channelId)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    const existingInput = document.querySelector<HTMLInputElement>("#vc-matrix-search-input");
+    if (existingInput) existingInput.focus();
+    else openMatrixSearch(channelId);
+}
+
+const MatrixBridgePlugin = definePlugin({
+    name: "MatrixBridge",
+    description: "Brings Matrix rooms, spaces, and direct messages into Discord.",
+    authors: [{ name: "Matrix Bridge", id: 0n }],
+    tags: ["Chat", "Privacy"],
+    dependencies: ["MessageEventsAPI", "PinDMs"],
+    enabledByDefault: IS_DISCORD_DESKTOP || IS_VESKTOP,
+    hidden: !(IS_DISCORD_DESKTOP || IS_VESKTOP),
+    settings,
+
+    contextMenus: {
+        "guild-context": matrixGuildCreateMenuPatch,
+        "guild-header-popout": matrixGuildCreateMenuPatch,
+        "channel-context": matrixCategoryCreateMenuPatch,
+        "gdm-context": matrixGroupLeaveMenuPatch,
+    },
+
+    patches: [
+        {
+            // Discord's lazy-image experiment can mount a synthetic room while
+            // it is hidden, then never deliver a later intersection callback.
+            // Eagerly start only media URLs owned by this bridge; all normal
+            // Discord media keeps the stock lazy-loading path.
+            find: '"2026-02-lazy-load-all-images"',
+            replacement: {
+                match: /componentDidMount\(\)\{let\{readyState:(\i)\}=this\.state;if\(\1===(\i)\.\i\.LOADING\)/,
+                replace: "$&if($self.isMatrixMediaUrl(this.props.src))this._triggerLazyLoad();else ",
+            },
+        },
+        {
+            find: '"MessageManager"',
+            replacement: {
+                match: /forceFetch:\i,isPreload:.+?}=(\i);(?=.+?getChannel\((\i)\))/,
+                replace: (match, request, channelId) => `${match}if($self.isMatrixChannelId(${channelId}))return $self.fetchMatrixMessages(${channelId},${request});`,
+            },
+        },
+        {
+            find: "Missing channel in Channel.renderHeaderToolbar",
+            replacement: [
+                {
+                    match: /(renderHeaderToolbar(?:",|=)\(\)=>\{let\{channel:(\i),[^}]+\}=this\.props;.+?let \i=\[\];)/,
+                    replace: (_, prefix, channel) => `${prefix}if($self.isMatrixChannelId(${channel}.id))return $self.renderMatrixToolbar(${channel});`,
+                },
+                {
+                    match: /(renderMobileToolbar(?:",|=)\(\)=>\{let\{channel:(\i)\}=this\.props;.+?let \i=\[\];)/,
+                    replace: (_, prefix, channel) => `${prefix}if($self.isMatrixChannelId(${channel}.id))return $self.renderMatrixToolbar(${channel});`,
+                },
+                {
+                    match: /(?<=renderHeaderBar(?:",|=)\(\)=>\{.+?hideSearch:(\i)\.isDirectory\(\))/,
+                    replace: (_, channel) => `||$self.isMatrixChannelId(${channel}.id)`,
+                },
+            ],
+        },
+        {
+            // Matrix group chats use Discord's normal title styling, without
+            // exposing rename/avatar/context-menu affordances that cannot be
+            // routed to Matrix yet.
+            find: 'action:"entry_point_hovered"',
+            replacement: {
+                match: /(\i=\i\.memo\(function\((\i)\)\{)(?=let\{channel:\i\}=\2,)/,
+                replace: "$&if($self.isMatrixChannelId($2.channel.id))return $self.renderMatrixReadOnlyTitle($2.channel);",
+            },
+        },
+        {
+            find: "GUILD_SUBSCRIPTIONS_FLUSH:function",
+            replacement: [
+                {
+                    // Member requests can batch multiple guilds. Strip local
+                    // Matrix projections while preserving normal guilds.
+                    match: /GUILD_MEMBERS_REQUEST:function\((\i)\)\{/,
+                    replace: "$&$1={...$1,guildIds:$1.guildIds.filter(guildId=>!$self.isMatrixGuildId(guildId))};if(!$1.guildIds.length)return!1;",
+                },
+                {
+                    match: /GUILD_SEARCH_RECENT_MEMBERS:function\((\i)\)\{/,
+                    replace: "$&if($self.isMatrixGuildId($1.guildId))return;",
+                },
+                {
+                    // Current Discord sends a guild-keyed subscription map,
+                    // not one event.guildId. Never put synthetic IDs on the
+                    // gateway; an invalid guild ID closes the live session.
+                    match: /GUILD_SUBSCRIPTIONS_FLUSH:function\((\i)\)\{let\{subscriptions:(\i)\}=\1;/,
+                    replace: "$&$2=Object.fromEntries(Object.entries($2).filter(([guildId])=>!$self.isMatrixGuildId(guildId)));if(!Object.keys($2).length)return!1;",
+                },
+                {
+                    match: /CALL_CONNECT:function\((\i)\)\{let\{channelId:(\i)\}=\1;/,
+                    replace: "$&if($self.isMatrixChannelId($2))return!1;",
+                },
+                {
+                    match: /CALL_CONNECT_MULTIPLE:function\((\i)\)\{let\{channelIds:(\i)\}=\1;/,
+                    replace: "$&$2=$2.filter(channelId=>!$self.isMatrixChannelId(channelId));",
+                },
+                {
+                    match: /STREAM_START:function\((\i)\)\{let\{streamType:\i,guildId:(\i),channelId:(\i)\}=\1;/,
+                    replace: "$&if($self.isMatrixGuildId($2)||$self.isMatrixChannelId($3))return!1;",
+                },
+                {
+                    match: /REQUEST_FORUM_UNREADS:function\((\i)\)\{let\{guildId:(\i),channelId:(\i),threads:\i\}=\1;/,
+                    replace: "$&if($self.isMatrixGuildId($2)||$self.isMatrixChannelId($3))return;",
+                },
+                {
+                    match: /REQUEST_SOUNDBOARD_SOUNDS:function\((\i)\)\{let\{guildIds:(\i)\}=\1;/,
+                    replace: "$&$2=$2.filter(guildId=>!$self.isMatrixGuildId(guildId));if(!$2.length)return;",
+                },
+            ],
+        },
+        {
+            find: "},closePrivateChannel(",
+            replacement: [
+                {
+                    match: /async openPrivateChannel\((\i)\)\{/,
+                    replace: "$&if($self.hasMatrixRecipients($1?.recipientIds))return $self.openMatrixPrivateChannel($1);",
+                },
+                {
+                    match: /closePrivateChannel\((\i)\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return Promise.resolve();",
+                },
+                {
+                    match: /addRecipient\((\i),\i,\i,\i\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return Promise.resolve($1);",
+                },
+                {
+                    match: /removeRecipient:\((\i),(\i)\)=>/,
+                    replace: "$&$self.isMatrixChannelId($1)?Promise.resolve():",
+                },
+                {
+                    match: /setDMOwner:\((\i),(\i)\)=>/,
+                    replace: "$&$self.isMatrixChannelId($1)?Promise.resolve():",
+                },
+                {
+                    match: /async setName\((\i),\i\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                },
+                {
+                    match: /async setIcon\((\i),\i,\i\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                },
+                {
+                    match: /async updateChannel\((\i),\i,\i\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return;",
+                },
+            ],
+        },
+        {
+            find: '"MessageActionCreators"',
+            replacement: [
+                {
+                    match: /fetchMessages\((\i)\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1.channelId))return $self.fetchMatrixMessages($1.channelId,$1);",
+                },
+                {
+                    match: /async deleteMessage\((\i),(\i)\)\{/,
+                    replace: "$&if($self.isMatrixChannelId($1))return $self.deleteMatrixMessage($1,$2);",
+                },
+            ],
+        },
+        {
+            find: '"TypingStore"',
+            replacement: [
+                {
+                    match: /TYPING_START_LOCAL:function\((\i)\)\{let\{channelId:(\i)\}=\1,/,
+                    replace: (_, event, channelId) => `TYPING_START_LOCAL:function(${event}){let{channelId:${channelId}}=${event};if($self.isMatrixChannelId(${channelId}))return void $self.matrixTyping(${channelId},true);let `,
+                },
+                {
+                    match: /TYPING_STOP_LOCAL:function\((\i)\)\{let\{channelId:(\i)\}=\1,/,
+                    replace: (_, event, channelId) => `TYPING_STOP_LOCAL:function(${event}){let{channelId:${channelId}}=${event};if($self.isMatrixChannelId(${channelId}))return void $self.matrixTyping(${channelId},false);let `,
+                },
+            ],
+        },
+        {
+            find: '"ReadStateStore"',
+            replacement: [
+                {
+                    match: /_ack\(\i,\i\)\{let\{outgoingAck:(\i)\}=this;if\(null==\1\)return;/,
+                    replace: "$&if($self.isMatrixChannelId(this.channelId))return void $self.matrixReceipt(this.channelId,$1);",
+                },
+                {
+                    match: /(\i\.push\(\.\.\.)(\i)(\.map\((\i)=>\(\{channel_id:\4\.channelId,message_id:\4\.messageId,read_state_type:\4\.readStateType\}\)\)\))/,
+                    replace: (_, push, list, map) => `${push}${list}.filter(entry=>!$self.isMatrixChannelId(entry.channelId))${map}`,
+                },
+                {
+                    match: /(?=\i&&this\._persisted&&\i\.\i\.del\(\{url:\i\.\i\.CHANNEL_ACK\(this\.channelId\))/,
+                    replace: "!$self.isMatrixChannelId(this.channelId)&&",
+                },
+            ],
+        },
+        {
+            find: 'type:"MESSAGE_REACTION_ADD_USERS",channelId:',
+            replacement: [
+                {
+                    match: /async function (\i)\((\i),(\i),(\i)\)\{(?=var \i,\i,\i,\i;let \i,\i=arguments\.length>3)/,
+                    replace: "$&if($self.isMatrixChannelId($2))return $self.addMatrixReaction($2,$3,$4);",
+                },
+                {
+                    match: /async function \i\((\i)\)\{(?=let\{channelId:(\i),messageId:(\i),emoji:(\i),location:)/,
+                    replace: "$&if($self.isMatrixChannelId($1.channelId))return $self.removeMatrixReaction($1.channelId,$1.messageId,$1.emoji);",
+                },
+            ],
+        },
+    ],
+
+    flux: {
+        CHANNEL_SELECT({ channelId }: { channelId?: string; }) {
+            queueMicrotask(() => activateMatrixChannel(channelId));
+        },
+        CONNECTION_OPEN() {
+            setTimeout(() => {
+                const snapshot = getLatestSnapshot();
+                if (snapshot) applySnapshot(snapshot);
+                else void restartBridge(false);
+            });
+        },
+        CONNECTION_OPEN_SUPPLEMENTAL() {
+            setTimeout(() => {
+                const snapshot = getLatestSnapshot();
+                if (snapshot) applySnapshot(snapshot);
+            });
+        },
+        BULK_ACK({ channels }: { channels?: Array<{ channelId: string; messageId?: string; }>; }) {
+            for (const { channelId, messageId } of channels ?? []) {
+                if (messageId && isMatrixChannelId(channelId)) void matrixReceipt(channelId, messageId);
+            }
+        },
+    },
+
+    async onBeforeMessageSend(channelId, message, options, props) {
+        if (!isMatrixChannelId(channelId)) return;
+        // Once a Matrix channel is recognized, every exit must remain
+        // fail-closed. MessageEvents deliberately treats an uncaught listener
+        // error as "continue with Discord's normal send", which would be the
+        // wrong privacy behavior here.
+        try {
+
+            const stickerIds = Array.isArray(options.stickerIds) ? options.stickerIds : [];
+        if (props.hasStickers || stickerIds.length > 0) {
+            if (props.hasAttachments) {
+                showToast("Send a Matrix sticker by itself, without attachments.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+            if (stickerIds.length !== 1) {
+                showToast("Matrix can send one sticker at a time.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+            if (typeof message.content !== "string" || message.content.length > 0) {
+                showToast("Send a Matrix sticker by itself, without text.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+
+            const stickerId = stickerIds[0];
+            const sticker = getStickerForMatrix(stickerId);
+            const stickerName = typeof sticker?.name === "string" && sticker.name.length <= 100
+                ? sticker.name
+                    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+                    .replace(/\s+/gu, " ")
+                    .trim()
+                : "";
+            if (
+                !sticker
+                || sticker.id !== stickerId
+                || !stickerName
+            ) {
+                showToast("Discord could not resolve that sticker for Matrix.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+
+            const formatType = sticker.format_type;
+            if (
+                formatType !== StickerFormatType.PNG
+                && formatType !== StickerFormatType.APNG
+                && formatType !== StickerFormatType.GIF
+            ) {
+                showToast("This sticker format is not supported on Matrix yet.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+
+            const reference = options.messageReference as any;
+            const sent = await sendMatrixSticker(channelId, {
+                id: sticker.id,
+                name: stickerName,
+                formatType,
+            }, reference?.message_id ?? reference?.messageId);
+            if (sent) {
+                FluxDispatcher.dispatch({ type: "DELETE_PENDING_REPLY", channelId });
+                FluxDispatcher.dispatch({
+                    type: "CLEAR_STICKER_PREVIEW",
+                    channelId,
+                    draftType: DraftType.ChannelMessage
+                });
+            }
+            return { cancel: true, shouldClear: sent };
+        }
+
+        if (props.hasAttachments) {
+            if (activeAttachmentBatches.has(channelId)) {
+                showToast("A Matrix attachment batch is already uploading.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            }
+            activeAttachmentBatches.add(channelId);
+            try {
+                if (tombstoneSafetyLock) {
+                    showToast(
+                        "Matrix attachment sending is locked because Discord could not safely clean an earlier sent draft.",
+                        Toasts.Type.FAILURE
+                    );
+                    return { cancel: true };
+                }
+                let draftUploads = UploadAttachmentStore.getUploads(channelId, DraftType.ChannelMessage);
+                for (const upload of draftUploads) {
+                    if (upload.status === "REMOVED_FROM_MSG_DRAFT") rememberConsumedUpload(channelId, upload);
+                }
+                if (tombstoneSafetyLock) {
+                    showToast(
+                        "Matrix attachment sending is locked because Discord could not safely clean an earlier sent draft.",
+                        Toasts.Type.FAILURE
+                    );
+                    return { cancel: true };
+                }
+                if (!retryConsumedUploadCleanup(channelId, draftUploads)) {
+                    showToast(
+                        "A previously sent Matrix attachment is still in the Discord draft. Remove it before retrying.",
+                        Toasts.Type.FAILURE
+                    );
+                    return { cancel: true };
+                }
+                draftUploads = UploadAttachmentStore.getUploads(channelId, DraftType.ChannelMessage);
+                if (draftUploads.length < 1) {
+                    showToast("There are no unsent Matrix attachments left in this draft.", Toasts.Type.FAILURE);
+                    return { cancel: true };
+                }
+                if (draftUploads.length > MAX_MATRIX_ATTACHMENT_COUNT) {
+                    showToast(`Matrix sends up to ${MAX_MATRIX_ATTACHMENT_COUNT} attachments at once.`, Toasts.Type.FAILURE);
+                    return { cancel: true };
+                }
+
+                let aggregateBytes = 0;
+                const uploads: Array<{ upload: MatrixComposerUpload; file: File; }> = [];
+                for (const upload of draftUploads) {
+                    const file = upload?.item?.file;
+                    if (!(file instanceof File)) {
+                        showToast("Discord could not read an attachment for Matrix.", Toasts.Type.FAILURE);
+                        return { cancel: true };
+                    }
+                    if (!Number.isSafeInteger(file.size) || file.size < 1 || file.size > MAX_MATRIX_ATTACHMENT_BYTES) {
+                        showToast("Each Matrix attachment must be between 1 byte and 25 MiB.", Toasts.Type.FAILURE);
+                        return { cancel: true };
+                    }
+                    aggregateBytes += file.size;
+                    if (aggregateBytes > MAX_MATRIX_ATTACHMENT_BATCH_BYTES) {
+                        showToast("A Matrix attachment batch can be at most 100 MiB.", Toasts.Type.FAILURE);
+                        return { cancel: true };
+                    }
+                    uploads.push({ upload, file });
+                }
+
+                const reference = options.messageReference as any;
+                const result = await sendMatrixAttachmentBatch(
+                    channelId,
+                    uploads,
+                    typeof message.content === "string" && message.content ? message.content : undefined,
+                    reference?.message_id ?? reference?.messageId
+                );
+                if (result.cleanupFailed) {
+                    showToast(
+                        "Matrix sent a file, but Discord could not remove it from the draft. Remove that sent file before retrying.",
+                        Toasts.Type.FAILURE
+                    );
+                } else if (!result.complete && result.sent > 0) {
+                    showToast(
+                        `Matrix sent ${result.sent} of ${result.total} attachments. Unsent files remain in the draft.`,
+                        Toasts.Type.FAILURE
+                    );
+                }
+                if (result.contentConsumed) {
+                    FluxDispatcher.dispatch({ type: "DELETE_PENDING_REPLY", channelId });
+                }
+                return { cancel: true, shouldClear: result.contentConsumed };
+            } catch {
+                showToast("Discord could not prepare the Matrix attachment batch.", Toasts.Type.FAILURE);
+                return { cancel: true };
+            } finally {
+                activeAttachmentBatches.delete(channelId);
+            }
+        }
+            const reference = options.messageReference as any;
+            const sent = await sendMatrixMessage(channelId, message.content, reference?.message_id ?? reference?.messageId);
+            if (sent) FluxDispatcher.dispatch({ type: "DELETE_PENDING_REPLY", channelId });
+            return { cancel: true, shouldClear: sent };
+        } catch {
+            try {
+                showToast("Matrix blocked this send after an unexpected local error.", Toasts.Type.FAILURE);
+            } catch {
+                // Cancellation must survive a broken toast subsystem.
+            }
+            return { cancel: true };
+        }
+    },
+
+    async onBeforeMessageEdit(channelId, messageId, message) {
+        if (!isMatrixChannelId(channelId)) return;
+        try {
+            const edited = await editMatrixMessage(channelId, messageId, message.content);
+            return { cancel: true, shouldClear: edited };
+        } catch {
+            try {
+                showToast("Matrix blocked this edit after an unexpected local error.", Toasts.Type.FAILURE);
+            } catch {
+                // Cancellation must survive a broken toast subsystem.
+            }
+            return { cancel: true };
+        }
+    },
+
+    start() {
+        const lifecycleGeneration = ++pluginLifecycleGeneration;
+        installRestGuard();
+        installReadStateProjection();
+        window.addEventListener("keydown", onMatrixSearchShortcut, true);
+        if (!SettingsPlugin.customEntries.some(entry => entry.key === MATRIX_SETTINGS_ENTRY_KEY)) {
+            SettingsPlugin.customEntries.push({
+                key: MATRIX_SETTINGS_ENTRY_KEY,
+                title: "Matrix",
+                panelTitle: "Matrix Bridge",
+                Component: MatrixSettings,
+                Icon: MatrixIcon,
+            });
+        }
+        void pendingPluginShutdown.then(() => {
+            if (lifecycleGeneration === pluginLifecycleGeneration) return startBridge();
+        });
+    },
+
+    stop() {
+        pluginLifecycleGeneration++;
+        attachmentGroupAssignments.clear();
+        window.removeEventListener("keydown", onMatrixSearchShortcut, true);
+        removeFromArray(SettingsPlugin.customEntries, entry => entry.key === MATRIX_SETTINGS_ENTRY_KEY);
+        pendingPluginShutdown = suspendBridge().catch(() => undefined);
+        removeReadStateProjection();
+        removeRestGuard();
+    },
+
+    toolboxActions: {
+        "Open Matrix settings": openMatrixSettings,
+        "Reconnect Matrix": () => void restartBridge(),
+    },
+
+    isMatrixChannelId,
+    isMatrixGuildId,
+    isMatrixMediaUrl,
+    hasMatrixRecipients,
+    openMatrixPrivateChannel,
+    renderMatrixToolbar,
+    renderMatrixReadOnlyTitle,
+    fetchMatrixMessages,
+    deleteMatrixMessage,
+    addMatrixReaction,
+    removeMatrixReaction,
+    matrixTyping,
+    matrixReceipt,
+});
+
+export default MatrixBridgePlugin;

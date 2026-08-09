@@ -1,0 +1,713 @@
+# Disorder Vencord one-file Windows installer.
+#
+# Download this file first, inspect it if desired, and then run the downloaded
+# file with Windows PowerShell. Never pipe a network response into PowerShell.
+
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$Repository = "__DISORDER_REPOSITORY__"
+$PublicKeyModulus = "__DISORDER_UPDATE_RSA_MODULUS__"
+$PublicKeyExponent = "__DISORDER_UPDATE_RSA_EXPONENT__"
+$PublicKeyFingerprint = "__DISORDER_PUBLIC_KEY_FINGERPRINT__"
+$StablePatcherBase64 = "__DISORDER_STABLE_PATCHER_BASE64__"
+$InstallerUrl = "https://github.com/Vencord/Installer/releases/download/v1.4.0/VencordInstallerCli.exe"
+$InstallerSha256 = "466d2a0be1f380ddffed052df3cc132125fa34dc1af29312e14f13f358c8d2a2"
+$ManifestName = "disorder-manifest.json"
+$SignatureName = "disorder-manifest.sig"
+$RuntimeName = "disorder-runtime.zip"
+$AllowedDownloadHosts = @(
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com"
+)
+$ExpectedRuntimeFiles = @(
+    "LICENSE",
+    "fflate.LICENSE",
+    "matrix-js-sdk.LICENSE",
+    "matrixBridgePreload.js",
+    "matrixBridgeWorker.js",
+    "matrixBridgeWorker.js.LEGAL.txt",
+    "matrixSecureView.css",
+    "matrixSecureView.js",
+    "matrixSecureViewPreload.js",
+    "matrix_sdk_crypto_wasm.LICENSE",
+    "matrix_sdk_crypto_wasm_bg.wasm",
+    "package.json",
+    "patcher.js",
+    "patcher.js.LEGAL.txt",
+    "preload.js",
+    "renderer.css",
+    "renderer.js",
+    "renderer.js.LEGAL.txt"
+)
+
+function Stop-Install([string]$Code) {
+    throw "Disorder installation stopped safely ($Code). Nothing downloaded by this script was executed."
+}
+
+function Test-ExactProperties($Value, [string[]]$Required, [string[]]$Optional = @()) {
+    if ($null -eq $Value) { return $false }
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    $allowed = @($Required + $Optional | Sort-Object -Unique)
+    foreach ($name in $Required) {
+        if ($actual -notcontains $name) { return $false }
+    }
+    foreach ($name in $actual) {
+        if ($allowed -notcontains $name) { return $false }
+    }
+    return $true
+}
+
+function Test-SafePositiveInteger($Value) {
+    return (($Value -is [int]) -or ($Value -is [long])) -and $Value -ge 1 -and $Value -le 9007199254740991
+}
+
+function Get-OptionalProperty($Value, [string]$Name) {
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function ConvertFrom-Base64Url([string]$Value) {
+    if ($Value -cnotmatch "^[A-Za-z0-9_-]+$") { Stop-Install "PUBLIC_KEY" }
+    $standard = $Value.Replace("-", "+").Replace("_", "/")
+    $standard += "=" * ((4 - ($standard.Length % 4)) % 4)
+    try {
+        $bytes = [Convert]::FromBase64String($standard)
+        $canonical = [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+        if ($canonical -cne $Value) { Stop-Install "PUBLIC_KEY" }
+        return $bytes
+    } catch {
+        Stop-Install "PUBLIC_KEY"
+    }
+}
+
+function Get-Sha256([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Read-BoundedBytes([string]$Path, [long]$Maximum, [string]$Code) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.PSIsContainer -or
+        $item.Length -lt 1 -or
+        $item.Length -gt $Maximum) {
+        Stop-Install $Code
+    }
+    return [IO.File]::ReadAllBytes($item.FullName)
+}
+
+function New-UpdatePublicKey {
+    $modulus = ConvertFrom-Base64Url $PublicKeyModulus
+    $exponent = ConvertFrom-Base64Url $PublicKeyExponent
+    $mostSignificant = [int]$modulus[0]
+    $mostSignificantBits = 0
+    while ($mostSignificant -gt 0) {
+        $mostSignificantBits++
+        $mostSignificant = $mostSignificant -shr 1
+    }
+    $modulusBits = (($modulus.Length - 1) * 8) + $mostSignificantBits
+    if ($modulus.Length -lt 384 -or
+        $modulus.Length -gt 512 -or
+        $modulusBits -lt 3072 -or
+        $modulusBits -gt 4096 -or
+        $PublicKeyExponent -cne "AQAB" -or
+        $exponent.Length -ne 3) {
+        Stop-Install "PUBLIC_KEY"
+    }
+    $parameters = New-Object Security.Cryptography.RSAParameters
+    $parameters.Modulus = $modulus
+    $parameters.Exponent = $exponent
+    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
+    try {
+        $rsa.ImportParameters($parameters)
+        return $rsa
+    } catch {
+        $rsa.Dispose()
+        Stop-Install "PUBLIC_KEY"
+    }
+}
+
+function Test-ManifestSignature([string]$ManifestPath, [string]$SignaturePath) {
+    $manifestBytes = Read-BoundedBytes $ManifestPath (128 * 1024) "MANIFEST"
+    $signatureBytes = Read-BoundedBytes $SignaturePath 2048 "SIGNATURE"
+    $signatureText = [Text.Encoding]::ASCII.GetString($signatureBytes)
+    if ($signatureText -cnotmatch "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$") {
+        Stop-Install "SIGNATURE"
+    }
+    try {
+        $signature = [Convert]::FromBase64String($signatureText)
+    } catch {
+        Stop-Install "SIGNATURE"
+    }
+    if ($signature.Length -lt 384 -or
+        $signature.Length -gt 512 -or
+        [Convert]::ToBase64String($signature) -cne $signatureText) {
+        Stop-Install "SIGNATURE"
+    }
+    $rsa = New-UpdatePublicKey
+    try {
+        $oid = [Security.Cryptography.CryptoConfig]::MapNameToOID("SHA256")
+        if (-not $rsa.VerifyData($manifestBytes, $oid, $signature)) { Stop-Install "SIGNATURE" }
+    } finally {
+        $rsa.Dispose()
+    }
+    return $manifestBytes
+}
+
+function Read-AndValidateManifest([byte[]]$Bytes) {
+    try {
+        $manifest = [Text.Encoding]::UTF8.GetString($Bytes) | ConvertFrom-Json
+    } catch {
+        Stop-Install "MANIFEST"
+    }
+    if (-not (Test-ExactProperties $manifest @(
+        "schema", "product", "channel", "sequence", "version", "commit", "publishedAt", "bundle", "files", "changes"
+    ))) { Stop-Install "MANIFEST" }
+    if ($manifest.schema -ne 1 -or $manifest.product -cne "disorder-vencord" -or $manifest.channel -cne "stable") {
+        Stop-Install "MANIFEST"
+    }
+    if (-not (Test-SafePositiveInteger $manifest.sequence)) { Stop-Install "MANIFEST" }
+    if (($manifest.commit -isnot [string]) -or $manifest.commit -cnotmatch "^[0-9a-f]{40}$") { Stop-Install "MANIFEST" }
+    if (($manifest.version -isnot [string]) -or $manifest.version -cnotmatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$") {
+        Stop-Install "MANIFEST"
+    }
+    if (($manifest.publishedAt -isnot [string]) -or $manifest.publishedAt -cnotmatch "^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$") {
+        Stop-Install "MANIFEST"
+    }
+    $published = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact(
+        $manifest.publishedAt,
+        "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$published
+    )) { Stop-Install "MANIFEST" }
+    if (-not (Test-ExactProperties $manifest.bundle @("name", "size", "sha256"))) { Stop-Install "MANIFEST" }
+    if ($manifest.bundle.name -cne $RuntimeName -or
+        -not (Test-SafePositiveInteger $manifest.bundle.size) -or
+        $manifest.bundle.size -gt (64 * 1024 * 1024) -or
+        ($manifest.bundle.sha256 -isnot [string]) -or
+        $manifest.bundle.sha256 -cnotmatch "^[0-9a-f]{64}$") {
+        Stop-Install "MANIFEST"
+    }
+    if ($null -eq $manifest.changes -or @($manifest.changes).Count -ne 0) { Stop-Install "MANIFEST_PRIVACY" }
+    if ($null -eq $manifest.files -or @($manifest.files).Count -ne $ExpectedRuntimeFiles.Count) {
+        Stop-Install "MANIFEST_FILES"
+    }
+    $manifestFiles = @($manifest.files)
+    $totalPayloadSize = [long]0
+    for ($index = 0; $index -lt $manifestFiles.Count; $index++) {
+        $file = $manifestFiles[$index]
+        if (-not (Test-ExactProperties $file @("path", "size", "sha256"))) { Stop-Install "MANIFEST_FILES" }
+        if (($file.path -isnot [string]) -or $file.path -cne $ExpectedRuntimeFiles[$index]) { Stop-Install "MANIFEST_FILES" }
+        if (-not (Test-SafePositiveInteger $file.size) -or
+            $file.size -gt (16 * 1024 * 1024) -or
+            ($file.sha256 -isnot [string]) -or
+            $file.sha256 -cnotmatch "^[0-9a-f]{64}$") {
+            Stop-Install "MANIFEST_FILES"
+        }
+        $totalPayloadSize += [long]$file.size
+    }
+    if ($totalPayloadSize -gt (64 * 1024 * 1024)) { Stop-Install "MANIFEST_FILES" }
+    return $manifest
+}
+
+function Assert-FixedAssetUrl([string]$Url) {
+    try { $uri = [Uri]$Url } catch { Stop-Install "RELEASE_URL" }
+    $prefix = "/$Repository/releases/download/"
+    if ($uri.Scheme -cne "https" -or
+        $uri.Host -cne "github.com" -or
+        -not $uri.IsDefaultPort -or
+        -not $uri.AbsolutePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment) -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo)) {
+        Stop-Install "RELEASE_URL"
+    }
+}
+
+function Assert-AllowedDownloadUri([Uri]$Uri, [string[]]$AllowedHosts) {
+    if ($Uri.Scheme -cne "https" -or
+        -not $Uri.IsDefaultPort -or
+        -not [string]::IsNullOrEmpty($Uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($Uri.Fragment) -or
+        $AllowedHosts -cnotcontains $Uri.DnsSafeHost) {
+        Stop-Install "DOWNLOAD_REDIRECT"
+    }
+}
+
+function Invoke-BoundedDownload(
+    [string]$Url,
+    [string]$Destination,
+    [long]$MaximumBytes,
+    [string[]]$AllowedHosts,
+    [string]$Accept = "application/octet-stream"
+) {
+    if ($MaximumBytes -lt 1) { Stop-Install "DOWNLOAD_LIMIT" }
+    try { $current = [Uri]$Url } catch { Stop-Install "DOWNLOAD_URL" }
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        for ($redirects = 0; $redirects -le 5; $redirects++) {
+            $remainingMilliseconds = [long][Math]::Floor((120 - $stopwatch.Elapsed.TotalSeconds) * 1000)
+            if ($remainingMilliseconds -lt 1) { Stop-Install "DOWNLOAD_LIMIT" }
+            Assert-AllowedDownloadUri $current $AllowedHosts
+            $request = [Net.HttpWebRequest]::CreateHttp($current)
+            $request.Method = "GET"
+            $request.AllowAutoRedirect = $false
+            $operationTimeout = [int][Math]::Min(30000, $remainingMilliseconds)
+            $request.Timeout = $operationTimeout
+            $request.ReadWriteTimeout = $operationTimeout
+            $request.UserAgent = "Disorder-Vencord-Installer"
+            $request.Accept = $Accept
+            $request.UseDefaultCredentials = $false
+            $request.PreAuthenticate = $false
+            try {
+                $response = [Net.HttpWebResponse]$request.GetResponse()
+            } catch {
+                Stop-Install "DOWNLOAD_RESPONSE"
+            }
+            if ($stopwatch.Elapsed.TotalSeconds -gt 120) {
+                $response.Dispose()
+                Stop-Install "DOWNLOAD_LIMIT"
+            }
+            $status = [int]$response.StatusCode
+            if (@(301, 302, 303, 307, 308) -contains $status) {
+                $location = $response.Headers["Location"]
+                $response.Dispose()
+                if ($redirects -ge 5 -or [string]::IsNullOrWhiteSpace($location)) { Stop-Install "DOWNLOAD_REDIRECT" }
+                try { $current = New-Object System.Uri -ArgumentList $current, $location } catch { Stop-Install "DOWNLOAD_REDIRECT" }
+                continue
+            }
+            if ($status -ne 200 -or $response.ContentLength -gt $MaximumBytes) {
+                $response.Dispose()
+                Stop-Install "DOWNLOAD_RESPONSE"
+            }
+            $total = [long]0
+            $input = $response.GetResponseStream()
+            $output = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+                $buffer = New-Object byte[] 81920
+                while ($true) {
+                    $remainingMilliseconds = [long][Math]::Floor((120 - $stopwatch.Elapsed.TotalSeconds) * 1000)
+                    if ($remainingMilliseconds -lt 1) { Stop-Install "DOWNLOAD_LIMIT" }
+                    if ($input.CanTimeout) {
+                        $input.ReadTimeout = [int][Math]::Min(30000, $remainingMilliseconds)
+                    }
+                    try {
+                        $read = $input.Read($buffer, 0, $buffer.Length)
+                    } catch {
+                        Stop-Install "DOWNLOAD_STREAM"
+                    }
+                    if ($read -le 0) { break }
+                    $total += $read
+                    if ($total -gt $MaximumBytes) {
+                        Stop-Install "DOWNLOAD_LIMIT"
+                    }
+                    $output.Write($buffer, 0, $read)
+                }
+            } finally {
+                $output.Dispose()
+                $input.Dispose()
+                $response.Dispose()
+            }
+            if ($total -lt 1) { Stop-Install "DOWNLOAD_EMPTY" }
+            return
+        }
+        Stop-Install "DOWNLOAD_REDIRECT"
+    } finally {
+        $stopwatch.Stop()
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            $item = Get-Item -LiteralPath $Destination -Force
+            if ($item.Length -gt $MaximumBytes) { Remove-Item -LiteralPath $Destination -Force }
+        }
+    }
+}
+
+function Get-LatestReleaseAssets([string]$TemporaryPath) {
+    $apiUrl = "https://api.github.com/repos/$Repository/releases/latest"
+    $apiPath = Join-Path $TemporaryPath "latest-release.json"
+    try {
+        Invoke-BoundedDownload $apiUrl $apiPath (1024 * 1024) @("api.github.com") "application/vnd.github+json"
+        $release = [Text.Encoding]::UTF8.GetString((Read-BoundedBytes $apiPath (1024 * 1024) "RELEASE_LOOKUP")) |
+            ConvertFrom-Json
+    } catch {
+        Stop-Install "RELEASE_LOOKUP"
+    }
+    if ($release.draft -ne $false -or $release.prerelease -ne $false -or $null -eq $release.assets) {
+        Stop-Install "RELEASE_LOOKUP"
+    }
+    $allowed = @(
+        $ManifestName,
+        $SignatureName,
+        $RuntimeName,
+        "Install-Disorder.ps1",
+        "Install-Disorder.cmd",
+        "Disorder-Setup.zip"
+    )
+    $assets = @{}
+    foreach ($asset in @($release.assets)) {
+        if (($asset.name -isnot [string]) -or $allowed -cnotcontains $asset.name -or $assets.ContainsKey($asset.name)) {
+            Stop-Install "RELEASE_ASSETS"
+        }
+        if (-not (Test-SafePositiveInteger $asset.size)) { Stop-Install "RELEASE_ASSETS" }
+        Assert-FixedAssetUrl $asset.browser_download_url
+        $assets[$asset.name] = $asset
+    }
+    if ($assets.Count -ne $allowed.Count) { Stop-Install "RELEASE_ASSETS" }
+    if ($assets[$ManifestName].size -gt (128 * 1024) -or
+        $assets[$SignatureName].size -gt 2048 -or
+        $assets[$RuntimeName].size -gt (64 * 1024 * 1024) -or
+        $assets["Install-Disorder.ps1"].size -gt (1024 * 1024) -or
+        $assets["Install-Disorder.cmd"].size -gt (16 * 1024) -or
+        $assets["Disorder-Setup.zip"].size -gt (2 * 1024 * 1024)) {
+        Stop-Install "RELEASE_ASSETS"
+    }
+    return $assets
+}
+
+function Expand-VerifiedRuntime([string]$ArchivePath, $Manifest, [string]$Destination) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $expected = @{}
+    foreach ($file in @($Manifest.files)) { $expected[$file.path] = $file }
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        if ($archive.Entries.Count -ne $ExpectedRuntimeFiles.Count) { Stop-Install "RUNTIME_ARCHIVE" }
+        $seen = @{}
+        for ($entryIndex = 0; $entryIndex -lt $archive.Entries.Count; $entryIndex++) {
+            $entry = $archive.Entries[$entryIndex]
+            if ($entry.FullName -cne $ExpectedRuntimeFiles[$entryIndex] -or
+                -not $expected.ContainsKey($entry.FullName) -or
+                $seen.ContainsKey($entry.FullName) -or
+                $entry.Name -cne $entry.FullName -or
+                $entry.Length -ne $expected[$entry.FullName].size) {
+                Stop-Install "RUNTIME_ARCHIVE"
+            }
+            $seen[$entry.FullName] = $true
+            $target = Join-Path $Destination $entry.FullName
+            $input = $entry.Open()
+            $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+            if ((Get-Item -LiteralPath $target).Length -ne $expected[$entry.FullName].size -or
+                (Get-Sha256 $target) -cne $expected[$entry.FullName].sha256) {
+                Stop-Install "RUNTIME_HASH"
+            }
+        }
+        if ($seen.Count -ne $ExpectedRuntimeFiles.Count) { Stop-Install "RUNTIME_ARCHIVE" }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Test-Identity($Identity) {
+    if (-not (Test-ExactProperties $Identity @("id", "sequence", "commit", "manifestSha256"))) { return $false }
+    if (-not (Test-SafePositiveInteger $Identity.sequence)) { return $false }
+    if (($Identity.id -isnot [string]) -or $Identity.id -cnotmatch "^r[1-9][0-9]{0,15}-[0-9a-f]{12}$") { return $false }
+    if (($Identity.commit -isnot [string]) -or $Identity.commit -cnotmatch "^[0-9a-f]{40}$") { return $false }
+    if (($Identity.manifestSha256 -isnot [string]) -or $Identity.manifestSha256 -cnotmatch "^[0-9a-f]{64}$") { return $false }
+    return $Identity.id -ceq "r$($Identity.sequence)-$($Identity.commit.Substring(0, 12))"
+}
+
+function Read-ExistingState([string]$StatePath) {
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $null }
+    $bytes = Read-BoundedBytes $StatePath (16 * 1024) "EXISTING_STATE"
+    try { $state = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json } catch { Stop-Install "EXISTING_STATE" }
+    if (-not (Test-ExactProperties $state @(
+        "schema", "current", "highestSeenSequence", "highestSeenManifestSha256", "pendingBoot", "bootAttempts"
+    ) @("previous", "failed"))) { Stop-Install "EXISTING_STATE" }
+    if ($state.schema -ne 1 -or
+        $state.pendingBoot -isnot [bool] -or
+        (($state.bootAttempts -isnot [int]) -and ($state.bootAttempts -isnot [long])) -or
+        $state.bootAttempts -lt 0 -or
+        $state.bootAttempts -gt 2 -or
+        (-not $state.pendingBoot -and $state.bootAttempts -ne 0) -or
+        -not (Test-SafePositiveInteger $state.highestSeenSequence) -or
+        ($state.highestSeenManifestSha256 -isnot [string]) -or
+        $state.highestSeenManifestSha256 -cnotmatch "^[0-9a-f]{64}$" -or
+        -not (Test-Identity $state.current)) {
+        Stop-Install "EXISTING_STATE"
+    }
+    $previous = Get-OptionalProperty $state "previous"
+    $failed = Get-OptionalProperty $state "failed"
+    if ($null -ne $previous -and -not (Test-Identity $previous)) { Stop-Install "EXISTING_STATE" }
+    if ($null -ne $failed -and -not (Test-Identity $failed)) { Stop-Install "EXISTING_STATE" }
+    $pointers = @($state.current)
+    if ($null -ne $previous) { $pointers += $previous }
+    if ($null -ne $failed) { $pointers += $failed }
+    if (@($pointers.id | Sort-Object -Unique).Count -ne $pointers.Count -or
+        @($pointers.sequence | Sort-Object -Unique).Count -ne $pointers.Count -or
+        ($null -ne $previous -and $previous.sequence -ge $state.current.sequence)) {
+        Stop-Install "EXISTING_STATE"
+    }
+    foreach ($identity in $pointers) {
+        if ($null -eq $identity) { continue }
+        if ($identity.sequence -gt $state.highestSeenSequence -or
+            ($identity.sequence -eq $state.highestSeenSequence -and
+                $identity.manifestSha256 -cne $state.highestSeenManifestSha256)) {
+            Stop-Install "EXISTING_STATE"
+        }
+    }
+    return $state
+}
+
+function Test-InstalledRelease([string]$ReleasesPath, $Identity) {
+    if (-not (Test-Identity $Identity)) { return $false }
+    $releasePath = Join-Path $ReleasesPath $Identity.id
+    if (-not (Test-Path -LiteralPath $releasePath -PathType Container)) { return $false }
+    $entries = @(Get-ChildItem -LiteralPath $releasePath -Force)
+    $expectedNames = @($ExpectedRuntimeFiles + $ManifestName + $SignatureName | Sort-Object)
+    if (@(Compare-Object @($entries.Name | Sort-Object) $expectedNames).Count -ne 0) { return $false }
+    foreach ($entry in $entries) {
+        if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    }
+    try {
+        $bytes = Test-ManifestSignature (Join-Path $releasePath $ManifestName) (Join-Path $releasePath $SignatureName)
+        $installedManifestHash = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+        if ($installedManifestHash -cne $Identity.manifestSha256) { return $false }
+        $manifest = Read-AndValidateManifest $bytes
+        if ($manifest.sequence -ne $Identity.sequence -or $manifest.commit -cne $Identity.commit) { return $false }
+        foreach ($file in @($manifest.files)) {
+            $path = Join-Path $releasePath $file.path
+            if ((Get-Item -LiteralPath $path).Length -ne $file.size -or (Get-Sha256 $path) -cne $file.sha256) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Write-AtomicUtf8([string]$Path, [string]$Content) {
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    $temporary = Join-Path $directory (".new-" + [Guid]::NewGuid().ToString("N"))
+    [IO.File]::WriteAllText($temporary, $Content, (New-Object Text.UTF8Encoding($false)))
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Path, $null, $true)
+        } else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Assert-DiscordStopped([bool]$RuntimeInstalled = $false) {
+    $discordNames = @("Discord", "DiscordCanary", "DiscordPTB", "DiscordDevelopment")
+    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $discordNames -contains $_.ProcessName })
+    if ($running.Count -ne 0) {
+        if ($RuntimeInstalled) {
+            throw "The signed runtime is installed, but Discord restarted before injection. Fully quit Discord and run setup again to finish."
+        }
+        throw "Fully quit Discord (including its tray icon), then run this installer again. No persistent changes were made."
+    }
+}
+
+if ($PSVersionTable.PSVersion.Major -lt 5) { Stop-Install "POWERSHELL_VERSION" }
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$applicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+if ([string]::IsNullOrWhiteSpace($applicationData)) { Stop-Install "APPDATA" }
+$applicationData = [IO.Path]::GetFullPath($applicationData).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$basePath = [IO.Path]::GetFullPath((Join-Path $applicationData "Vencord"))
+if ([IO.Path]::GetDirectoryName($basePath).TrimEnd([IO.Path]::DirectorySeparatorChar) -ine $applicationData) {
+    Stop-Install "INSTALL_PATH"
+}
+foreach ($existingPath in @($basePath, (Join-Path $basePath "dist"), (Join-Path $basePath "dist\releases"))) {
+    if (Test-Path -LiteralPath $existingPath) {
+        $existingItem = Get-Item -LiteralPath $existingPath -Force
+        if (-not $existingItem.PSIsContainer -or ($existingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Stop-Install "INSTALL_PATH"
+        }
+    }
+}
+
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("DisorderInstall-" + [Guid]::NewGuid().ToString("N"))
+$stagingRelease = $null
+$installLock = $null
+$lockPath = $null
+$installLockOwner = $null
+$ownsInstallLock = $false
+try {
+    New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+    $assets = Get-LatestReleaseAssets $temporaryRoot
+    $manifestPath = Join-Path $temporaryRoot $ManifestName
+    $signaturePath = Join-Path $temporaryRoot $SignatureName
+    $runtimePath = Join-Path $temporaryRoot $RuntimeName
+    Invoke-BoundedDownload $assets[$ManifestName].browser_download_url $manifestPath (128 * 1024) $AllowedDownloadHosts
+    Invoke-BoundedDownload $assets[$SignatureName].browser_download_url $signaturePath 2048 $AllowedDownloadHosts
+    if ((Get-Item -LiteralPath $manifestPath).Length -ne $assets[$ManifestName].size -or
+        (Get-Item -LiteralPath $signaturePath).Length -ne $assets[$SignatureName].size) {
+        Stop-Install "RELEASE_ASSET_SIZE"
+    }
+    $manifestBytes = Test-ManifestSignature $manifestPath $signaturePath
+    $manifest = Read-AndValidateManifest $manifestBytes
+    if ($assets[$RuntimeName].size -ne $manifest.bundle.size) { Stop-Install "RUNTIME_SIZE" }
+    Invoke-BoundedDownload $assets[$RuntimeName].browser_download_url $runtimePath (64 * 1024 * 1024) $AllowedDownloadHosts
+    if ((Get-Item -LiteralPath $runtimePath).Length -ne $manifest.bundle.size -or
+        (Get-Sha256 $runtimePath) -cne $manifest.bundle.sha256) {
+        Stop-Install "RUNTIME_HASH"
+    }
+
+    $installerPath = Join-Path $temporaryRoot "VencordInstallerCli.exe"
+    Invoke-BoundedDownload $InstallerUrl $installerPath (16 * 1024 * 1024) $AllowedDownloadHosts
+    if ((Get-Item -LiteralPath $installerPath).Length -gt (16 * 1024 * 1024) -or
+        (Get-Sha256 $installerPath) -cne $InstallerSha256) {
+        Stop-Install "UPSTREAM_INSTALLER_HASH"
+    }
+    Assert-DiscordStopped $false
+
+    New-Item -ItemType Directory -Path $basePath -Force | Out-Null
+    $distPath = Join-Path $basePath "dist"
+    $releasesPath = Join-Path $distPath "releases"
+    New-Item -ItemType Directory -Path $distPath -Force | Out-Null
+    New-Item -ItemType Directory -Path $releasesPath -Force | Out-Null
+    $lockPath = Join-Path $basePath "disorder-install.lock"
+    if (Test-Path -LiteralPath $lockPath) {
+        $lockItem = Get-Item -LiteralPath $lockPath -Force
+        if ($lockItem.PSIsContainer -or ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Stop-Install "INSTALL_LOCK"
+        }
+    }
+    $installLockOwner = ([ordered]@{
+        schema = 1
+        pid = [long]$PID
+        nonce = [Guid]::NewGuid().ToString("N")
+        createdAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    } | ConvertTo-Json -Compress)
+    $installLockOwnerBytes = ([Text.UTF8Encoding]::new($false)).GetBytes($installLockOwner)
+    if ($installLockOwnerBytes.Length -lt 1 -or $installLockOwnerBytes.Length -gt 256) {
+        Stop-Install "INSTALL_LOCK"
+    }
+    try {
+        $installLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $ownsInstallLock = $true
+    } catch {
+        Stop-Install "INSTALL_BUSY"
+    }
+    try {
+        $installLock.SetLength(0)
+        $installLock.Write($installLockOwnerBytes, 0, $installLockOwnerBytes.Length)
+        $installLock.Flush($true)
+    } catch {
+        Stop-Install "INSTALL_LOCK"
+    }
+    $releaseId = "r$($manifest.sequence)-$($manifest.commit.Substring(0, 12))"
+    $manifestSha256 = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($manifestBytes))).Replace("-", "").ToLowerInvariant()
+    $identity = [ordered]@{
+        id = $releaseId
+        sequence = [long]$manifest.sequence
+        commit = $manifest.commit
+        manifestSha256 = $manifestSha256
+    }
+    $statePath = Join-Path $distPath "release-state.json"
+    $oldState = Read-ExistingState $statePath
+    if ($null -ne $oldState) {
+        if ($manifest.sequence -lt $oldState.highestSeenSequence) { Stop-Install "DOWNGRADE" }
+        if ($manifest.sequence -eq $oldState.highestSeenSequence -and
+            $manifestSha256 -cne $oldState.highestSeenManifestSha256) {
+            Stop-Install "SEQUENCE_REUSE"
+        }
+        $knownFailed = Get-OptionalProperty $oldState "failed"
+        if ($null -ne $knownFailed -and
+            $knownFailed.sequence -eq $manifest.sequence -and
+            $knownFailed.manifestSha256 -ceq $manifestSha256) {
+            Stop-Install "KNOWN_FAILED_RELEASE"
+        }
+    }
+
+    $finalRelease = Join-Path $releasesPath $releaseId
+    if (Test-Path -LiteralPath $finalRelease) {
+        if (-not (Test-InstalledRelease $releasesPath ([pscustomobject]$identity))) { Stop-Install "EXISTING_RELEASE" }
+    } else {
+        $stagingRelease = Join-Path $releasesPath (".staging-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $stagingRelease | Out-Null
+        Expand-VerifiedRuntime $runtimePath $manifest $stagingRelease
+        [IO.File]::Copy($manifestPath, (Join-Path $stagingRelease $ManifestName), $false)
+        [IO.File]::Copy($signaturePath, (Join-Path $stagingRelease $SignatureName), $false)
+        [IO.Directory]::Move($stagingRelease, $finalRelease)
+        $stagingRelease = $null
+    }
+
+    $previous = $null
+    if ($null -ne $oldState) {
+        $candidate = if ($oldState.pendingBoot) { Get-OptionalProperty $oldState "previous" } else { $oldState.current }
+        if ($null -ne $candidate -and
+            $candidate.id -cne $releaseId -and
+            (Test-InstalledRelease $releasesPath $candidate)) {
+            $previous = $candidate
+        }
+    }
+    $sameCurrent = $null -ne $oldState -and
+        $oldState.current.sequence -eq $manifest.sequence -and
+        $oldState.current.manifestSha256 -ceq $manifestSha256
+    if ($sameCurrent) {
+        $newState = $oldState
+    } else {
+        $newState = [ordered]@{
+            schema = 1
+            current = $identity
+        }
+        if ($null -ne $previous) { $newState.previous = $previous }
+        $newState.highestSeenSequence = [long]$manifest.sequence
+        $newState.highestSeenManifestSha256 = $manifestSha256
+        $newState.pendingBoot = $true
+        $newState.bootAttempts = 0
+    }
+
+    $stablePatcherBytes = [Convert]::FromBase64String($StablePatcherBase64)
+    $stablePatcher = [Text.Encoding]::UTF8.GetString($stablePatcherBytes)
+    if ($stablePatcher.Contains(("__" + "DISORDER_"))) { Stop-Install "STABLE_PATCHER" }
+    Write-AtomicUtf8 $statePath (($newState | ConvertTo-Json -Depth 5 -Compress) + "`n")
+    Write-AtomicUtf8 (Join-Path $distPath "patcher.js") $stablePatcher
+
+    Assert-DiscordStopped $true
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $installerPath
+    $startInfo.Arguments = "--install"
+    $startInfo.UseShellExecute = $false
+    $startInfo.EnvironmentVariables["VENCORD_USER_DATA_DIR"] = $basePath
+    $startInfo.EnvironmentVariables["VENCORD_DEV_INSTALL"] = "1"
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) {
+        throw "The verified upstream installer returned an error. Signed files remain valid; fully quit Discord and run setup again to retry injection."
+    }
+
+    Write-Host "Disorder Vencord was installed from signed release $releaseId."
+    Write-Host "Fully quit and reopen Discord to finish."
+    Write-Host "Update public-key fingerprint: $PublicKeyFingerprint"
+} finally {
+    if ($null -ne $installLock) {
+        $installLock.Dispose()
+        $installLock = $null
+    }
+    if ($ownsInstallLock -and $null -ne $lockPath -and
+        $lockPath -ieq (Join-Path $basePath "disorder-install.lock") -and
+        (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+        try {
+            $lockItem = Get-Item -LiteralPath $lockPath -Force
+            if (($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+                $lockItem.Length -ge 1 -and $lockItem.Length -le 256 -and
+                [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($lockPath)) -ceq $installLockOwner) {
+                Remove-Item -LiteralPath $lockPath -Force
+            }
+        } catch {
+            # A failed exact-owner cleanup leaves a bounded, recoverable lease.
+        }
+    }
+    if ($null -ne $stagingRelease -and
+        $stagingRelease.StartsWith((Join-Path $basePath "dist\releases\.staging-"), [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $stagingRelease)) {
+        Remove-Item -LiteralPath $stagingRelease -Recurse -Force
+    }
+    if ($temporaryRoot.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Path -LiteralPath $temporaryRoot)) {
+        Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+    }
+}
