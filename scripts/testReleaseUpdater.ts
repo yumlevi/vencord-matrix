@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
@@ -261,7 +261,10 @@ async function testStablePatcherRollback(releaseRoot: string) {
         });
         assert.equal(launched.status, 0, `stable patcher boot ${attempt + 1} must complete`);
     }
-    assert.equal(await readFile(dataDirOutput, "utf8"), join(releaseRoot, ".."));
+    assert.equal(
+        await realpath(await readFile(dataDirOutput, "utf8")),
+        await realpath(join(releaseRoot, ".."))
+    );
 
     const state = await readReleaseState(releaseRoot);
     assert.equal(state.current.id, second.pointer.id);
