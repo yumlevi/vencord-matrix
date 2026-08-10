@@ -43,7 +43,7 @@ Reflect.set(globalThis, "UPDATE_RSA_EXPONENT", publicJwk.e);
 function signedRelease(sequence: number, commitCharacter: string) {
     const files = RELEASE_RUNTIME_FILES.map(path => {
         const contents = Buffer.from(
-            path === "patcher.js" ? `module.exports = ${sequence};\n`
+            path === "patcher.js" ? `if(process.env.DISORDER_TEST_DATA_DIR_OUTPUT)require("fs").writeFileSync(process.env.DISORDER_TEST_DATA_DIR_OUTPUT,process.env.VENCORD_USER_DATA_DIR??"");module.exports = ${sequence};\n`
                 : path === "package.json" ? "{\"type\":\"commonjs\"}\n"
                     : `release-${sequence}:${path}`,
             "utf8"
@@ -249,16 +249,19 @@ async function testStablePatcherRollback(releaseRoot: string) {
         .replace("__DISORDER_UPDATE_RSA_EXPONENT__", publicJwk.e!);
     assert.ok(!source.includes("__DISORDER_"));
     const stablePatcher = join(releaseRoot, "stablePatcher.cjs");
+    const dataDirOutput = join(releaseRoot, "stable-data-dir.txt");
     await writeFile(stablePatcher, source, { encoding: "utf8", flag: "wx" });
 
     for (let attempt = 0; attempt < 3; attempt++) {
         const launched = spawnSync(process.execPath, [stablePatcher], {
             encoding: "utf8",
+            env: { ...process.env, DISORDER_TEST_DATA_DIR_OUTPUT: dataDirOutput },
             timeout: 20_000,
             windowsHide: true
         });
         assert.equal(launched.status, 0, `stable patcher boot ${attempt + 1} must complete`);
     }
+    assert.equal(await readFile(dataDirOutput, "utf8"), join(releaseRoot, ".."));
 
     const state = await readReleaseState(releaseRoot);
     assert.equal(state.current.id, second.pointer.id);

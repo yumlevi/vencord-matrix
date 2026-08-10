@@ -9,7 +9,9 @@ This repository contains a release path for a public, credential-free Disorder V
 - A separate job has release-write permission but cannot access the signing environment or private key. The workflow uses unique tags and refuses reuse; repository-level immutable releases must be enabled before publishing so released tags and assets cannot later be replaced.
 - The downloaded installer embeds the public RSA trust root. It verifies the detached manifest signature, runtime ZIP hash, exact file allowlist, sizes, and per-file hashes before writing anything persistent.
 - The stable loader re-verifies the signed manifest and every runtime file on every Discord start. A new release must boot successfully; two failed boots roll back to the last verified release without lowering the anti-rollback watermark.
-- The upstream Vencord Installer CLI is pinned to v1.4.0 and its complete SHA-256 from the [official checksum file](https://github.com/Vencord/Installer/releases/download/v1.4.0/checksums.sha256): `466d2a0be1f380ddffed052df3cc132125fa34dc1af29312e14f13f358c8d2a2`.
+- Windows uses the upstream Vencord Installer CLI pinned to v1.4.0 and its complete SHA-256 from the [official checksum file](https://github.com/Vencord/Installer/releases/download/v1.4.0/checksums.sha256): `466d2a0be1f380ddffed052df3cc132125fa34dc1af29312e14f13f358c8d2a2`.
+- Linux x86_64 uses the corresponding pinned `VencordInstallerCli-linux` only after verifying its complete SHA-256: `815917a79391a4426022b395cc1d8e41ae80130edab98cbfbe08fbbe67cd2b28`.
+- macOS does not download or execute the unsigned upstream installer. The local shell verifies the original Discord bundle and its sealed `app.asar`, requires an exact interactive warning acknowledgement, and then replaces it with a locally generated, upstream-compatible loader ASAR without elevation or a Gatekeeper bypass.
 
 The first installer download is trust-on-first-use. Send the setup ZIP SHA-256 and public-key SPKI SHA-256 to recipients through a separate trusted conversation so they can compare them with the release page before running it.
 
@@ -80,21 +82,36 @@ The release contains exactly:
 - `Install-Disorder.cmd`
 - `Disorder-Setup.zip`
 
-Release notes are static and privacy-safe: no generated changelog, commit author, or commit message is included. They disclose the two installer hashes, the one-download ZIP hash, and the public-key fingerprint.
+`Disorder-Setup.zip` contains exactly `Install-Disorder.cmd`, `Install-Disorder.ps1`, and `Install-Disorder.sh`; the shell remains inside the ZIP so the release still has exactly six assets.
+
+Release notes are static and privacy-safe: no generated changelog, commit author, or commit message is included. They disclose the Windows installer and launcher hashes, the embedded macOS/Linux shell hash, the one-download ZIP hash, and the public-key fingerprint.
 
 ## Friend installation
 
-1. Download `Disorder-Setup.zip` from the latest release as a file. Do not use `irm | iex`, `curl | powershell`, or any other pipe-to-shell command.
+1. Download `Disorder-Setup.zip` from the latest release as a file. Do not use `irm | iex`, `curl | powershell`, `curl | sh`, or any other pipe-to-shell command.
 2. Compare its SHA-256 with the release notes and, ideally, with the value sent through a separate trusted conversation:
 
    ```powershell
    Get-FileHash .\Disorder-Setup.zip -Algorithm SHA256
    ```
 
-3. Extract the ZIP. It contains exactly `Install-Disorder.cmd` and `Install-Disorder.ps1`.
-4. Fully quit Discord, including the tray icon, then double-click `Install-Disorder.cmd`.
-5. Reopen Discord when setup asks. The install lives under `%APPDATA%\Vencord`; Matrix account storage and settings are outside immutable release directories and are not cleared by updates.
+   On macOS use `shasum -a 256 Disorder-Setup.zip`; on Linux use `sha256sum Disorder-Setup.zip`.
+3. Extract all three files from the ZIP and fully quit Discord, including its tray or menu-bar process.
+4. Run the local installer for the platform:
+   - Windows: double-click `Install-Disorder.cmd`.
+   - macOS or Linux: install Python 3.9 or newer and OpenSSL, open a terminal in the extracted folder, and run `sh ./Install-Disorder.sh` as the normal desktop user. The shell accepts no arguments and rejects root, `sudo`, or an already-elevated environment.
+5. Reopen Discord when setup asks.
 
-The launcher never elevates, downloads, or evaluates text. It only starts the adjacent downloaded PowerShell file. The PowerShell installer permits a small fixed HTTPS host allowlist, follows redirects manually, applies byte and time limits while streaming, verifies the signed package, serializes concurrent installs, and only then runs the pinned upstream installer. Automatic in-app updates use the same signature and anti-rollback checks and require a normal Discord restart to activate.
+Linux support is x86_64 only. The shell verifies the exact pinned v1.4.0 Linux CLI before starting its interactive Discord selection. This non-elevating bootstrap supports only user-writable Discord installs and user Flatpak; root-owned system or `.deb` installs, system Flatpak, and Snap are unsupported.
 
-If the verified upstream installer returns an error after the runtime is staged, leave the signed runtime/state in place, fully quit Discord, and run setup again. Do not delete `release-state.json` to force a downgrade.
+macOS support is experimental on arm64 and x86_64. The shell offers only official Discord, PTB, Canary, or Development apps in `/Applications` or `~/Applications`, and refuses a bundle whose `Contents/Resources` directory is not writable. After checking the original Apple signature and sealed `app.asar`, it explains the change and requires exactly `MODIFY DISCORD` for a per-user app or `MODIFY SHARED DISCORD` for an app under `/Applications`. It retains the original as `_app.asar` and writes a deterministic, upstream-compatible loader ASAR to `Discord.app/Contents/Resources/app.asar`.
+
+The generated loader embeds the installing account's private Vencord data path. Modifying a shared `/Applications` bundle therefore binds that machine-wide app to this local account and may make it unusable to other local accounts. Prefer a per-user copy under `~/Applications` on a multi-user Mac.
+
+This deliberate macOS modification invalidates Discord's sealed code signature. macOS may report the app as modified or damaged, and the changed identity may affect privacy prompts or Keychain access. Setup does not use `sudo`, re-sign Discord, remove quarantine attributes, invoke `xattr` or `spctl`, or disable Gatekeeper. Rerun the same verified setup after Discord replaces or updates its app bundle. Reinstall Discord to restore the stock bundle and signature.
+
+Platform data roots are `%APPDATA%\Vencord` on Windows, `~/Library/Application Support/Vencord` on macOS, and `${XDG_CONFIG_HOME:-$HOME/.config}/Vencord` on Linux. Matrix account storage and settings remain outside immutable release directories and are not cleared by updates.
+
+The Windows launcher never elevates, downloads, or evaluates text; it only starts the adjacent downloaded PowerShell file. The project's PowerShell and POSIX bootstraps use small fixed HTTPS host allowlists, follow redirects manually, enforce byte and time limits, verify the signed package, and serialize concurrent installs. Windows and Linux then start a pinned, verified upstream installer; macOS performs the attested direct injection described above. The Linux CLI makes its own GitHub version-check request, with a `vencord.dev` fallback, exposing the recipient's IP address and its User-Agent to those services. In this development-install path it neither self-updates nor downloads the upstream Vencord runtime. Automatic in-app updates use the signed Disorder release channel and anti-rollback checks and require a normal Discord restart to activate.
+
+If setup stops after the runtime is staged or the macOS injection begins, leave the signed runtime, release state, and macOS recovery journal in place, fully quit Discord, and run setup again. Do not delete `release-state.json` or an injection journal to force a retry or downgrade.

@@ -20,7 +20,7 @@
 
 const { constants, createHash, createPublicKey, randomUUID, verify } = require("crypto");
 const { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } = require("fs");
-const { join } = require("path");
+const { dirname, join } = require("path");
 
 const MANIFEST_NAME = "disorder-manifest.json";
 const SIGNATURE_NAME = "disorder-manifest.sig";
@@ -431,6 +431,10 @@ try {
     process.env.VENCORD_RELEASE_ROOT = DIST_DIR;
     process.env.VENCORD_RELEASE_ID = selected.identity.id;
     process.env.VENCORD_RELEASE_SEQUENCE = String(selected.identity.sequence);
+    // Keep settings, themes, Matrix credentials, and updater state beside the
+    // stable loader on every platform. The one-shot installer environment is
+    // not inherited by later Discord launches.
+    process.env.VENCORD_USER_DATA_DIR = dirname(DIST_DIR);
     module.exports = require(selected.patcherPath);
 } finally {
     releaseInstallLock(installLock);

@@ -8,18 +8,50 @@ and is not supported by the Vencord project.
 
 1. Open the [latest release](../../releases/latest).
 2. Download `Disorder-Setup.zip` and compare its SHA-256 with the release notes.
-3. Fully quit Discord, extract the ZIP, and double-click `Install-Disorder.cmd`.
-4. Reopen Discord and enable/configure MatrixBridge in Vencord settings.
+3. Fully quit Discord, including its tray or menu-bar process, and extract all
+   three files from the ZIP.
+4. Install for your platform:
+   - **Windows:** double-click `Install-Disorder.cmd`.
+   - **macOS or Linux:** install Python 3.9 or newer and OpenSSL, open a terminal
+     in the extracted folder, and run `sh ./Install-Disorder.sh` as your normal
+     user. Never run it with `sudo` and never pipe it from the network.
+5. Reopen Discord and enable/configure MatrixBridge in Vencord settings.
 
-Future signed releases are checked automatically when Discord starts. A completed
-update asks you to restart Discord; the previous verified version is retained for
-automatic rollback.
-Never pipe an installer from the network directly into PowerShell.
+Linux support is limited to x86_64, user-writable Discord installs, and user
+Flatpak. This non-elevating bootstrap does not support root-owned system or
+`.deb` installs, system Flatpak, or Snap. It downloads the pinned, exact-hash
+Vencord Installer v1.4.0 CLI and lets you select the Discord install
+interactively. That verified CLI performs its normal GitHub version check, with
+a `vencord.dev` fallback, which exposes your IP address and its User-Agent to
+those services. In this development-install mode it does not self-update or
+download the upstream Vencord runtime.
+
+macOS support is experimental on both Apple silicon and Intel. Setup supports
+official Discord apps in `/Applications` or `~/Applications`, verifies the
+original signed app, and asks you to type `MODIFY DISCORD` before it replaces a
+per-user app's `Discord.app/Contents/Resources/app.asar` with a locally
+generated, upstream-compatible loader ASAR. A shared `/Applications` app
+instead requires `MODIFY SHARED DISCORD`: its loader embeds this account's
+private Vencord path, so the modified app is bound to the installing account
+and may not work for other local accounts. Prefer a per-user copy under
+`~/Applications` on a multi-user Mac.
+
+The original ASAR is retained as `_app.asar`, but the change invalidates
+Discord's sealed Apple code signature and may affect macOS security prompts or
+Keychain access. Setup never uses `sudo`, `xattr`, `spctl`, or a Gatekeeper
+override and stops if the app is not writable. Rerun the verified setup after
+Discord updates its application bundle; reinstalling Discord restores its stock
+bundle and signature.
+
+Future signed releases are checked automatically. A completed update asks you to
+restart Discord; the previous verified version is retained for automatic rollback.
+Never pipe an installer from the network directly into PowerShell or a shell.
 
 ## Privacy and risk
 
-- Release archives contain only compiled runtime files and required licenses—no
-  account files, messages, logs, screenshots, local paths, or source maps.
+- Release archives contain only compiled runtime files and required licenses;
+  they contain no account files, messages, logs, screenshots, local paths, or
+  source maps.
 - Matrix credentials and encryption storage remain local, but the default native
   projection makes normalized Matrix message content available to Discord's
   renderer and therefore to other renderer plugins.

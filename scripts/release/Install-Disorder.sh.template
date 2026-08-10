@@ -1,0 +1,1420 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Vencord contributors
+# Disorder Vencord local-file installer for macOS and Linux.
+# Download Disorder-Setup.zip, verify its published SHA-256 through a trusted
+# channel, extract it, and run this file locally. Never pipe it from a network.
+# The deterministic macOS ASAR writer is ported from Vencord Installer v1.4.0
+# app_asar.go (GPL-3.0), Copyright Vencord contributors.
+
+set -eu
+umask 077
+
+if [ "$#" -ne 0 ]; then
+    printf '%s\n' 'Disorder installation stopped safely (ARGUMENTS). This installer accepts no arguments.' >&2
+    exit 1
+fi
+
+PYTHON_BIN=""
+for candidate in python3 /usr/bin/python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+        PYTHON_BIN="$candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+    printf '%s\n' 'Disorder installation stopped safely (PYTHON). Python 3.9 or newer is required; nothing was installed.' >&2
+    exit 1
+fi
+
+exec "$PYTHON_BIN" - <<'PY'
+from __future__ import annotations
+
+import base64
+import binascii
+import datetime
+import errno
+import hashlib
+import json
+import os
+import platform
+import plistlib
+import re
+import secrets
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, NoReturn
+
+
+REPOSITORY = "__DISORDER_REPOSITORY__"
+PUBLIC_KEY_PEM_BASE64 = "__DISORDER_UPDATE_PUBLIC_KEY_PEM_BASE64__"
+PUBLIC_KEY_FINGERPRINT = "__DISORDER_PUBLIC_KEY_FINGERPRINT__"
+STABLE_PATCHER_BASE64 = "__DISORDER_STABLE_PATCHER_BASE64__"
+
+MANIFEST_NAME = "disorder-manifest.json"
+SIGNATURE_NAME = "disorder-manifest.sig"
+RUNTIME_NAME = "disorder-runtime.zip"
+RELEASE_ASSET_NAMES = (
+    MANIFEST_NAME,
+    SIGNATURE_NAME,
+    RUNTIME_NAME,
+    "Install-Disorder.ps1",
+    "Install-Disorder.cmd",
+    "Disorder-Setup.zip",
+)
+RELEASE_ASSET_LIMITS = {
+    MANIFEST_NAME: 128 * 1024,
+    SIGNATURE_NAME: 2 * 1024,
+    RUNTIME_NAME: 64 * 1024 * 1024,
+    "Install-Disorder.ps1": 1024 * 1024,
+    "Install-Disorder.cmd": 16 * 1024,
+    "Disorder-Setup.zip": 2 * 1024 * 1024,
+}
+RUNTIME_FILES = (
+    "LICENSE",
+    "fflate.LICENSE",
+    "matrix-js-sdk.LICENSE",
+    "matrixBridgePreload.js",
+    "matrixBridgeWorker.js",
+    "matrixBridgeWorker.js.LEGAL.txt",
+    "matrixSecureView.css",
+    "matrixSecureView.js",
+    "matrixSecureViewPreload.js",
+    "matrix_sdk_crypto_wasm.LICENSE",
+    "matrix_sdk_crypto_wasm_bg.wasm",
+    "package.json",
+    "patcher.js",
+    "patcher.js.LEGAL.txt",
+    "preload.js",
+    "renderer.css",
+    "renderer.js",
+    "renderer.js.LEGAL.txt",
+)
+ALLOWED_RELEASE_HOSTS = frozenset((
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+))
+LINUX_INSTALLER_URL = "https://github.com/Vencord/Installer/releases/download/v1.4.0/VencordInstallerCli-linux"
+LINUX_INSTALLER_SHA256 = "815917a79391a4426022b395cc1d8e41ae80130edab98cbfbe08fbbe67cd2b28"
+LINUX_INSTALLER_MAX_BYTES = 16 * 1024 * 1024
+INSTALL_LOCK_NAME = "disorder-install.lock"
+INSTALL_LOCK_MAX_BYTES = 256
+INSTALL_LOCK_INVALID_STALE_SECONDS = 30
+DOWNLOAD_TOTAL_SECONDS = 120
+DOWNLOAD_OPERATION_SECONDS = 30
+MAX_REDIRECTS = 5
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}$")
+RELEASE_TAG_PATTERN = re.compile(r"^disorder-r([1-9][0-9]{0,15})-([0-9a-f]{12})$")
+RELEASE_ID_PATTERN = re.compile(r"^r([1-9][0-9]{0,15})-([0-9a-f]{12})$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MAC_BUNDLES = {
+    "Discord.app": ("com.hnc.Discord", "stable"),
+    "Discord PTB.app": ("com.hnc.DiscordPTB", "ptb"),
+    "Discord Canary.app": ("com.hnc.DiscordCanary", "canary"),
+    "Discord Development.app": ("com.hnc.DiscordDevelopment", "development"),
+}
+DISCORD_PROCESS_NAMES = frozenset((
+    "Discord",
+    "DiscordPTB",
+    "DiscordCanary",
+    "DiscordDevelopment",
+    "discord",
+    "discordptb",
+    "discordcanary",
+    "discorddevelopment",
+    "discord-ptb",
+    "discord-canary",
+    "discord-development",
+    "com.discordapp.Discord",
+    "com.discordapp.DiscordPTB",
+    "com.discordapp.DiscordCanary",
+    "com.discordapp.DiscordDevelopment",
+))
+MAC_CONFIRMATION = "MODIFY DISCORD"
+MAC_SHARED_CONFIRMATION = "MODIFY SHARED DISCORD"
+MAC_INJECTION_RECORD_SCHEMA = 1
+PERSISTENT_CHANGES_STARTED = False
+VERIFIED_EXECUTION_STARTED = False
+
+
+class InstallFailure(Exception):
+    def __init__(self, code: str, detail: str | None = None):
+        self.code = code
+        self.detail = detail
+        super().__init__(code)
+
+
+def stop(code: str, detail: str | None = None) -> NoReturn:
+    raise InstallFailure(code, detail)
+
+
+def is_plain_int(value: object, minimum: int = 0, maximum: int = MAX_SAFE_INTEGER) -> bool:
+    return type(value) is int and minimum <= value <= maximum
+
+
+def exact_object(value: object, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> bool:
+    return isinstance(value, dict) and set(value) == set(required) | (set(value) & set(optional)) \
+        and all(key in value for key in required) and all(key in required or key in optional for key in value)
+
+
+def strict_json(raw: bytes, code: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                stop(code)
+            result[key] = value
+        return result
+
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        return json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: stop(code),
+        )
+    except InstallFailure:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        stop(code)
+
+
+def canonical_base64(value: str, code: str) -> bytes:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", value):
+        stop(code)
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        stop(code)
+    if not decoded or base64.b64encode(decoded).decode("ascii") != value:
+        stop(code)
+    return decoded
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path, maximum: int | None = None) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(128 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if maximum is not None and total > maximum:
+                stop("DOWNLOAD_LIMIT")
+            digest.update(chunk)
+    return digest.hexdigest(), total
+
+
+def trusted_system_tool(name: str) -> Path:
+    candidates = (Path("/usr/bin") / name, Path("/bin") / name)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and os.access(resolved, os.X_OK) \
+                and info.st_uid == 0 and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0:
+            return resolved
+    stop(f"{name.upper()}_UNAVAILABLE")
+
+
+def safe_https_url(value: str, allowed_hosts: frozenset[str], code: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        stop(code)
+    hostname = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        stop(code)
+    if parsed.scheme != "https" or hostname is None or hostname.lower() not in allowed_hosts \
+            or port not in (None, 443) or parsed.username is not None or parsed.password is not None \
+            or parsed.fragment:
+        stop(code)
+    return urllib.parse.urlunsplit(parsed)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: urllib.request.Request, fp: BinaryIO, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirect())
+
+
+def bounded_download(
+    url: str,
+    destination: Path,
+    maximum: int,
+    allowed_hosts: frozenset[str],
+    accept: str = "application/octet-stream",
+) -> int:
+    if maximum < 1 or destination.exists() or destination.is_symlink():
+        stop("DOWNLOAD_DESTINATION")
+    current = safe_https_url(url, allowed_hosts, "DOWNLOAD_URL")
+    deadline = time.monotonic() + DOWNLOAD_TOTAL_SECONDS
+    for redirects in range(MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stop("DOWNLOAD_LIMIT")
+        request = urllib.request.Request(current, method="GET", headers={
+            "Accept": accept,
+            "User-Agent": "Disorder-Vencord-Installer",
+        })
+        response: Any
+        try:
+            response = NO_REDIRECT_OPENER.open(request, timeout=min(DOWNLOAD_OPERATION_SECONDS, remaining))
+        except urllib.error.HTTPError as error:
+            response = error
+        except (OSError, urllib.error.URLError, TimeoutError):
+            stop("DOWNLOAD_RESPONSE")
+        try:
+            status = getattr(response, "status", response.getcode())
+            if status in (301, 302, 303, 307, 308):
+                if redirects >= MAX_REDIRECTS:
+                    stop("DOWNLOAD_REDIRECT")
+                location = response.headers.get("Location")
+                if not isinstance(location, str) or not location.strip():
+                    stop("DOWNLOAD_REDIRECT")
+                current = safe_https_url(urllib.parse.urljoin(current, location), allowed_hosts, "DOWNLOAD_REDIRECT")
+                continue
+            if status != 200:
+                stop("DOWNLOAD_RESPONSE")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and (not re.fullmatch(r"(?:0|[1-9][0-9]{0,15})", content_length)
+                                               or int(content_length) > maximum):
+                stop("DOWNLOAD_LIMIT")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(destination, flags, 0o600)
+            total = 0
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as output:
+                    descriptor = -1
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            stop("DOWNLOAD_LIMIT")
+                        raw_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                        if raw_socket is not None:
+                            raw_socket.settimeout(min(DOWNLOAD_OPERATION_SECONDS, remaining))
+                        chunk = response.read(128 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > maximum:
+                            stop("DOWNLOAD_LIMIT")
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if total < 1 or (content_length is not None and total != int(content_length)):
+                stop("DOWNLOAD_SIZE")
+            return total
+        except (OSError, TimeoutError, urllib.error.URLError) as error:
+            if isinstance(error, InstallFailure):
+                raise
+            stop("DOWNLOAD_STREAM")
+        finally:
+            response.close()
+    stop("DOWNLOAD_REDIRECT")
+
+
+def public_key_file(temporary: Path) -> Path:
+    pem = canonical_base64(PUBLIC_KEY_PEM_BASE64, "PUBLIC_KEY")
+    if sha256_bytes(_pem_to_der(pem)) != PUBLIC_KEY_FINGERPRINT or not SHA256_PATTERN.fullmatch(PUBLIC_KEY_FINGERPRINT):
+        stop("PUBLIC_KEY")
+    path = temporary / "update-public-key.pem"
+    write_exclusive(path, pem, 0o600)
+    openssl = trusted_system_tool("openssl")
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    result = subprocess.run(
+        [str(openssl), "pkey", "-pubin", "-in", str(path), "-text", "-noout"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    bits = re.search(r"Public-Key:\s*\(([0-9]+) bit\)", result.stdout)
+    if result.returncode != 0 or bits is None or not 3072 <= int(bits.group(1)) <= 4096 \
+            or re.search(r"Exponent:\s*65537\b", result.stdout) is None:
+        stop("PUBLIC_KEY")
+    return path
+
+
+def _pem_to_der(pem: bytes) -> bytes:
+    try:
+        text = pem.decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        stop("PUBLIC_KEY")
+    match = re.fullmatch(
+        r"-----BEGIN PUBLIC KEY-----\n([A-Za-z0-9+/=\n]+)-----END PUBLIC KEY-----\n?",
+        text,
+    )
+    if match is None:
+        stop("PUBLIC_KEY")
+    encoded = match.group(1).replace("\n", "")
+    return canonical_base64(encoded, "PUBLIC_KEY")
+
+
+def verify_manifest_signature(manifest_path: Path, signature_path: Path, key_path: Path, temporary: Path) -> bytes:
+    manifest = read_regular_bounded(manifest_path, RELEASE_ASSET_LIMITS[MANIFEST_NAME], "MANIFEST")
+    signature_text = read_regular_bounded(signature_path, RELEASE_ASSET_LIMITS[SIGNATURE_NAME], "SIGNATURE")
+    try:
+        ascii_signature = signature_text.decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        stop("SIGNATURE")
+    signature = canonical_base64(ascii_signature, "SIGNATURE")
+    if len(signature) < 384 or len(signature) > 512:
+        stop("SIGNATURE")
+    binary_signature = temporary / "disorder-manifest.sig.bin"
+    write_exclusive(binary_signature, signature, 0o600)
+    result = subprocess.run(
+        [
+            str(trusted_system_tool("openssl")), "dgst", "-sha256", "-verify", str(key_path),
+            "-signature", str(binary_signature), str(manifest_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        stop("SIGNATURE")
+    return manifest
+
+
+def parse_manifest(manifest_bytes: bytes) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    raw = strict_json(manifest_bytes, "MANIFEST")
+    required = ("schema", "product", "channel", "sequence", "version", "commit", "publishedAt", "bundle", "files", "changes")
+    if not exact_object(raw, required):
+        stop("MANIFEST")
+    manifest = raw
+    sequence = manifest["sequence"]
+    commit = manifest["commit"]
+    if manifest["schema"] != 1 or manifest["product"] != "disorder-vencord" or manifest["channel"] != "stable" \
+            or not is_plain_int(sequence, 1) or not isinstance(commit, str) or not COMMIT_PATTERN.fullmatch(commit) \
+            or not isinstance(manifest["version"], str) or not VERSION_PATTERN.fullmatch(manifest["version"]):
+        stop("MANIFEST")
+    published_at = manifest["publishedAt"]
+    if not isinstance(published_at, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", published_at):
+        stop("MANIFEST")
+    try:
+        parsed_published_at = datetime.datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        stop("MANIFEST")
+    if parsed_published_at.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" != published_at:
+        stop("MANIFEST")
+    bundle = manifest["bundle"]
+    if not exact_object(bundle, ("name", "size", "sha256")) or bundle["name"] != RUNTIME_NAME \
+            or not is_plain_int(bundle["size"], 1, 64 * 1024 * 1024) \
+            or not isinstance(bundle["sha256"], str) or not SHA256_PATTERN.fullmatch(bundle["sha256"]):
+        stop("MANIFEST")
+    if manifest["changes"] != [] or not isinstance(manifest["files"], list) or len(manifest["files"]) != len(RUNTIME_FILES):
+        stop("MANIFEST_FILES")
+    files: dict[str, dict[str, object]] = {}
+    total = 0
+    for expected_path, value in zip(RUNTIME_FILES, manifest["files"]):
+        if not exact_object(value, ("path", "size", "sha256")) or value["path"] != expected_path \
+                or not is_plain_int(value["size"], 1, 16 * 1024 * 1024) \
+                or not isinstance(value["sha256"], str) or not SHA256_PATTERN.fullmatch(value["sha256"]):
+            stop("MANIFEST_FILES")
+        total += value["size"]
+        files[expected_path] = value
+    if total > 64 * 1024 * 1024:
+        stop("MANIFEST_FILES")
+    return manifest, files
+
+
+def parse_release_assets(raw: bytes) -> tuple[str, dict[str, dict[str, object]]]:
+    release = strict_json(raw, "RELEASE_LOOKUP")
+    if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False \
+            or not isinstance(release.get("tag_name"), str) or not RELEASE_TAG_PATTERN.fullmatch(release["tag_name"]) \
+            or not isinstance(release.get("assets"), list) or len(release["assets"]) > 100:
+        stop("RELEASE_LOOKUP")
+    tag = release["tag_name"]
+    assets: dict[str, dict[str, object]] = {}
+    for asset in release["assets"]:
+        if not isinstance(asset, dict):
+            stop("RELEASE_ASSETS")
+        name = asset.get("name")
+        size = asset.get("size")
+        url = asset.get("browser_download_url")
+        if asset.get("state") != "uploaded" or name not in RELEASE_ASSET_NAMES or name in assets or not is_plain_int(size, 1) \
+                or size > RELEASE_ASSET_LIMITS[name] or not isinstance(url, str):
+            stop("RELEASE_ASSETS")
+        parsed = urllib.parse.urlsplit(url)
+        expected_path = f"/{REPOSITORY}/releases/download/{tag}/{name}"
+        if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.port not in (None, 443) \
+                or parsed.username is not None or parsed.password is not None or parsed.path != expected_path \
+                or parsed.query or parsed.fragment:
+            stop("RELEASE_URL")
+        assets[name] = {"name": name, "size": size, "url": url}
+    if tuple(sorted(assets)) != tuple(sorted(RELEASE_ASSET_NAMES)):
+        stop("RELEASE_ASSETS")
+    return tag, assets
+
+
+def validate_release_tag(tag: str, manifest: dict[str, object]) -> None:
+    expected = f"disorder-r{manifest['sequence']}-{str(manifest['commit'])[:12]}"
+    if tag != expected:
+        stop("RELEASE_IDENTITY")
+
+
+def read_regular_bounded(path: Path, maximum: int, code: str) -> bytes:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size < 1 or info.st_size > maximum:
+            stop(code)
+        contents = path.read_bytes()
+    except OSError:
+        stop(code)
+    if len(contents) != info.st_size:
+        stop(code)
+    return contents
+
+
+def write_exclusive(path: Path, contents: bytes, mode: int) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as output:
+            descriptor = -1
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, contents: bytes, mode: int = 0o600) -> None:
+    temporary = path.parent / f".{path.name}-{os.getpid()}-{secrets.token_hex(8)}.tmp"
+    try:
+        write_exclusive(temporary, contents, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def refuse_symlink_directories(paths: tuple[Path, ...]) -> None:
+    for path in paths:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            stop("INSTALL_PATH")
+
+
+def data_root(system: str) -> Path:
+    home_value = os.environ.get("HOME")
+    if not home_value or "\x00" in home_value:
+        stop("HOME")
+    home = Path(home_value)
+    if not home.is_absolute():
+        stop("HOME")
+    if system == "Darwin":
+        parent = home / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            if "\x00" in xdg or not Path(xdg).is_absolute():
+                stop("XDG_CONFIG_HOME")
+            parent = Path(xdg)
+        else:
+            parent = home / ".config"
+    return parent / "Vencord"
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def parsed_lock_owner(contents: bytes) -> dict[str, object] | None:
+    if not 1 <= len(contents) <= INSTALL_LOCK_MAX_BYTES:
+        return None
+    try:
+        value = strict_json(contents, "INSTALL_LOCK_PARSE")
+    except InstallFailure:
+        return None
+    if not exact_object(value, ("schema", "pid", "nonce", "createdAt")) or value["schema"] != 1 \
+            or not is_plain_int(value["pid"], 1, 0xFFFF_FFFF) \
+            or not isinstance(value["nonce"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"]) \
+            or not is_plain_int(value["createdAt"], 1):
+        return None
+    return value
+
+
+class InstallLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.descriptor: int | None = None
+        self.contents: bytes | None = None
+        self.device: int | None = None
+        self.inode: int | None = None
+
+    def _recover_stale(self) -> bool:
+        try:
+            info = self.path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size > INSTALL_LOCK_MAX_BYTES:
+                return False
+            contents = self.path.read_bytes()
+            if len(contents) != info.st_size:
+                return False
+            owner = parsed_lock_owner(contents)
+            if owner is not None:
+                if process_is_alive(owner["pid"]):
+                    return False
+            elif time.time() - info.st_mtime < INSTALL_LOCK_INVALID_STALE_SECONDS:
+                return False
+            confirmed = self.path.lstat()
+            if (confirmed.st_dev, confirmed.st_ino) != (info.st_dev, info.st_ino) or self.path.read_bytes() != contents:
+                return False
+            self.path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def acquire(self) -> None:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EEXIST, errno.EPERM):
+                    stop("INSTALL_LOCK")
+                if self._recover_stale():
+                    continue
+                if time.monotonic() >= deadline:
+                    stop("INSTALL_BUSY")
+                time.sleep(0.05)
+                continue
+            owner = {
+                "schema": 1,
+                "pid": os.getpid(),
+                "nonce": secrets.token_hex(16),
+                "createdAt": int(time.time() * 1000),
+            }
+            contents = json.dumps(owner, separators=(",", ":")).encode("utf-8")
+            try:
+                if len(contents) > INSTALL_LOCK_MAX_BYTES:
+                    stop("INSTALL_LOCK")
+                os.write(descriptor, contents)
+                os.fsync(descriptor)
+                handle_info = os.fstat(descriptor)
+                path_info = self.path.lstat()
+                if not stat.S_ISREG(path_info.st_mode) or stat.S_ISLNK(path_info.st_mode) \
+                        or (handle_info.st_dev, handle_info.st_ino) != (path_info.st_dev, path_info.st_ino):
+                    stop("INSTALL_LOCK")
+                self.descriptor = descriptor
+                self.contents = contents
+                self.device = handle_info.st_dev
+                self.inode = handle_info.st_ino
+                return
+            except Exception:
+                os.close(descriptor)
+                try:
+                    path_info = self.path.lstat()
+                    if (path_info.st_dev, path_info.st_ino) == (handle_info.st_dev, handle_info.st_ino):
+                        self.path.unlink()
+                except (OSError, UnboundLocalError):
+                    pass
+                raise
+
+    def release(self) -> None:
+        if self.descriptor is None:
+            return
+        os.close(self.descriptor)
+        self.descriptor = None
+        try:
+            info = self.path.lstat()
+            contents = self.path.read_bytes()
+            if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) \
+                    and (info.st_dev, info.st_ino) == (self.device, self.inode) and contents == self.contents:
+                self.path.unlink()
+                fsync_directory(self.path.parent)
+        except OSError:
+            pass
+
+
+def validate_identity(value: object, code: str) -> dict[str, object]:
+    if not exact_object(value, ("id", "sequence", "commit", "manifestSha256")):
+        stop(code)
+    identity = value
+    if not is_plain_int(identity["sequence"], 1) or not isinstance(identity["commit"], str) \
+            or not COMMIT_PATTERN.fullmatch(identity["commit"]) or not isinstance(identity["manifestSha256"], str) \
+            or not SHA256_PATTERN.fullmatch(identity["manifestSha256"]) or not isinstance(identity["id"], str) \
+            or not RELEASE_ID_PATTERN.fullmatch(identity["id"]) \
+            or identity["id"] != f"r{identity['sequence']}-{identity['commit'][:12]}":
+        stop(code)
+    return identity
+
+
+def parse_state(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    raw = strict_json(read_regular_bounded(path, 16 * 1024, "EXISTING_STATE"), "EXISTING_STATE")
+    required = ("schema", "current", "highestSeenSequence", "highestSeenManifestSha256", "pendingBoot", "bootAttempts")
+    if not exact_object(raw, required, ("previous", "failed")) or raw["schema"] != 1 \
+            or type(raw["pendingBoot"]) is not bool or not is_plain_int(raw["bootAttempts"], 0, 2) \
+            or (raw["pendingBoot"] is False and raw["bootAttempts"] != 0) \
+            or not is_plain_int(raw["highestSeenSequence"], 1) \
+            or not isinstance(raw["highestSeenManifestSha256"], str) \
+            or not SHA256_PATTERN.fullmatch(raw["highestSeenManifestSha256"]):
+        stop("EXISTING_STATE")
+    current = validate_identity(raw["current"], "EXISTING_STATE")
+    previous = validate_identity(raw["previous"], "EXISTING_STATE") if "previous" in raw else None
+    failed = validate_identity(raw["failed"], "EXISTING_STATE") if "failed" in raw else None
+    identities = [item for item in (current, previous, failed) if item is not None]
+    if len({item["id"] for item in identities}) != len(identities) \
+            or len({item["sequence"] for item in identities}) != len(identities) \
+            or (previous is not None and previous["sequence"] >= current["sequence"]):
+        stop("EXISTING_STATE")
+    for identity in identities:
+        if identity["sequence"] > raw["highestSeenSequence"] \
+                or (identity["sequence"] == raw["highestSeenSequence"]
+                    and identity["manifestSha256"] != raw["highestSeenManifestSha256"]):
+            stop("EXISTING_STATE")
+    return raw
+
+
+def verify_installed_release(releases: Path, identity: dict[str, object], public_key: Path) -> bool:
+    directory = releases / str(identity["id"])
+    try:
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return False
+        expected_names = set(RUNTIME_FILES) | {MANIFEST_NAME, SIGNATURE_NAME}
+        entries = list(directory.iterdir())
+        if {entry.name for entry in entries} != expected_names or len(entries) != len(expected_names):
+            return False
+        if any(not stat.S_ISREG(entry.lstat().st_mode) or entry.is_symlink() for entry in entries):
+            return False
+        manifest_path = directory / MANIFEST_NAME
+        manifest_bytes = read_regular_bounded(manifest_path, RELEASE_ASSET_LIMITS[MANIFEST_NAME], "INSTALLED_RELEASE")
+        if sha256_bytes(manifest_bytes) != identity["manifestSha256"]:
+            return False
+        with tempfile.TemporaryDirectory(prefix="DisorderVerify-") as raw_temporary:
+            temporary = Path(raw_temporary)
+            verified = verify_manifest_signature(manifest_path, directory / SIGNATURE_NAME, public_key, temporary)
+        manifest, files = parse_manifest(verified)
+        if manifest["sequence"] != identity["sequence"] or manifest["commit"] != identity["commit"]:
+            return False
+        for name, expected in files.items():
+            digest, length = sha256_file(directory / name, int(expected["size"]))
+            if length != expected["size"] or digest != expected["sha256"]:
+                return False
+        return True
+    except (InstallFailure, OSError):
+        return False
+
+
+def extract_runtime(
+    archive: Path,
+    staging: Path,
+    files: dict[str, dict[str, object]],
+    manifest_path: Path,
+    signature_path: Path,
+) -> None:
+    staging.mkdir(mode=0o700)
+    try:
+        with zipfile.ZipFile(archive, "r") as package:
+            entries = package.infolist()
+            if len(entries) != len(RUNTIME_FILES) or tuple(entry.filename for entry in entries) != RUNTIME_FILES:
+                stop("RUNTIME_ARCHIVE")
+            for entry in entries:
+                expected = files.get(entry.filename)
+                path = PurePosixPath(entry.filename)
+                unix_mode = (entry.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(unix_mode)
+                if expected is None or entry.is_dir() or entry.flag_bits & 1 or path.is_absolute() or ".." in path.parts \
+                        or len(path.parts) != 1 or entry.file_size != expected["size"] \
+                        or file_type not in (0, stat.S_IFREG):
+                    stop("RUNTIME_ARCHIVE")
+                with package.open(entry, "r") as source:
+                    contents = source.read(int(expected["size"]) + 1)
+                if len(contents) != expected["size"] or sha256_bytes(contents) != expected["sha256"]:
+                    stop("RUNTIME_HASH")
+                write_exclusive(staging / entry.filename, contents, 0o600)
+        write_exclusive(staging / MANIFEST_NAME, read_regular_bounded(manifest_path, 128 * 1024, "MANIFEST"), 0o600)
+        write_exclusive(staging / SIGNATURE_NAME, read_regular_bounded(signature_path, 2 * 1024, "SIGNATURE"), 0o600)
+        fsync_directory(staging)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def stage_signed_runtime(
+    base: Path,
+    manifest: dict[str, object],
+    files: dict[str, dict[str, object]],
+    manifest_bytes: bytes,
+    manifest_path: Path,
+    signature_path: Path,
+    runtime_path: Path,
+    public_key: Path,
+) -> str:
+    dist = base / "dist"
+    releases = dist / "releases"
+    refuse_symlink_directories((base, dist, releases))
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dist.mkdir(mode=0o700, exist_ok=True)
+    releases.mkdir(mode=0o700, exist_ok=True)
+    refuse_symlink_directories((base, dist, releases))
+    release_id = f"r{manifest['sequence']}-{manifest['commit'][:12]}"
+    identity = {
+        "id": release_id,
+        "sequence": manifest["sequence"],
+        "commit": manifest["commit"],
+        "manifestSha256": sha256_bytes(manifest_bytes),
+    }
+    state_path = dist / "release-state.json"
+    old_state = parse_state(state_path)
+    if old_state is not None:
+        if manifest["sequence"] < old_state["highestSeenSequence"]:
+            stop("DOWNGRADE")
+        if manifest["sequence"] == old_state["highestSeenSequence"] \
+                and identity["manifestSha256"] != old_state["highestSeenManifestSha256"]:
+            stop("SEQUENCE_REUSE")
+        failed = old_state.get("failed")
+        if isinstance(failed, dict) and failed["sequence"] == manifest["sequence"] \
+                and failed["manifestSha256"] == identity["manifestSha256"]:
+            stop("KNOWN_FAILED_RELEASE")
+    final_release = releases / release_id
+    if final_release.exists():
+        if not verify_installed_release(releases, identity, public_key):
+            stop("EXISTING_RELEASE")
+    else:
+        staging = releases / f".staging-{secrets.token_hex(16)}"
+        extract_runtime(runtime_path, staging, files, manifest_path, signature_path)
+        os.rename(staging, final_release)
+        fsync_directory(releases)
+    previous = None
+    if old_state is not None:
+        candidate = old_state.get("previous") if old_state["pendingBoot"] else old_state["current"]
+        if isinstance(candidate, dict) and candidate["id"] != release_id \
+                and verify_installed_release(releases, candidate, public_key):
+            previous = candidate
+    same_current = old_state is not None and old_state["current"]["sequence"] == manifest["sequence"] \
+        and old_state["current"]["manifestSha256"] == identity["manifestSha256"]
+    if same_current:
+        new_state = old_state
+    else:
+        new_state = {
+            "schema": 1,
+            "current": identity,
+            **({"previous": previous} if previous is not None else {}),
+            "highestSeenSequence": manifest["sequence"],
+            "highestSeenManifestSha256": identity["manifestSha256"],
+            "pendingBoot": True,
+            "bootAttempts": 0,
+        }
+    stable_patcher = canonical_base64(STABLE_PATCHER_BASE64, "STABLE_PATCHER")
+    try:
+        stable_patcher_text = stable_patcher.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        stop("STABLE_PATCHER")
+    if "__DISORDER_" in stable_patcher_text:
+        stop("STABLE_PATCHER")
+    atomic_write(dist / "package.json", b"{}\n")
+    atomic_write(state_path, (json.dumps(new_state, separators=(",", ":")) + "\n").encode("utf-8"))
+    atomic_write(dist / "patcher.js", stable_patcher)
+    return release_id
+
+
+def assert_discord_stopped(runtime_installed: bool = False) -> None:
+    ps = trusted_system_tool("ps")
+    result = subprocess.run(
+        [str(ps), "-A", "-o", "comm=", "-o", "args="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        stop("PROCESS_CHECK")
+    running = {Path(line.strip().split(maxsplit=1)[0]).name for line in result.stdout.splitlines() if line.strip()}
+    mac_helper = re.compile(
+        r"/(?:Discord|Discord PTB|Discord Canary|Discord Development)\.app/Contents/"
+        r"(?:MacOS|Frameworks)/[^\n]*(?:Discord|Discord Helper)"
+    )
+    if running & DISCORD_PROCESS_NAMES or any(mac_helper.search(line) for line in result.stdout.splitlines()):
+        stop("DISCORD_RUNNING_AFTER_STAGE" if runtime_installed else "DISCORD_RUNNING")
+
+
+def go_json_string(value: str) -> str:
+    # Match encoding/json.Marshal for a valid Go/Python Unicode string.
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return encoded.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026") \
+        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+
+def mac_patcher_asar(base: Path) -> bytes:
+    # Ported byte-for-byte from Vencord Installer v1.4.0 app_asar.go.
+    package_json = b'{\n\t"name": "discord",\n\t"main": "index.js"\n}'
+    index_js = f"require({go_json_string(str(base / 'dist' / 'patcher.js'))})".encode("utf-8")
+    header = (
+        '{"files":{"index.js":{"size":' + str(len(index_js)) + ',"offset":"0"},'
+        '"package.json":{"size":' + str(len(package_json)) + ',"offset":"' + str(len(index_js)) + '"}}}'
+    ).encode("utf-8")
+    header_size = len(header)
+    aligned_size = (header_size + 3) & ~3
+    prefix = struct.pack("<IIII", 4, aligned_size + 8, aligned_size + 4, header_size)
+    return prefix + header + b"0" * (aligned_size - header_size) + index_js + package_json
+
+
+def path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def exact_regular_file(
+    path: Path,
+    expected: bytes | None = None,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> bool:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size < minimum \
+                or (maximum is not None and info.st_size > maximum):
+            return False
+        if expected is None:
+            return True
+        contents = path.read_bytes()
+        return len(contents) == info.st_size and contents == expected
+    except OSError:
+        return False
+
+
+def assert_no_symlink_components(path: Path) -> None:
+    if not path.is_absolute():
+        stop("DISCORD_PATH")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError:
+            stop("DISCORD_PATH")
+        if stat.S_ISLNK(info.st_mode):
+            stop("DISCORD_PATH")
+
+
+def mac_bundle_metadata(bundle: Path) -> tuple[str, str]:
+    expected = MAC_BUNDLES.get(bundle.name)
+    home_applications = Path(os.environ["HOME"]) / "Applications"
+    if expected is None or bundle.parent not in (Path("/Applications"), home_applications):
+        stop("DISCORD_PATH")
+    assert_no_symlink_components(bundle / "Contents" / "Resources")
+    info_path = bundle / "Contents" / "Info.plist"
+    raw = read_regular_bounded(info_path, 1024 * 1024, "DISCORD_BUNDLE")
+    try:
+        info = plistlib.loads(raw)
+    except (ValueError, TypeError, plistlib.InvalidFileException):
+        stop("DISCORD_BUNDLE")
+    bundle_id, branch = expected
+    if not isinstance(info, dict) or info.get("CFBundleIdentifier") != bundle_id \
+            or info.get("CFBundlePackageType") != "APPL":
+        stop("DISCORD_BUNDLE")
+    return bundle_id, branch
+
+
+def sealed_app_asar_sha256(bundle: Path) -> str:
+    seal_path = bundle / "Contents" / "_CodeSignature" / "CodeResources"
+    assert_no_symlink_components(seal_path)
+    raw = read_regular_bounded(seal_path, 4 * 1024 * 1024, "DISCORD_SEAL")
+    try:
+        seal = plistlib.loads(raw)
+    except (ValueError, TypeError, plistlib.InvalidFileException):
+        stop("DISCORD_SEAL")
+    files = seal.get("files2") if isinstance(seal, dict) else None
+    entry = files.get("Resources/app.asar") if isinstance(files, dict) else None
+    digest = entry.get("hash2") if isinstance(entry, dict) else None
+    if not isinstance(digest, bytes) or len(digest) != 32:
+        stop("DISCORD_SEAL")
+    return digest.hex()
+
+
+def verify_original_app_asar(bundle: Path, path: Path) -> tuple[str, int]:
+    if not exact_regular_file(path, minimum=1, maximum=2 * 1024 * 1024 * 1024):
+        stop("DISCORD_ASAR")
+    expected = sealed_app_asar_sha256(bundle)
+    actual, size = sha256_file(path, 2 * 1024 * 1024 * 1024)
+    if actual != expected:
+        stop("DISCORD_SEAL")
+    return actual, size
+
+
+def verify_apple_bundle(bundle: Path) -> None:
+    codesign = Path("/usr/bin/codesign")
+    if not codesign.is_file():
+        stop("CODESIGN_UNAVAILABLE")
+    result = subprocess.run(
+        [str(codesign), "--verify", "--deep", "--strict", "--verbose=2", str(bundle)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        stop("DISCORD_SIGNATURE")
+
+
+def mac_record_path(base: Path, branch: str) -> Path:
+    if branch not in ("stable", "ptb", "canary", "development"):
+        stop("MAC_JOURNAL")
+    return base / f"disorder-macos-injection-{branch}.json"
+
+
+def validate_mac_record(
+    value: object,
+    bundle: Path,
+    bundle_id: str,
+    base: Path,
+    patched: bytes,
+) -> dict[str, object]:
+    required = (
+        "schema", "product", "status", "bundlePath", "bundleId", "dataRoot",
+        "originalSize", "originalSha256", "stagingName", "patchedSize", "patchedSha256",
+    )
+    if not exact_object(value, required) or value["schema"] != MAC_INJECTION_RECORD_SCHEMA \
+            or value["product"] != "disorder-vencord" or value["status"] not in ("pending", "installed") \
+            or value["bundlePath"] != str(bundle) or value["bundleId"] != bundle_id \
+            or value["dataRoot"] != str(base) or not is_plain_int(value["originalSize"], 1, 2 * 1024 * 1024 * 1024) \
+            or not isinstance(value["originalSha256"], str) or not SHA256_PATTERN.fullmatch(value["originalSha256"]) \
+            or not isinstance(value["stagingName"], str) \
+            or not re.fullmatch(r"\.disorder-app-asar-staging-[0-9a-f]{32}", value["stagingName"]) \
+            or value["patchedSize"] != len(patched) or value["patchedSha256"] != sha256_bytes(patched):
+        stop("MAC_JOURNAL")
+    return value
+
+
+def read_mac_record(
+    path: Path,
+    bundle: Path,
+    bundle_id: str,
+    base: Path,
+    patched: bytes,
+) -> dict[str, object] | None:
+    if not path_lexists(path):
+        return None
+    raw = read_regular_bounded(path, 4096, "MAC_JOURNAL")
+    return validate_mac_record(strict_json(raw, "MAC_JOURNAL"), bundle, bundle_id, base, patched)
+
+
+def write_mac_record(path: Path, record: dict[str, object]) -> None:
+    atomic_write(path, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def mac_original_matches(path: Path, record: dict[str, object]) -> bool:
+    if not exact_regular_file(path, minimum=1, maximum=2 * 1024 * 1024 * 1024):
+        return False
+    try:
+        digest, size = sha256_file(path, 2 * 1024 * 1024 * 1024)
+    except (InstallFailure, OSError):
+        return False
+    return size == record["originalSize"] and digest == record["originalSha256"]
+
+
+def recoverable_mac_staging(path: Path, record: dict[str, object], patched: bytes) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) \
+        and 0 <= info.st_size <= record["patchedSize"] \
+        and record["patchedSize"] == len(patched) and record["patchedSha256"] == sha256_bytes(patched)
+
+
+def remove_recoverable_mac_staging(path: Path, record: dict[str, object], patched: bytes) -> None:
+    if not recoverable_mac_staging(path, record, patched):
+        stop("MAC_STAGING")
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def stage_mac_asar(path: Path, record: dict[str, object], patched: bytes) -> None:
+    if path_lexists(path):
+        if exact_regular_file(path, patched):
+            return
+        remove_recoverable_mac_staging(path, record, patched)
+    write_exclusive(path, patched, 0o600)
+    fsync_directory(path.parent)
+
+
+def mac_layout(
+    bundle: Path,
+    base: Path,
+) -> tuple[str, dict[str, object] | None, Path, bytes]:
+    bundle_id, branch = mac_bundle_metadata(bundle)
+    resources = bundle / "Contents" / "Resources"
+    app_asar = resources / "app.asar"
+    original = resources / "_app.asar"
+    unpacked_app = resources / "app"
+    patched = mac_patcher_asar(base)
+    record_path = mac_record_path(base, branch)
+    record = read_mac_record(record_path, bundle, bundle_id, base, patched)
+    staging = resources / str(record["stagingName"]) if record is not None else None
+    if path_lexists(unpacked_app):
+        stop("UNKNOWN_DISCORD_INJECTION")
+    stock = exact_regular_file(app_asar, minimum=1, maximum=2 * 1024 * 1024 * 1024) \
+        and not path_lexists(original)
+    if stock:
+        verify_apple_bundle(bundle)
+        digest, size = verify_original_app_asar(bundle, app_asar)
+        if record is not None and staging is not None and path_lexists(staging) \
+                and not recoverable_mac_staging(staging, record, patched):
+            stop("MAC_JOURNAL")
+        if record is not None and record["status"] == "pending" \
+                and record["originalSha256"] == digest and record["originalSize"] == size:
+            return "fresh-pending", record, record_path, patched
+        return ("fresh-reset" if record is not None else "fresh"), record, record_path, patched
+    original_is_sealed = exact_regular_file(original, minimum=1, maximum=2 * 1024 * 1024 * 1024) \
+        and sha256_file(original, 2 * 1024 * 1024 * 1024)[0] == sealed_app_asar_sha256(bundle)
+    if original_is_sealed and exact_regular_file(app_asar, patched) \
+            and (staging is None or not path_lexists(staging)):
+        if record is not None and not mac_original_matches(original, record):
+            stop("MAC_JOURNAL")
+        return "ours", record, record_path, patched
+    if record is not None and record["status"] == "pending" and original_is_sealed \
+            and mac_original_matches(original, record) and not path_lexists(app_asar) \
+            and staging is not None and path_lexists(staging) \
+            and recoverable_mac_staging(staging, record, patched):
+        return "renamed", record, record_path, patched
+    stop("UNKNOWN_DISCORD_INJECTION")
+
+
+def discover_mac_bundles(home: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for parent in (Path("/Applications"), home / "Applications"):
+        for name in MAC_BUNDLES:
+            candidate = parent / name
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                candidates.append(candidate)
+    return candidates
+
+
+def mac_confirmation_for_bundle(bundle: Path) -> str:
+    if bundle.parent == Path("/Applications"):
+        return MAC_SHARED_CONFIRMATION
+    return MAC_CONFIRMATION
+
+
+def choose_mac_bundle(home: Path) -> Path:
+    candidates = discover_mac_bundles(home)
+    if not candidates:
+        stop("DISCORD_NOT_FOUND")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        stop("INTERACTIVE_CONFIRMATION")
+    print("Choose the Discord application to modify:")
+    for index, candidate in enumerate(candidates, start=1):
+        print(f"  {index}. {candidate}")
+    try:
+        selection = input("Selection: ").strip()
+    except EOFError:
+        stop("INTERACTIVE_CONFIRMATION")
+    if not selection.isascii() or not selection.isdigit() or not 1 <= int(selection) <= len(candidates):
+        stop("DISCORD_SELECTION")
+    selected = candidates[int(selection) - 1]
+    print()
+    print("Disorder must replace Discord's sealed Contents/Resources/app.asar with a deterministic loader ASAR.")
+    print("This invalidates Discord's application signature after the original signature is checked.")
+    print("The original app.asar is retained as _app.asar. You must rerun this verified installer after Discord updates.")
+    print("No sudo, Gatekeeper override, quarantine removal, or remote script execution will be used.")
+    confirmation_phrase = mac_confirmation_for_bundle(selected)
+    if confirmation_phrase == MAC_SHARED_CONFIRMATION:
+        print()
+        print("WARNING: This Discord bundle is under /Applications and may be shared by local accounts.")
+        print("The loader embeds this local account's private Vencord data path, binding the shared app to this account.")
+        print("After this modification, Discord may be unusable to other local accounts on this Mac.")
+    try:
+        confirmation = input(f'Type "{confirmation_phrase}" to continue: ')
+    except EOFError:
+        stop("INTERACTIVE_CONFIRMATION")
+    if confirmation != confirmation_phrase:
+        stop("CONFIRMATION")
+    return selected
+
+
+def preflight_mac_bundle(bundle: Path, base: Path) -> None:
+    resources = bundle / "Contents" / "Resources"
+    try:
+        resource_info = resources.lstat()
+    except OSError:
+        stop("DISCORD_PATH")
+    if not stat.S_ISDIR(resource_info.st_mode) or stat.S_ISLNK(resource_info.st_mode) \
+            or not os.access(resources, os.W_OK | os.X_OK):
+        stop("DISCORD_NOT_WRITABLE")
+    mac_layout(bundle, base)
+
+
+def install_mac_asar(bundle: Path, base: Path) -> None:
+    global PERSISTENT_CHANGES_STARTED
+    resources = bundle / "Contents" / "Resources"
+    mode, record, record_path, patched = mac_layout(bundle, base)
+    app_asar = resources / "app.asar"
+    original = resources / "_app.asar"
+    if mode == "ours":
+        if record is None:
+            bundle_id, _branch = mac_bundle_metadata(bundle)
+            original_digest, original_size = verify_original_app_asar(bundle, original)
+            record = {
+                "schema": MAC_INJECTION_RECORD_SCHEMA,
+                "product": "disorder-vencord",
+                "status": "installed",
+                "bundlePath": str(bundle),
+                "bundleId": bundle_id,
+                "dataRoot": str(base),
+                "originalSize": original_size,
+                "originalSha256": original_digest,
+                "stagingName": f".disorder-app-asar-staging-{secrets.token_hex(16)}",
+                "patchedSize": len(patched),
+                "patchedSha256": sha256_bytes(patched),
+            }
+            write_mac_record(record_path, record)
+        elif record["status"] != "installed":
+            write_mac_record(record_path, {**record, "status": "installed"})
+        return
+    if mode in ("fresh", "fresh-reset"):
+        if mode == "fresh-reset" and record is not None:
+            stale_staging = resources / str(record["stagingName"])
+            if path_lexists(stale_staging):
+                remove_recoverable_mac_staging(stale_staging, record, patched)
+        bundle_id, _branch = mac_bundle_metadata(bundle)
+        original_digest, original_size = verify_original_app_asar(bundle, app_asar)
+        record = {
+            "schema": MAC_INJECTION_RECORD_SCHEMA,
+            "product": "disorder-vencord",
+            "status": "pending",
+            "bundlePath": str(bundle),
+            "bundleId": bundle_id,
+            "dataRoot": str(base),
+            "originalSize": original_size,
+            "originalSha256": original_digest,
+            "stagingName": f".disorder-app-asar-staging-{secrets.token_hex(16)}",
+            "patchedSize": len(patched),
+            "patchedSha256": sha256_bytes(patched),
+        }
+        write_mac_record(record_path, record)
+    elif mode == "fresh-pending" and record is not None:
+        pass
+    elif mode != "renamed" or record is None:
+        stop("UNKNOWN_DISCORD_INJECTION")
+    staging = resources / str(record["stagingName"])
+    stage_mac_asar(staging, record, patched)
+    PERSISTENT_CHANGES_STARTED = True
+    if path_lexists(app_asar):
+        if path_lexists(original) or not mac_original_matches(app_asar, record):
+            stop("UNKNOWN_DISCORD_INJECTION")
+        assert_discord_stopped(True)
+        app_asar.rename(original)
+        fsync_directory(resources)
+    if not mac_original_matches(original, record) or path_lexists(app_asar) \
+            or not exact_regular_file(staging, patched):
+        stop("UNKNOWN_DISCORD_INJECTION")
+    assert_discord_stopped(True)
+    staging.rename(app_asar)
+    fsync_directory(resources)
+    if not exact_regular_file(app_asar, patched):
+        stop("MAC_PATCH_RESULT")
+    write_mac_record(record_path, {**record, "status": "installed"})
+
+
+def run_linux_installer(installer: Path, base: Path) -> None:
+    global VERIFIED_EXECUTION_STARTED
+    os.chmod(installer, 0o700)
+    environment = os.environ.copy()
+    environment["VENCORD_USER_DATA_DIR"] = str(base)
+    environment["VENCORD_DEV_INSTALL"] = "1"
+    print("Linux installation is limited to user-writable Discord installs and per-user Flatpak installs.")
+    print("System .deb paths and Snap installs are unsupported; this installer will not use sudo.")
+    print("The pinned Vencord installer performs a version check against GitHub, with vencord.dev as fallback.")
+    print("That request exposes your IP address and User-Agent; dev-install mode prevents self-update and runtime download.")
+    VERIFIED_EXECUTION_STARTED = True
+    result = subprocess.run(
+        [str(installer), "--install"],
+        env=environment,
+        stdin=None,
+        stdout=None,
+        stderr=None,
+        check=False,
+    )
+    if result.returncode != 0:
+        stop("UPSTREAM_INSTALLER")
+
+
+def main() -> None:
+    global PERSISTENT_CHANGES_STARTED
+    if any(token in value for token in ("__DISORDER_",) for value in (
+        REPOSITORY, PUBLIC_KEY_PEM_BASE64, PUBLIC_KEY_FINGERPRINT, STABLE_PATCHER_BASE64
+    )):
+        stop("INSTALLER_TEMPLATE")
+    if not REPOSITORY_PATTERN.fullmatch(REPOSITORY):
+        stop("REPOSITORY")
+    system = platform.system()
+    if system not in ("Darwin", "Linux"):
+        stop("UNSUPPORTED_PLATFORM")
+    machine = platform.machine().lower()
+    if system == "Linux" and machine not in ("x86_64", "amd64"):
+        stop("UNSUPPORTED_ARCHITECTURE")
+    if system == "Darwin" and machine not in ("x86_64", "amd64", "arm64", "aarch64"):
+        stop("UNSUPPORTED_ARCHITECTURE")
+    if not hasattr(os, "geteuid") or os.geteuid() == 0 or os.environ.get("SUDO_USER") or os.environ.get("SUDO_UID"):
+        stop("ELEVATION")
+    trusted_system_tool("openssl")
+    base = data_root(system)
+    with tempfile.TemporaryDirectory(prefix="DisorderInstall-") as raw_temporary:
+        temporary = Path(raw_temporary)
+        metadata_path = temporary / "latest-release.json"
+        bounded_download(
+            f"https://api.github.com/repos/{REPOSITORY}/releases/latest",
+            metadata_path,
+            1024 * 1024,
+            frozenset(("api.github.com",)),
+            "application/vnd.github+json",
+        )
+        tag, assets = parse_release_assets(read_regular_bounded(metadata_path, 1024 * 1024, "RELEASE_LOOKUP"))
+        manifest_path = temporary / MANIFEST_NAME
+        signature_path = temporary / SIGNATURE_NAME
+        runtime_path = temporary / RUNTIME_NAME
+        bounded_download(assets[MANIFEST_NAME]["url"], manifest_path, 128 * 1024, ALLOWED_RELEASE_HOSTS)
+        bounded_download(assets[SIGNATURE_NAME]["url"], signature_path, 2 * 1024, ALLOWED_RELEASE_HOSTS)
+        if manifest_path.stat().st_size != assets[MANIFEST_NAME]["size"] \
+                or signature_path.stat().st_size != assets[SIGNATURE_NAME]["size"]:
+            stop("RELEASE_ASSET_SIZE")
+        key_path = public_key_file(temporary)
+        manifest_bytes = verify_manifest_signature(manifest_path, signature_path, key_path, temporary)
+        manifest, files = parse_manifest(manifest_bytes)
+        validate_release_tag(tag, manifest)
+        if assets[RUNTIME_NAME]["size"] != manifest["bundle"]["size"]:
+            stop("RUNTIME_SIZE")
+        bounded_download(assets[RUNTIME_NAME]["url"], runtime_path, 64 * 1024 * 1024, ALLOWED_RELEASE_HOSTS)
+        runtime_digest, runtime_size = sha256_file(runtime_path, 64 * 1024 * 1024)
+        if runtime_size != manifest["bundle"]["size"] or runtime_digest != manifest["bundle"]["sha256"]:
+            stop("RUNTIME_HASH")
+        linux_installer: Path | None = None
+        if system == "Linux":
+            linux_installer = temporary / "VencordInstallerCli-linux"
+            bounded_download(LINUX_INSTALLER_URL, linux_installer, LINUX_INSTALLER_MAX_BYTES, ALLOWED_RELEASE_HOSTS)
+            installer_digest, _installer_size = sha256_file(linux_installer, LINUX_INSTALLER_MAX_BYTES)
+            if installer_digest != LINUX_INSTALLER_SHA256:
+                stop("UPSTREAM_INSTALLER_HASH")
+        assert_discord_stopped(False)
+        selected_bundle: Path | None = None
+        if system == "Darwin":
+            selected_bundle = choose_mac_bundle(Path(os.environ["HOME"]))
+            preflight_mac_bundle(selected_bundle, base)
+        refuse_symlink_directories((base, base / "dist", base / "dist" / "releases"))
+        PERSISTENT_CHANGES_STARTED = True
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        refuse_symlink_directories((base, base / "dist", base / "dist" / "releases"))
+        install_lock = InstallLock(base / INSTALL_LOCK_NAME)
+        install_lock.acquire()
+        runtime_installed = False
+        try:
+            release_id = stage_signed_runtime(
+                base, manifest, files, manifest_bytes, manifest_path, signature_path,
+                runtime_path, key_path,
+            )
+            runtime_installed = True
+            assert_discord_stopped(True)
+            if system == "Darwin":
+                assert selected_bundle is not None
+                install_mac_asar(selected_bundle, base)
+            else:
+                assert linux_installer is not None
+                run_linux_installer(linux_installer, base)
+        finally:
+            install_lock.release()
+    print(f"Disorder Vencord was installed from signed release {release_id}.")
+    print("Fully quit and reopen Discord to finish.")
+    if system == "Darwin":
+        print("Rerun this verified installer after Discord replaces or updates its application bundle.")
+    print(f"Update public-key fingerprint: {PUBLIC_KEY_FINGERPRINT}")
+
+
+try:
+    main()
+except InstallFailure as error:
+    if VERIFIED_EXECUTION_STARTED:
+        truth = "The verified upstream installer was started; signed local files may remain. No unverified payload was executed."
+    elif PERSISTENT_CHANGES_STARTED:
+        truth = "Signed local files or an attested Discord injection may remain. No unverified payload was executed."
+    else:
+        truth = "Nothing downloaded by this script was executed and no persistent installation transaction began."
+    print(f"Disorder installation stopped safely ({error.code}). {truth}", file=sys.stderr)
+    if error.detail:
+        print(error.detail, file=sys.stderr)
+    raise SystemExit(1)
+except KeyboardInterrupt:
+    if VERIFIED_EXECUTION_STARTED:
+        truth = "The verified upstream installer was started; signed local files may remain. No unverified payload was executed."
+    elif PERSISTENT_CHANGES_STARTED:
+        truth = "Signed local files or an attested Discord injection may remain. No unverified payload was executed."
+    else:
+        truth = "No persistent installation transaction began and no downloaded payload was executed."
+    print(f"Disorder installation cancelled. {truth}", file=sys.stderr)
+    raise SystemExit(130)
+except Exception:
+    if VERIFIED_EXECUTION_STARTED:
+        truth = "The verified upstream installer was started; signed local files may remain. No unverified payload was executed."
+    elif PERSISTENT_CHANGES_STARTED:
+        truth = "Signed local files or an attested Discord injection may remain. No unverified payload was executed."
+    else:
+        truth = "Nothing downloaded by this script was executed and no persistent installation transaction began."
+    print(f"Disorder installation stopped safely (UNEXPECTED). {truth}", file=sys.stderr)
+    raise SystemExit(1)
+PY
