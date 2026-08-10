@@ -663,6 +663,7 @@ try {
     $stablePatcherBytes = [Convert]::FromBase64String($StablePatcherBase64)
     $stablePatcher = [Text.Encoding]::UTF8.GetString($stablePatcherBytes)
     if ($stablePatcher.Contains(("__" + "DISORDER_"))) { Stop-Install "STABLE_PATCHER" }
+    Write-AtomicUtf8 (Join-Path $distPath "package.json") ("{}" + "`n")
     Write-AtomicUtf8 $statePath (($newState | ConvertTo-Json -Depth 5 -Compress) + "`n")
     Write-AtomicUtf8 (Join-Path $distPath "patcher.js") $stablePatcher
 

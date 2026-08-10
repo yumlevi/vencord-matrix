@@ -35,11 +35,46 @@ jobs:
             - name: Reject tracked private or diagnostic artifacts
               run: node scripts/release/checkPublicTree.mjs
 
+    portable-bootstrap-audit:
+        needs: privacy-audit
+        strategy:
+            fail-fast: false
+            matrix:
+                os:
+                    - ubuntu-latest
+                    - macos-latest
+        runs-on: ${{ matrix.os }}
+        steps:
+            - name: Check out the exact source revision
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            - name: Set up pnpm
+              uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+            - name: Use Node.js 24
+              uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install locked dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Validate the macOS and Linux bootstrap
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  sh -n scripts/release/Install-Disorder.sh.template
+                  bash -n scripts/release/Install-Disorder.sh.template
+                  pnpm exec tsx scripts/testUnixReleaseInstaller.ts
+                  pnpm exec tsx scripts/testReleaseUpdater.ts
+
     build:
         if: >-
-            vars.DISORDER_PUBLIC_RELEASES_ENABLED == 'true'
-            && github.ref == 'refs/heads/main'
-            && (github.event_name == 'push' || inputs.confirm_public_release == true)
+            github.event_name == 'pull_request'
+            || (vars.DISORDER_PUBLIC_RELEASES_ENABLED == 'true'
+                && github.ref == 'refs/heads/main'
+                && (github.event_name == 'push' || inputs.confirm_public_release == true))
         needs: privacy-audit
         runs-on: ubuntu-latest
         permissions:
@@ -122,7 +157,9 @@ jobs:
             vars.DISORDER_PUBLIC_RELEASES_ENABLED == 'true'
             && github.ref == 'refs/heads/main'
             && (github.event_name == 'push' || inputs.confirm_public_release == true)
-        needs: build
+        needs:
+            - build
+            - portable-bootstrap-audit
         runs-on: ubuntu-latest
         environment: disorder-release-signing
         permissions:
@@ -240,12 +277,19 @@ jobs:
                   assert 0 < setup.stat().st_size <= 2 * 1024 * 1024
                   with zipfile.ZipFile(setup) as archive:
                       infos = archive.infolist()
-                      assert [info.filename for info in infos] == ["Install-Disorder.cmd", "Install-Disorder.ps1"]
+                      assert [info.filename for info in infos] == [
+                          "Install-Disorder.cmd", "Install-Disorder.ps1", "Install-Disorder.sh",
+                      ]
                       assert all(not info.is_dir() and not (info.flag_bits & 1) for info in infos)
                       assert all(((info.external_attr >> 16) & 0o170000) != 0o120000 for info in infos)
-                      assert [info.file_size for info in infos] == [len(launcher), len(installer)]
+                      portable = archive.read("Install-Disorder.sh")
+                      assert [info.file_size for info in infos] == [len(launcher), len(installer), len(portable)]
+                      assert [((info.external_attr >> 16) & 0o777) for info in infos] == [0o644, 0o644, 0o755]
                       assert archive.read("Install-Disorder.cmd") == launcher
                       assert archive.read("Install-Disorder.ps1") == installer
+                      assert portable.startswith(b"#!/bin/sh\n") and b"\r" not in portable
+                      assert re.search(br"__DISORDER_[A-Z0-9_]+__", portable) is None
+                      assert os.environ["EXPECTED_REPOSITORY"].encode() in portable
                   fingerprint = (root / "update-public-key.spki.sha256").read_text(encoding="ascii")
                   assert re.fullmatch(r"[0-9a-f]{64}\n", fingerprint)
                   PY
@@ -402,12 +446,18 @@ jobs:
                   powershell = (root / "Install-Disorder.ps1").read_bytes()
                   with zipfile.ZipFile(root / "Disorder-Setup.zip") as archive:
                       entries = archive.infolist()
-                      assert [entry.filename for entry in entries] == ["Install-Disorder.cmd", "Install-Disorder.ps1"]
+                      assert [entry.filename for entry in entries] == [
+                          "Install-Disorder.cmd", "Install-Disorder.ps1", "Install-Disorder.sh",
+                      ]
                       assert all(not entry.is_dir() and not (entry.flag_bits & 1) for entry in entries)
                       assert all(((entry.external_attr >> 16) & 0o170000) != 0o120000 for entry in entries)
-                      assert [entry.file_size for entry in entries] == [len(command), len(powershell)]
+                      portable = archive.read("Install-Disorder.sh")
+                      assert [entry.file_size for entry in entries] == [len(command), len(powershell), len(portable)]
+                      assert [((entry.external_attr >> 16) & 0o777) for entry in entries] == [0o644, 0o644, 0o755]
                       assert archive.read("Install-Disorder.cmd") == command
                       assert archive.read("Install-Disorder.ps1") == powershell
+                      assert portable.startswith(b"#!/bin/sh\n") and b"\r" not in portable
+                      assert re.search(br"__DISORDER_[A-Z0-9_]+__", portable) is None
                   PY
 
             - name: Publish a new unique release only
@@ -459,16 +509,20 @@ jobs:
                   bootstrap_sha="$(sha256sum signed-release/Install-Disorder.ps1 | cut -d' ' -f1)"
                   launcher_sha="$(sha256sum signed-release/Install-Disorder.cmd | cut -d' ' -f1)"
                   setup_sha="$(sha256sum signed-release/Disorder-Setup.zip | cut -d' ' -f1)"
+                  portable_sha="$(unzip -p signed-release/Disorder-Setup.zip Install-Disorder.sh | sha256sum | cut -d' ' -f1)"
                   public_fingerprint="$(tr -d '\r\n' < signed-release/update-public-key.spki.sha256)"
                   notes="$release_work/notes.md"
                   {
                       printf '%s\n\n' 'Automated signed Disorder Vencord build.'
                       printf 'Commit: `%s`\n\n' "$GITHUB_SHA"
-                      printf 'Downloaded bootstrap SHA-256: `%s`\n\n' "$bootstrap_sha"
+                      printf 'Windows PowerShell installer SHA-256: `%s`\n\n' "$bootstrap_sha"
                       printf 'Double-click launcher SHA-256: `%s`\n\n' "$launcher_sha"
+                      printf 'macOS/Linux shell installer SHA-256: `%s`\n\n' "$portable_sha"
                       printf 'One-download setup ZIP SHA-256: `%s`\n\n' "$setup_sha"
                       printf 'Update public-key SPKI SHA-256: `%s`\n\n' "$public_fingerprint"
-                      printf '%s\n' 'Download `Disorder-Setup.zip`, verify its SHA-256, extract both files, then double-click `Install-Disorder.cmd`. Never pipe network content into PowerShell.'
+                      printf '%s\n\n' 'Download `Disorder-Setup.zip`, verify its SHA-256, and extract all three files. On Windows, double-click `Install-Disorder.cmd`. On macOS or Linux, run `sh ./Install-Disorder.sh` locally. Never pipe network content into a shell.'
+                      printf '%s\n\n' 'Linux support is limited to x86_64 user-writable installs and user Flatpak; this bootstrap never elevates. The pinned helper checks GitHub (with vencord.dev fallback), exposing your IP address and User-Agent, but does not self-update or download Vencord runtime in dev-install mode.'
+                      printf '%s\n' 'macOS support is experimental: modifying Discord breaks its sealed app signature and may affect privacy prompts or Keychain access. The installer never disables Gatekeeper or removes quarantine attributes.'
                   } > "$notes"
                   gh release create "$tag" \
                       --repo "$GITHUB_REPOSITORY" \

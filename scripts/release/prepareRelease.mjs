@@ -28,6 +28,7 @@ const MANIFEST_NAME = "disorder-manifest.json";
 const RUNTIME_NAME = "disorder-runtime.zip";
 const INSTALLER_NAME = "Install-Disorder.ps1";
 const INSTALLER_LAUNCHER_NAME = "Install-Disorder.cmd";
+const PORTABLE_INSTALLER_NAME = "Install-Disorder.sh";
 const SETUP_ARCHIVE_NAME = "Disorder-Setup.zip";
 const RUNTIME_SOURCES = Object.freeze([
     ["LICENSE", "LICENSE"],
@@ -122,7 +123,8 @@ async function readPublicKey(path) {
         || Buffer.from(jwk.n, "base64url").toString("base64url") !== jwk.n)
         abort("the update public key must be canonical 3072-4096 bit RSA with exponent 65537");
     const spki = key.export({ format: "der", type: "spki" });
-    return { jwk, fingerprint: sha256(spki) };
+    const spkiPem = key.export({ format: "pem", type: "spki" });
+    return { jwk, fingerprint: sha256(spki), spkiPem };
 }
 
 if (typeof values.output !== "string") abort("--output is required");
@@ -144,7 +146,7 @@ if ((await readdir(output)).length !== 0) abort("--output must be an empty direc
 const packageJson = JSON.parse((await readRequiredFile(join(repositoryRoot, "package.json"), 1024 * 1024)).toString("utf8"));
 const version = `${packageJson.version}-r${sequence}`;
 if (!VERSION.test(version)) abort("the generated display version is invalid");
-const { jwk, fingerprint } = await readPublicKey(resolve(values["public-key"]));
+const { jwk, fingerprint, spkiPem } = await readPublicKey(resolve(values["public-key"]));
 
 const runtimeBytes = new Map();
 for (const [path, source] of RUNTIME_SOURCES) {
@@ -209,19 +211,43 @@ const installerLauncher = (await readRequiredFile(join(repositoryRoot, "scripts/
     .toString("utf8")
     .replace(/\r?\n/g, "\r\n");
 if (Buffer.byteLength(installerLauncher) > 16 * 1024) abort("the generated launcher exceeds 16 KiB");
+let portableInstaller = (await readRequiredFile(join(repositoryRoot, "scripts/release/Install-Disorder.sh.template"), 1024 * 1024))
+    .toString("utf8");
+portableInstaller = replaceOnce(portableInstaller, "__DISORDER_REPOSITORY__", values.repository);
+portableInstaller = replaceOnce(
+    portableInstaller,
+    "__DISORDER_UPDATE_PUBLIC_KEY_PEM_BASE64__",
+    Buffer.from(spkiPem, "ascii").toString("base64")
+);
+portableInstaller = replaceOnce(portableInstaller, "__DISORDER_PUBLIC_KEY_FINGERPRINT__", fingerprint);
+portableInstaller = replaceOnce(
+    portableInstaller,
+    "__DISORDER_STABLE_PATCHER_BASE64__",
+    Buffer.from(stablePatcher, "utf8").toString("base64")
+);
+if (/__DISORDER_[A-Z0-9_]+__/.test(portableInstaller)) abort("the portable installer contains an unresolved template token");
+portableInstaller = portableInstaller.replace(/\r\n/g, "\n");
+if (!portableInstaller.startsWith("#!/bin/sh\n") || Buffer.byteLength(portableInstaller) > 1024 * 1024)
+    abort("the generated portable installer is invalid");
 const setupEntries = {
     [INSTALLER_LAUNCHER_NAME]: [new Uint8Array(Buffer.from(installerLauncher, "utf8")), {
-        level: 9, mtime: FIXED_ZIP_TIME, os: 0
+        level: 9, mtime: FIXED_ZIP_TIME, os: 3, attrs: 0o644 << 16
     }],
     [INSTALLER_NAME]: [new Uint8Array(Buffer.from(installer, "utf8")), {
-        level: 9, mtime: FIXED_ZIP_TIME, os: 0
+        level: 9, mtime: FIXED_ZIP_TIME, os: 3, attrs: 0o644 << 16
+    }],
+    [PORTABLE_INSTALLER_NAME]: [new Uint8Array(Buffer.from(portableInstaller, "utf8")), {
+        level: 9, mtime: FIXED_ZIP_TIME, os: 3, attrs: 0o755 << 16
     }]
 };
-const setupArchive = Buffer.from(zipSync(setupEntries, { level: 9, mtime: FIXED_ZIP_TIME, os: 0 }));
+const setupArchive = Buffer.from(zipSync(setupEntries, { level: 9, mtime: FIXED_ZIP_TIME, os: 3 }));
 const unpackedSetup = unzipSync(new Uint8Array(setupArchive));
-if (JSON.stringify(Object.keys(unpackedSetup)) !== JSON.stringify([INSTALLER_LAUNCHER_NAME, INSTALLER_NAME])
+if (JSON.stringify(Object.keys(unpackedSetup)) !== JSON.stringify([
+    INSTALLER_LAUNCHER_NAME, INSTALLER_NAME, PORTABLE_INSTALLER_NAME
+])
     || !Buffer.from(unpackedSetup[INSTALLER_LAUNCHER_NAME]).equals(Buffer.from(installerLauncher, "utf8"))
     || !Buffer.from(unpackedSetup[INSTALLER_NAME]).equals(Buffer.from(installer, "utf8"))
+    || !Buffer.from(unpackedSetup[PORTABLE_INSTALLER_NAME]).equals(Buffer.from(portableInstaller, "utf8"))
     || setupArchive.length > 2 * 1024 * 1024)
     abort("the one-download setup archive failed its exact-content check");
 
@@ -237,5 +263,6 @@ console.log(`- ${MANIFEST_NAME}: ${manifestBytes.length} bytes`);
 console.log(`- ${RUNTIME_NAME}: ${runtime.length} bytes`);
 console.log(`- ${INSTALLER_NAME}: ${Buffer.byteLength(installer)} bytes`);
 console.log(`- ${INSTALLER_LAUNCHER_NAME}: ${Buffer.byteLength(installerLauncher)} bytes`);
+console.log(`- ${PORTABLE_INSTALLER_NAME} (inside ${SETUP_ARCHIVE_NAME}): ${Buffer.byteLength(portableInstaller)} bytes`);
 console.log(`- ${SETUP_ARCHIVE_NAME}: ${setupArchive.length} bytes`);
 console.log(`- public-key SPKI SHA-256: ${fingerprint}`);
