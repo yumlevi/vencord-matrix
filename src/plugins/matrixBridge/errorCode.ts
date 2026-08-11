@@ -4,8 +4,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-const MATRIX_ERROR_CODE_PATTERN = /^(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/u;
-const WRAPPED_MATRIX_ERROR_CODE_PATTERN = /(?:^|:\s)((?:MATRIX_|M_|ORG[._])[A-Z0-9._]+)(?=:)/u;
+const MATRIX_ERROR_CODE_PATTERN = /^(?=.{1,128}$)(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/u;
+const WRAPPED_MATRIX_ERROR_CODE_PATTERN = /(?:^|:\s)(MATRIX_[A-Z0-9._]{1,121}|M_[A-Z0-9._]{1,126}|ORG[._][A-Z0-9._]{1,124})(?=:)/u;
+
+export function matrixServerUnavailableHttpStatus(value: unknown): boolean {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 500 && value <= 599;
+}
 
 /**
  * Electron's invoke boundary replaces a native Error's custom `name` with
@@ -23,5 +27,6 @@ export function matrixErrorCode(value: unknown): string | undefined {
     const message = typeof candidate?.message === "string"
         ? candidate.message
         : typeof value === "string" ? value : undefined;
-    return message?.match(WRAPPED_MATRIX_ERROR_CODE_PATTERN)?.[1];
+    const wrappedCode = message?.match(WRAPPED_MATRIX_ERROR_CODE_PATTERN)?.[1];
+    return wrappedCode && MATRIX_ERROR_CODE_PATTERN.test(wrappedCode) ? wrappedCode : undefined;
 }

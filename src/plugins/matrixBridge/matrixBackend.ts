@@ -31,6 +31,7 @@ import {
 } from "matrix-js-sdk";
 
 import { isDefinitiveCreateRoomRejection } from "./createSpaceChildError";
+import { matrixServerUnavailableHttpStatus } from "./errorCode";
 import {
     createMatrixLiveDecryptionTracker,
     isCurrentMatrixTimelineGeneration,
@@ -689,6 +690,7 @@ function publicError(error: unknown): MatrixBridgeError {
             errcode?: unknown;
             error?: unknown;
             data?: { error?: unknown; soft_logout?: unknown; };
+            httpStatus?: unknown;
             message?: unknown;
             name?: unknown;
         }
@@ -707,6 +709,11 @@ function publicError(error: unknown): MatrixBridgeError {
             .trim()
             .slice(0, 300)
         : "";
+    const httpStatus = typeof candidate?.httpStatus === "number"
+        && Number.isSafeInteger(candidate.httpStatus)
+        && candidate.httpStatus >= 100 && candidate.httpStatus <= 599
+        ? candidate.httpStatus
+        : undefined;
     switch (errcode) {
         case "M_FORBIDDEN":
             return { code: errcode, message: serverMessage || "Matrix rejected the credentials or action." };
@@ -750,6 +757,12 @@ function publicError(error: unknown): MatrixBridgeError {
         case "M_UNRECOGNIZED":
             return { code: errcode, message: "The Matrix homeserver does not support this operation." };
         default:
+            if (matrixServerUnavailableHttpStatus(httpStatus)) {
+                return {
+                    code: "MATRIX_SERVER_UNAVAILABLE",
+                    message: "The Matrix homeserver is temporarily unavailable."
+                };
+            }
             if (errcode) return { code: errcode, message: serverMessage || `Matrix returned ${errcode}.` };
             if (candidate?.name === "AbortError") {
                 return { code: "MATRIX_REQUEST_TIMEOUT", message: "The Matrix homeserver request timed out." };
@@ -2951,11 +2964,16 @@ async function startAuthenticated(
         disableVoip: true
     });
     let sessionIdentityValidated = false;
+    let startupRefreshAttempted = false;
     let pendingRefreshedCredentials: MatrixCredentialUpdate | undefined;
     const refreshTokens = async (refreshToken: string) => {
         if (matrixClient !== client || clientGeneration !== generation) {
             fail("MATRIX_SESSION_CHANGED", "The Matrix account changed while refreshing its session.");
         }
+        // Refresh tokens may rotate even when their response is lost. Record
+        // the attempt before dispatch so a later transient-looking failure is
+        // never replayed automatically as if this startup were read-only.
+        startupRefreshAttempted = true;
         const result = await refreshClient.refreshToken(refreshToken);
         if (matrixClient !== client || clientGeneration !== generation) {
             fail("MATRIX_SESSION_CHANGED", "The Matrix account changed while refreshing its session.");
@@ -3054,7 +3072,16 @@ async function startAuthenticated(
         return snapshot();
     } catch (error) {
         await disposeClient(false);
-        const safeError = publicError(error);
+        let safeError = publicError(error);
+        if (!sessionIdentityValidated && startupRefreshAttempted
+            && (safeError.code === "MATRIX_NETWORK_ERROR"
+                || safeError.code === "MATRIX_REQUEST_TIMEOUT"
+                || safeError.code === "MATRIX_SERVER_UNAVAILABLE")) {
+            safeError = {
+                code: "MATRIX_STARTUP_REFRESH_AMBIGUOUS",
+                message: "Matrix could not confirm whether its saved-session refresh completed. Reconnect manually after checking the homeserver."
+            };
+        }
         setStatus("error", safeError);
         throw new PublicWorkerError(safeError.code, safeError.message);
     }

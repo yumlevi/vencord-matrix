@@ -436,10 +436,14 @@ const ambiguousGroupChatCreates = new Map<string, PendingGroupChatCreate>();
 const MAX_AMBIGUOUS_GROUP_CHAT_CREATES = 64;
 const ambiguousGroupChatInvites = new Map<string, PendingGroupChatInvite>();
 const MAX_AMBIGUOUS_GROUP_CHAT_INVITES = 256;
+const MATRIX_ERROR_CODE_PATTERN = /^(?=.{1,128}$)(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/u;
 
-function bridgeError(code: string, message: string): Error {
+function bridgeError(code: string, message: string, causeCode?: string): Error {
     const error = new Error(message);
     error.name = code;
+    if (causeCode && MATRIX_ERROR_CODE_PATTERN.test(causeCode)) {
+        (error as Error & { causeCode?: string; }).causeCode = causeCode;
+    }
     return error;
 }
 
@@ -455,8 +459,13 @@ function isSecureViewDocumentUrl(value: string): boolean {
 }
 
 function errorDTO(error: unknown): MatrixBridgeError {
-    if (error instanceof Error && /^(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/.test(error.name)) {
-        return { code: error.name, message: error.message.slice(0, 300) };
+    if (error instanceof Error && MATRIX_ERROR_CODE_PATTERN.test(error.name)) {
+        const { causeCode } = error as Error & { causeCode?: unknown; };
+        return {
+            code: error.name,
+            message: error.message.slice(0, 300),
+            ...(typeof causeCode === "string" && MATRIX_ERROR_CODE_PATTERN.test(causeCode) ? { causeCode } : {})
+        };
     }
 
     return {
@@ -607,14 +616,23 @@ function validateSecureViewShellCommand(value: unknown): MatrixSecureViewShellCo
 }
 
 function projectShellStatus(status: MatrixBridgeStatus): MatrixBridgeStatus {
-    const code = status.error?.code && /^[A-Z0-9_.-]{1,100}$/u.test(status.error.code)
+    const code = status.error?.code && MATRIX_ERROR_CODE_PATTERN.test(status.error.code)
         ? status.error.code
         : "MATRIX_BACKEND_ERROR";
+    const causeCode = status.error?.causeCode && MATRIX_ERROR_CODE_PATTERN.test(status.error.causeCode)
+        ? status.error.causeCode
+        : undefined;
     return {
         seq: status.seq,
         state: status.state,
         ...(status.account ? { account: { userId: status.account.userId } } : {}),
-        ...(status.error ? { error: { code, message: "The Matrix backend reported an error." } } : {})
+        ...(status.error ? {
+            error: {
+                code,
+                message: "The Matrix backend reported an error.",
+                ...(causeCode ? { causeCode } : {})
+            }
+        } : {})
     };
 }
 
@@ -1577,11 +1595,15 @@ function validateProtocolStatus(value: unknown): MatrixBridgeStatus {
         }
         const code = protocolText(raw.error.code, "status error code", 128);
         const message = protocolText(raw.error.message, "status error message", 300);
-        if (!/^(?:MATRIX_|M_|ORG[._])[A-Z0-9._]+$/u.test(code)
+        const causeCode = raw.error.causeCode == null
+            ? undefined
+            : protocolText(raw.error.causeCode, "status error cause code", 128);
+        if (!MATRIX_ERROR_CODE_PATTERN.test(code)
+            || (causeCode != null && !MATRIX_ERROR_CODE_PATTERN.test(causeCode))
             || /[\u0000-\u001f\u007f]/u.test(message)) {
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix status error response was invalid.");
         }
-        status.error = { code, message };
+        status.error = { code, message, ...(causeCode ? { causeCode } : {}) };
     }
     return status;
 }
@@ -3767,42 +3789,49 @@ function startupTimeoutError(stage: MatrixWorkerStartupStage): Error {
     }
 }
 
-function startupStageFailureError(stage: MatrixWorkerStartupStage): Error {
+function startupStageFailureError(stage: MatrixWorkerStartupStage, causeCode: string): Error {
     switch (stage) {
         case "store":
             return bridgeError(
                 "MATRIX_STARTUP_STORE_FAILED",
-                "Matrix could not open its local sync store. Toggle the plugin to try again."
+                "Matrix could not open its local sync store. Toggle the plugin to try again.",
+                causeCode
             );
         case "session":
             return bridgeError(
                 "MATRIX_STARTUP_SESSION_FAILED",
-                "Matrix could not validate its saved session. Toggle the plugin to try again."
+                "Matrix could not validate its saved session. Toggle the plugin to try again.",
+                causeCode
             );
         case "crypto-module":
             return bridgeError(
                 "MATRIX_STARTUP_CRYPTO_MODULE_FAILED",
-                "Matrix could not load its crypto module. Toggle the plugin to try again."
+                "Matrix could not load its crypto module. Toggle the plugin to try again.",
+                causeCode
             );
         case "crypto-wasm":
             return bridgeError(
                 "MATRIX_STARTUP_CRYPTO_WASM_FAILED",
-                "Matrix could not initialize its crypto runtime. Toggle the plugin to try again."
+                "Matrix could not initialize its crypto runtime. Toggle the plugin to try again.",
+                causeCode
             );
         case "crypto-store":
             return bridgeError(
                 "MATRIX_STARTUP_CRYPTO_STORE_FAILED",
-                "Matrix could not open its encrypted crypto store. Toggle the plugin to try again."
+                "Matrix could not open its encrypted crypto store. Toggle the plugin to try again.",
+                causeCode
             );
         case "crypto-machine":
             return bridgeError(
                 "MATRIX_STARTUP_CRYPTO_MACHINE_FAILED",
-                "Matrix could not restore its encryption machine. Toggle the plugin to try again."
+                "Matrix could not restore its encryption machine. Toggle the plugin to try again.",
+                causeCode
             );
         case "client":
             return bridgeError(
                 "MATRIX_STARTUP_CLIENT_FAILED",
-                "Matrix could not start sync. Toggle the plugin to try again."
+                "Matrix could not start sync. Toggle the plugin to try again.",
+                causeCode
             );
     }
 }
@@ -3817,6 +3846,19 @@ function latchStartupFailure(pending: PendingWorkerRequest, error: Error): void 
 
 function isSessionRecoveryError(error: MatrixBridgeError): boolean {
     return error.code === "MATRIX_REAUTH_REQUIRED" || error.code === "MATRIX_SESSION_RESET_REQUIRED";
+}
+
+const RETRYABLE_PRE_CRYPTO_SESSION_FAILURES = new Set([
+    "MATRIX_NETWORK_ERROR",
+    "MATRIX_REQUEST_TIMEOUT",
+    "MATRIX_SERVER_UNAVAILABLE"
+]);
+
+function retryablePreCryptoSessionFailure(
+    pending: PendingWorkerRequest,
+    error: MatrixBridgeError
+): boolean {
+    return pending.startupStage === "session" && RETRYABLE_PRE_CRYPTO_SESSION_FAILURES.has(error.code);
 }
 
 function latchActiveSessionFailure(error: MatrixBridgeError): void {
@@ -3941,10 +3983,16 @@ function handleWorkerMessage(message: MatrixWorkerMessage): void {
         // initRustCrypto does not expose its in-progress StoreHandle through
         // client.cryptoBackend. Destroy this exact worker on any staged startup
         // failure so a leaked handle cannot poison the next deliberate retry.
+        const retryableSessionFailure = retryablePreCryptoSessionFailure(pending, message.error);
         const error = isSessionRecoveryError(message.error)
             ? bridgeError(message.error.code, message.error.message)
-            : startupStageFailureError(pending.startupStage);
-        latchStartupFailure(pending, error);
+            : startupStageFailureError(pending.startupStage, message.error.code);
+        // A proven transient session failure happened before Rust crypto was
+        // opened and before any ambiguous refresh attempt. The backend closed
+        // its sync store, and failWorker still destroys this exact worker, so
+        // the renderer may use its bounded reconnect loop without clearing any
+        // account or crypto data. Every other staged failure stays latched.
+        if (!retryableSessionFailure) latchStartupFailure(pending, error);
         failWorker(error);
         pending.reject(error);
         return;
