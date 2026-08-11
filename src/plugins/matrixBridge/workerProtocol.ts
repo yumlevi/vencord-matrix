@@ -133,10 +133,10 @@ export type MatrixWorkerCommand =
     | { type: "openDirectMessage"; spaceId: string; userId: string; }
     | { type: "downloadMedia"; roomId: string; eventId: string; attachmentIndex: number; }
     | { type: "urlPreview"; roomId: string; eventId: string; }
-    | { type: "sendText"; roomId: string; body: string; replyEventId?: string; }
+    | { type: "sendText"; roomId: string; body: string; replyEventId?: string; mentionedUserIds?: string[]; }
     | { type: "sendSticker"; roomId: string; sticker: MatrixStickerSendRequest; }
     | { type: "sendAttachment"; roomId: string; attachment: MatrixAttachmentSendRequest; }
-    | { type: "edit"; roomId: string; eventId: string; body: string; }
+    | { type: "edit"; roomId: string; eventId: string; body: string; mentionedUserIds?: string[]; }
     | { type: "cancelPending"; roomId: string; transactionId: string; }
     | { type: "redact"; roomId: string; eventId: string; reason?: string; }
     | { type: "react"; roomId: string; eventId: string; key: string; remove?: boolean; }

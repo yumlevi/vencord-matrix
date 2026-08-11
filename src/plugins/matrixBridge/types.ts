@@ -136,6 +136,8 @@ export interface MatrixMessageDTO {
     senderName?: string;
     timestamp: number;
     body: string;
+    /** Canonical Matrix identities intentionally mentioned by this event. */
+    mentionedUserIds?: string[];
     /** True when the original Matrix event type is m.sticker. */
     sticker?: true;
     formattedBody?: string;
