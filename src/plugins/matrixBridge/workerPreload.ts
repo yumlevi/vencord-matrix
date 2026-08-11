@@ -9,6 +9,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import {
     MATRIX_WORKER_COMMAND,
     MATRIX_WORKER_FETCH_KLIPY_PREVIEW,
+    MATRIX_WORKER_FETCH_TENOR_PREVIEW,
+    MATRIX_WORKER_FETCH_X_STATUS,
     MATRIX_WORKER_MESSAGE,
     MATRIX_WORKER_SAVE_CREDENTIALS,
     type MatrixCredentialUpdate,
@@ -32,6 +34,12 @@ const host: MatrixWorkerHost = Object.freeze({
     },
     fetchKlipyPreview(url: string) {
         return ipcRenderer.invoke(MATRIX_WORKER_FETCH_KLIPY_PREVIEW, url);
+    },
+    fetchTenorPreview(url: string) {
+        return ipcRenderer.invoke(MATRIX_WORKER_FETCH_TENOR_PREVIEW, url);
+    },
+    fetchXStatus(url: string) {
+        return ipcRenderer.invoke(MATRIX_WORKER_FETCH_X_STATUS, url);
     }
 });
 

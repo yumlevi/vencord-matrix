@@ -192,8 +192,10 @@ const PREVIEW_VIDEO_DOWNLOAD_TIMEOUT_MS = 80_000;
 const MAX_IMAGE_DIMENSION = 16_384;
 const MAX_IMAGE_PIXELS = 33_554_432;
 const MAX_URL_PREVIEW_CACHE = 256;
-const MAX_KLIPY_PREVIEW_HTML_CHARS = 512 * 1024;
+const MAX_PROVIDER_PREVIEW_DOCUMENT_CHARS = 512 * 1024;
 const KLIPY_MEDIA_HOSTS = new Set(["static.klipy.com", "static2.klipy.com"]);
+const TENOR_MEDIA_HOSTS = new Set(["media.tenor.com", "media1.tenor.com"]);
+const X_POSTER_HOST = "pbs.twimg.com";
 // Discord documents a 512 KiB guild-upload limit. Leave bounded headroom for
 // larger first-party/legacy assets without sharing the Matrix media limit.
 const MAX_DISCORD_STICKER_BYTES = 2 * 1024 * 1024;
@@ -317,6 +319,7 @@ interface SpaceAccessMemberLoad {
 const spaceAccessMemberLoads = new Map<Room, SpaceAccessMemberLoad>();
 interface CachedUrlPreview {
     sourceUrl: string;
+    directProvider?: "klipy" | "tenor" | "x";
     imageMxc?: string;
     imageUrl?: string;
     videoMxc?: string;
@@ -336,6 +339,8 @@ const reactionMapCache = new WeakMap<Room, Map<string, MatrixReactionDTO[]>>();
 const isolatedDecryptionEvents = new WeakSet<MatrixEvent>();
 const liveDecryptionEvents = createMatrixLiveDecryptionTracker<MatrixEvent>();
 const activeMediaReadControllers = new Set<AbortController>();
+const activeDirectPreviewControllers = new Set<AbortController>();
+let directPreviewPolicyAllowed = true;
 
 function resolvedSpaceAccessRequestKey(roomId: string, userId: string): string {
     return `${roomId}\0${userId}`;
@@ -372,6 +377,16 @@ function forgetResolvedSpaceAccessRequestsForRoom(roomId: string): void {
 function trackMediaReadController(controller: AbortController): AbortController {
     activeMediaReadControllers.add(controller);
     return controller;
+}
+
+function trackDirectPreviewController(controller: AbortController): AbortController {
+    activeDirectPreviewControllers.add(controller);
+    return trackMediaReadController(controller);
+}
+
+function releaseDirectPreviewController(controller: AbortController): void {
+    activeDirectPreviewControllers.delete(controller);
+    activeMediaReadControllers.delete(controller);
 }
 
 function rememberReactionTarget(reactionEventId: string, roomId: string, eventId: string): void {
@@ -1092,7 +1107,7 @@ async function fetchPreviewVideo(url: string): Promise<{ bytes: Uint8Array<Array
         fail("MATRIX_MEDIA_INVALID", "The link preview video URI is invalid.");
     }
 
-    const controller = trackMediaReadController(new AbortController());
+    const controller = trackDirectPreviewController(new AbortController());
     const timer = setTimeout(() => controller.abort(), PREVIEW_VIDEO_DOWNLOAD_TIMEOUT_MS);
     try {
         const response = await fetch(candidate.href, {
@@ -1116,7 +1131,7 @@ async function fetchPreviewVideo(url: string): Promise<{ bytes: Uint8Array<Array
         fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The link preview video could not be downloaded.");
     } finally {
         clearTimeout(timer);
-        activeMediaReadControllers.delete(controller);
+        releaseDirectPreviewController(controller);
     }
 }
 
@@ -1138,7 +1153,7 @@ async function fetchKlipyGif(url: string): Promise<{ bytes: Uint8Array<ArrayBuff
     const candidate = klipyMediaUrl(url);
     if (!candidate) fail("MATRIX_MEDIA_INVALID", "The KLIPY preview media URI is invalid.");
 
-    const controller = trackMediaReadController(new AbortController());
+    const controller = trackDirectPreviewController(new AbortController());
     const timer = setTimeout(() => controller.abort(), MEDIA_DOWNLOAD_TIMEOUT_MS);
     try {
         const response = await fetch(candidate, {
@@ -1162,7 +1177,120 @@ async function fetchKlipyGif(url: string): Promise<{ bytes: Uint8Array<ArrayBuff
         fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The KLIPY preview image could not be downloaded.");
     } finally {
         clearTimeout(timer);
-        activeMediaReadControllers.delete(controller);
+        releaseDirectPreviewController(controller);
+    }
+}
+
+function xPosterUrl(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length === 0 || value.length > 4_096
+        || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || url.hostname !== X_POSTER_HOST
+            || url.username || url.password || url.port || url.hash || url.href !== value
+            || !/^\/(?:media|tweet_video_thumb|ext_tw_video_thumb|amplify_video_thumb)\/[A-Za-z0-9_./-]{1,1024}$/u.test(url.pathname)) {
+            return undefined;
+        }
+        const parameters = Array.from(url.searchParams.entries());
+        if (parameters.some(([name, parameter]) =>
+            name === "format"
+                ? !/^(?:jpe?g|png|webp)$/iu.test(parameter)
+                : name === "name"
+                    ? !/^[A-Za-z0-9_]{1,32}$/u.test(parameter)
+                    : true)
+            || new Set(parameters.map(([name]) => name)).size !== parameters.length) {
+            return undefined;
+        }
+        return url.href;
+    } catch {
+        return undefined;
+    }
+}
+
+async function fetchXPoster(url: string): Promise<{ bytes: Uint8Array<ArrayBuffer>; mimeType?: string; }> {
+    const candidate = xPosterUrl(url);
+    if (!candidate) fail("MATRIX_MEDIA_INVALID", "The X preview poster URI is invalid.");
+
+    const controller = trackDirectPreviewController(new AbortController());
+    const timer = setTimeout(() => controller.abort(), MEDIA_DOWNLOAD_TIMEOUT_MS);
+    try {
+        const response = await fetch(candidate, {
+            cache: "no-store",
+            credentials: "omit",
+            headers: { Accept: "image/jpeg,image/png,image/webp" },
+            redirect: "error",
+            referrerPolicy: "no-referrer",
+            signal: controller.signal
+        });
+        if (!response.ok || response.url !== candidate) {
+            await response.body?.cancel();
+            fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The X preview poster could not be downloaded.");
+        }
+        return {
+            bytes: await readBoundedMedia(response, MAX_MEDIA_DOWNLOAD_BYTES),
+            mimeType: normalizedMimeType(response.headers.get("Content-Type"))
+        };
+    } catch (error) {
+        if (error instanceof PublicWorkerError) throw error;
+        fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The X preview poster could not be downloaded.");
+    } finally {
+        clearTimeout(timer);
+        releaseDirectPreviewController(controller);
+    }
+}
+
+function tenorMediaUrl(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length === 0 || value.length > 4_096
+        || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+    try {
+        const url = new URL(value);
+        const validPath = url.hostname === "media1.tenor.com"
+            ? /^\/m\/[A-Za-z0-9_-]{1,256}\/[A-Za-z0-9_.-]{1,256}\.(?:gif|webp|mp4)$/iu.test(url.pathname)
+            : /^\/[A-Za-z0-9_-]{1,256}\/[A-Za-z0-9_.-]{1,256}\.(?:gif|webp|mp4)$/iu.test(url.pathname);
+        if (url.protocol !== "https:" || !TENOR_MEDIA_HOSTS.has(url.hostname)
+            || url.username || url.password || url.port || url.search || url.hash || url.href !== value
+            || !validPath) {
+            return undefined;
+        }
+        return url.href;
+    } catch {
+        return undefined;
+    }
+}
+
+async function fetchTenorMedia(url: string): Promise<{ bytes: Uint8Array<ArrayBuffer>; mimeType?: string; }> {
+    const candidate = tenorMediaUrl(url);
+    if (!candidate) fail("MATRIX_MEDIA_INVALID", "The Tenor preview media URI is invalid.");
+    const video = new URL(candidate).pathname.toLowerCase().endsWith(".mp4");
+    const maximumBytes = video ? MAX_PREVIEW_VIDEO_DOWNLOAD_BYTES : MAX_MEDIA_DOWNLOAD_BYTES;
+    const controller = trackDirectPreviewController(new AbortController());
+    const timer = setTimeout(
+        () => controller.abort(),
+        video ? PREVIEW_VIDEO_DOWNLOAD_TIMEOUT_MS : MEDIA_DOWNLOAD_TIMEOUT_MS
+    );
+    try {
+        const response = await fetch(candidate, {
+            cache: "no-store",
+            credentials: "omit",
+            headers: { Accept: video ? "video/mp4" : "image/gif,image/webp" },
+            redirect: "error",
+            referrerPolicy: "no-referrer",
+            signal: controller.signal
+        });
+        if (!response.ok || response.url !== candidate) {
+            await response.body?.cancel();
+            fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The Tenor preview media could not be downloaded.");
+        }
+        return {
+            bytes: await readBoundedMedia(response, maximumBytes, video),
+            mimeType: normalizedMimeType(response.headers.get("Content-Type"))
+        };
+    } catch (error) {
+        if (error instanceof PublicWorkerError) throw error;
+        fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The Tenor preview media could not be downloaded.");
+    } finally {
+        clearTimeout(timer);
+        releaseDirectPreviewController(controller);
     }
 }
 
@@ -8285,13 +8413,8 @@ function firstPreviewUrl(content: Record<string, any>): string | undefined {
     if (!candidate || candidate.length > 2_048) return undefined;
     try {
         const url = new URL(candidate);
-        const hostname = url.hostname.toLowerCase();
         if ((url.protocol !== "http:" && url.protocol !== "https:")
             || url.username || url.password || url.port) return undefined;
-        if (PROJECTED_SOCIAL_HOSTS.has(hostname)) {
-            url.protocol = "https:";
-            url.hostname = "girlcockx.com";
-        }
         return url.href;
     } catch {
         return undefined;
@@ -8306,6 +8429,54 @@ function klipyShareUrl(value: string): string | undefined {
             || url.href !== value || !/^\/gifs\/[a-z0-9](?:[a-z0-9-]{0,198}[a-z0-9])?$/u.test(url.pathname)) {
             return undefined;
         }
+        return url.href;
+    } catch {
+        return undefined;
+    }
+}
+
+function tenorShareUrl(value: string): string | undefined {
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || (url.hostname !== "tenor.com" && url.hostname !== "www.tenor.com")
+            || url.username || url.password || url.port || url.search || url.hash
+            || url.href !== value
+            || !/^\/view\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,238}[A-Za-z0-9])?-gif-[1-9][0-9]{0,19}$/u.test(url.pathname)) {
+            return undefined;
+        }
+        url.hostname = "tenor.com";
+        return url.href;
+    } catch {
+        return undefined;
+    }
+}
+
+function xStatusApiUrl(value: string): { url: string; statusId: string; } | undefined {
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || !PROJECTED_SOCIAL_HOSTS.has(url.hostname)
+            || url.username || url.password || url.port) {
+            return undefined;
+        }
+        const match = /^\/(?:[A-Za-z0-9_]{1,15}|i(?:\/web)?)\/status\/(\d{2,20})\/?$/u.exec(url.pathname);
+        if (!match) return undefined;
+        return {
+            url: `https://api.fxtwitter.com/2/status/${match[1]}`,
+            statusId: match[1]
+        };
+    } catch {
+        return undefined;
+    }
+}
+
+function xVideoUrl(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length === 0 || value.length > 4_096
+        || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || url.hostname !== "video.twimg.com"
+            || url.username || url.password || url.port || url.hash || url.href !== value
+            || !url.pathname.toLowerCase().endsWith(".mp4")) return undefined;
         return url.href;
     } catch {
         return undefined;
@@ -8329,36 +8500,79 @@ function previewDimensions(widthValue: unknown, heightValue: unknown): { width: 
     return safeImageDimensions(numeric(widthValue), numeric(heightValue));
 }
 
-function previewVideoSource(preview: Awaited<ReturnType<MatrixClient["getUrlPreview"]>>, sourceUrl: string): {
-    mxc?: string;
-    url?: string;
-} | undefined {
+function previewVideoSource(preview: Awaited<ReturnType<MatrixClient["getUrlPreview"]>>): { mxc: string; } | undefined {
     const candidates = [preview["og:video:secure_url"], preview["og:video:url"], preview["og:video"]];
     for (const value of candidates) {
         if (typeof value !== "string" || value.length === 0 || value.length > 4_096
             || /[\u0000-\u001f\u007f]/u.test(value)) continue;
         if (authenticatedMediaUrl(value)) return { mxc: value };
-
-        try {
-            const page = new URL(sourceUrl);
-            const video = new URL(value);
-            if (page.origin !== "https://girlcockx.com"
-                || video.protocol !== "https:" || video.hostname !== "video.twimg.com"
-                || video.username || video.password || video.port || video.hash
-                || video.href !== value || !video.pathname.toLowerCase().endsWith(".mp4")) continue;
-            return { url: video.href };
-        } catch {
-            // Ignore malformed or unsupported remote media. It never leaves the worker.
-        }
     }
     return undefined;
 }
 
-interface KlipyOpenGraphImage {
+interface OpenGraphMedia {
     url?: string;
     type?: string;
     width?: string;
     height?: string;
+}
+
+interface OpenGraphMetadata {
+    title?: string;
+    description?: string;
+    provider?: string;
+    images: OpenGraphMedia[];
+    videos: OpenGraphMedia[];
+}
+
+function parseOpenGraphMetadata(html: string): OpenGraphMetadata | undefined {
+    if (!html || html.length > MAX_PROVIDER_PREVIEW_DOCUMENT_CHARS) return undefined;
+    const metaMarkup = Array.from(html.matchAll(/<meta\b[^>]{0,8192}>/giu), match => match[0])
+        .slice(0, 256)
+        .join("");
+    if (!metaMarkup) return undefined;
+    const document = new DOMParser().parseFromString(`<head>${metaMarkup}</head>`, "text/html");
+    const metadata: OpenGraphMetadata = { images: [], videos: [] };
+    let currentImage: OpenGraphMedia | undefined;
+    let currentVideo: OpenGraphMedia | undefined;
+    for (const element of document.querySelectorAll("meta[property], meta[name]")) {
+        const property = (element.getAttribute("property") ?? element.getAttribute("name"))?.trim().toLowerCase();
+        const content = element.getAttribute("content")?.trim();
+        if (!property || !content) continue;
+        if ((property === "og:title" || property === "twitter:title") && metadata.title == null) {
+            metadata.title = previewText(content, 512);
+        } else if ((property === "og:description" || property === "twitter:description")
+            && metadata.description == null) {
+            metadata.description = previewText(content, 4_096);
+        } else if (property === "og:site_name" && metadata.provider == null) {
+            metadata.provider = previewText(content, 256);
+        } else if (property === "og:image" || property === "og:image:url" || property === "twitter:image") {
+            currentImage = { url: content };
+            metadata.images.push(currentImage);
+        } else if (property === "og:image:secure_url") {
+            currentImage ??= {};
+            if (!metadata.images.includes(currentImage)) metadata.images.push(currentImage);
+            currentImage.url = content;
+        } else if (property === "og:image:type" && currentImage) currentImage.type = content;
+        else if (property === "og:image:width" && currentImage) currentImage.width = content;
+        else if (property === "og:image:height" && currentImage) currentImage.height = content;
+        else if (property === "og:video" || property === "og:video:url"
+            || property === "twitter:player:stream") {
+            currentVideo = { url: content };
+            metadata.videos.push(currentVideo);
+        } else if (property === "og:video:secure_url") {
+            currentVideo ??= {};
+            if (!metadata.videos.includes(currentVideo)) metadata.videos.push(currentVideo);
+            currentVideo.url = content;
+        } else if ((property === "og:video:type" || property === "twitter:player:stream:content_type") && currentVideo) {
+            currentVideo.type = content;
+        } else if ((property === "og:video:width" || property === "twitter:player:width") && currentVideo) {
+            currentVideo.width = content;
+        } else if ((property === "og:video:height" || property === "twitter:player:height") && currentVideo) {
+            currentVideo.height = content;
+        }
+    }
+    return metadata;
 }
 
 async function klipyUrlPreview(sourceUrl: string): Promise<CachedUrlPreview | undefined> {
@@ -8370,43 +8584,12 @@ async function klipyUrlPreview(sourceUrl: string): Promise<CachedUrlPreview | un
     } catch {
         return undefined;
     }
-    if (!html || html.length > MAX_KLIPY_PREVIEW_HTML_CHARS) return undefined;
-
-    // Only feed bounded meta tags to the HTML parser. This keeps every script,
-    // image, stylesheet, frame, and preload in the remote document inert even
-    // if detached-document resource loading changes in Chromium.
-    const metaMarkup = Array.from(html.matchAll(/<meta\b[^>]{0,8192}>/giu), match => match[0])
-        .slice(0, 256)
-        .join("");
-    if (!metaMarkup) return undefined;
-    const document = new DOMParser().parseFromString(`<head>${metaMarkup}</head>`, "text/html");
-    const images: KlipyOpenGraphImage[] = [];
-    let currentImage: KlipyOpenGraphImage | undefined;
-    let title: string | undefined;
-    let description: string | undefined;
-    for (const element of document.querySelectorAll("meta[property], meta[name]")) {
-        const property = (element.getAttribute("property") ?? element.getAttribute("name"))?.trim().toLowerCase();
-        const content = element.getAttribute("content")?.trim();
-        if (!property || !content) continue;
-        if (property === "og:title" && title == null) title = previewText(content, 512);
-        else if (property === "og:description" && description == null) description = previewText(content, 4_096);
-        else if (property === "og:image" || property === "og:image:url") {
-            currentImage = { url: content };
-            images.push(currentImage);
-        } else if (property === "og:image:secure_url") {
-            if (!currentImage) {
-                currentImage = {};
-                images.push(currentImage);
-            }
-            currentImage.url = content;
-        } else if (property === "og:image:type" && currentImage) currentImage.type = content;
-        else if (property === "og:image:width" && currentImage) currentImage.width = content;
-        else if (property === "og:image:height" && currentImage) currentImage.height = content;
-    }
+    const metadata = parseOpenGraphMetadata(html ?? "");
+    if (!metadata) return undefined;
 
     let imageUrl: string | undefined;
     let dimensions: { width: number; height: number; } | undefined;
-    for (const image of images) {
+    for (const image of metadata.images) {
         const candidate = klipyMediaUrl(image.url);
         const type = normalizedMimeType(image.type);
         const candidateDimensions = previewDimensions(image.width, image.height);
@@ -8432,9 +8615,183 @@ async function klipyUrlPreview(sourceUrl: string): Promise<CachedUrlPreview | un
             encrypted: false
         }
     };
-    if (title) preview.title = title;
-    if (description) preview.description = description;
-    return { sourceUrl, imageUrl, preview };
+    if (metadata.title) preview.title = metadata.title;
+    if (metadata.description) preview.description = metadata.description;
+    return { sourceUrl, directProvider: "klipy", imageUrl, preview };
+}
+
+function previewImageMime(value: unknown, url: string): "image/jpeg" | "image/png" | "image/webp" | undefined {
+    const declared = normalizedMimeType(value);
+    if (declared === "image/jpeg" || declared === "image/png" || declared === "image/webp") return declared;
+    const candidate = new URL(url);
+    const format = candidate.searchParams.get("format")?.toLowerCase();
+    if (format === "jpg" || format === "jpeg" || /\.jpe?g$/iu.test(candidate.pathname)) return "image/jpeg";
+    if (format === "png" || /\.png$/iu.test(candidate.pathname)) return "image/png";
+    if (format === "webp" || /\.webp$/iu.test(candidate.pathname)) return "image/webp";
+    return undefined;
+}
+
+function fxTwitterRecord(value: unknown): Record<string, unknown> | undefined {
+    return value != null && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : undefined;
+}
+
+async function xUrlPreview(
+    sourceUrl: string,
+    request: { url: string; statusId: string; }
+): Promise<CachedUrlPreview | undefined> {
+    let raw: string | undefined;
+    try {
+        raw = await window.MatrixBridgeWorkerHost.fetchXStatus(request.url);
+    } catch {
+        return undefined;
+    }
+    if (!raw || raw.length > MAX_PROVIDER_PREVIEW_DOCUMENT_CHARS) return undefined;
+
+    let response: Record<string, unknown> | undefined;
+    try {
+        response = fxTwitterRecord(JSON.parse(raw));
+    } catch {
+        return undefined;
+    }
+    const status = fxTwitterRecord(response?.status);
+    const author = fxTwitterRecord(status?.author);
+    const media = fxTwitterRecord(status?.media);
+    const videos = media?.videos;
+    const screenName = author?.screen_name;
+    const authorName = author?.name;
+    const text = status?.text;
+    if (response?.code !== 200 || status?.type !== "status" || status.id !== request.statusId
+        || status.provider !== "twitter" || status.embed_card !== "player"
+        || typeof screenName !== "string" || !/^[A-Za-z0-9_]{1,15}$/u.test(screenName)
+        || (authorName != null && (typeof authorName !== "string" || authorName.length > 256))
+        || typeof text !== "string" || text.length > 65_536
+        || !Array.isArray(videos) || videos.length === 0 || videos.length > 16) {
+        return undefined;
+    }
+
+    let video: {
+        url: string;
+        posterUrl: string;
+        posterMimeType: "image/jpeg" | "image/png" | "image/webp";
+        dimensions: { width: number; height: number; };
+    } | undefined;
+    for (const value of videos) {
+        const candidate = fxTwitterRecord(value);
+        if (!candidate || candidate.type !== "video" || candidate.format !== "video/mp4") continue;
+        const url = xVideoUrl(candidate.url);
+        const posterUrl = xPosterUrl(candidate.thumbnail_url);
+        const posterMimeType = posterUrl ? previewImageMime(undefined, posterUrl) : undefined;
+        const dimensions = previewDimensions(candidate.width, candidate.height);
+        if (url && posterUrl && posterMimeType && dimensions) {
+            video = { url, posterUrl, posterMimeType, dimensions };
+            break;
+        }
+    }
+    if (!video) return undefined;
+
+    const preview: MatrixUrlPreviewDTO = {
+        url: sourceUrl,
+        provider: { name: "X" },
+        title: previewText(authorName ? `${authorName} (@${screenName})` : `@${screenName}`, 512),
+        description: previewText(text, 4_096),
+        image: {
+            name: `x-preview.${video.posterMimeType.split("/")[1].replace("jpeg", "jpg")}`,
+            mimeType: video.posterMimeType,
+            ...video.dimensions,
+            downloadable: true,
+            downloadIndex: 0,
+            encrypted: false
+        },
+        video: {
+            name: "x-preview.mp4",
+            mimeType: "video/mp4",
+            ...video.dimensions,
+            downloadable: true,
+            downloadIndex: 1,
+            encrypted: false
+        }
+    };
+    return {
+        sourceUrl,
+        directProvider: "x",
+        imageUrl: video.posterUrl,
+        videoUrl: video.url,
+        preview
+    };
+}
+
+async function tenorUrlPreview(sourceUrl: string): Promise<CachedUrlPreview | undefined> {
+    let html: string | undefined;
+    try {
+        html = await window.MatrixBridgeWorkerHost.fetchTenorPreview(sourceUrl);
+    } catch {
+        return undefined;
+    }
+    const metadata = parseOpenGraphMetadata(html ?? "");
+    if (!metadata) return undefined;
+
+    let image: { url: string; mimeType: "image/gif" | "image/webp"; dimensions?: { width: number; height: number; }; } | undefined;
+    for (const candidate of metadata.images) {
+        const url = tenorMediaUrl(candidate.url);
+        if (!url) continue;
+        const mimeType = new URL(url).pathname.toLowerCase().endsWith(".gif") ? "image/gif"
+            : new URL(url).pathname.toLowerCase().endsWith(".webp") ? "image/webp" : undefined;
+        if (!mimeType) continue;
+        const selected: NonNullable<typeof image> = {
+            url,
+            mimeType,
+            dimensions: previewDimensions(candidate.width, candidate.height)
+        };
+        if (!image || selected.dimensions) image = selected;
+        if (selected.dimensions) break;
+    }
+    if (!image) return undefined;
+
+    let video: { url: string; dimensions: { width: number; height: number; }; } | undefined;
+    for (const candidate of metadata.videos) {
+        const url = tenorMediaUrl(candidate.url);
+        const dimensions = previewDimensions(candidate.width, candidate.height);
+        if (url && new URL(url).pathname.toLowerCase().endsWith(".mp4") && dimensions) {
+            video = { url, dimensions };
+            break;
+        }
+    }
+    const imageDimensions = image.dimensions ?? video?.dimensions;
+    if (!imageDimensions) return undefined;
+    const preview: MatrixUrlPreviewDTO = {
+        url: sourceUrl,
+        provider: { name: "Tenor" },
+        image: {
+            name: `tenor-preview.${image.mimeType === "image/gif" ? "gif" : "webp"}`,
+            mimeType: image.mimeType,
+            ...imageDimensions,
+            ...(image.mimeType === "image/gif" ? { animated: true } : {}),
+            downloadable: true,
+            downloadIndex: 0,
+            encrypted: false
+        }
+    };
+    if (video) {
+        preview.video = {
+            name: "tenor-preview.mp4",
+            mimeType: "video/mp4",
+            ...video.dimensions,
+            downloadable: true,
+            downloadIndex: 1,
+            encrypted: false
+        };
+    }
+    if (metadata.title) preview.title = metadata.title;
+    if (metadata.description) preview.description = metadata.description;
+    return {
+        sourceUrl,
+        directProvider: "tenor",
+        imageUrl: image.url,
+        videoUrl: video?.url,
+        preview
+    };
 }
 
 function cloneUrlPreview(preview: MatrixUrlPreviewDTO): MatrixUrlPreviewDTO {
@@ -8460,10 +8817,12 @@ function cacheUrlPreview(
 }
 
 async function urlPreview(command: Extract<MatrixWorkerCommand, { type: "urlPreview"; }>): Promise<MatrixUrlPreviewDTO | undefined> {
+    if (typeof command.allowDirectMedia !== "boolean") {
+        fail("MATRIX_INVALID_ARGUMENT", "The provider-preview policy is invalid.");
+    }
+    const allowDirectMedia = command.allowDirectMedia && directPreviewPolicyAllowed;
     const room = getRoom(command.roomId);
-    // Asking the homeserver to preview a URL from an encrypted room would reveal
-    // plaintext which the room deliberately hid from that server.
-    if (room.hasEncryptionStateEvent()) return undefined;
+    const encrypted = room.hasEncryptionStateEvent();
     const eventId = validateEventId(command.eventId);
     const event = findRoomEvent(room, eventId);
     if (!event || event.getType() !== EventType.RoomMessage || event.isRedacted()) return undefined;
@@ -8472,17 +8831,36 @@ async function urlPreview(command: Extract<MatrixWorkerCommand, { type: "urlPrev
 
     const key = previewCacheKey(room.roomId, eventId);
     const cached = urlPreviewMedia.get(key);
-    if (cached?.sourceUrl === sourceUrl) {
+    if (cached?.sourceUrl === sourceUrl
+        && (!cached.directProvider || allowDirectMedia)
+        && (!encrypted || cached.directProvider)) {
         cacheUrlPreview(key, cached);
         return cloneUrlPreview(cached.preview);
     }
+    if (cached) urlPreviewMedia.delete(key);
 
-    if (klipyShareUrl(sourceUrl)) {
-        const klipyPreview = await klipyUrlPreview(sourceUrl);
-        if (!klipyPreview) return undefined;
-        cacheUrlPreview(key, klipyPreview);
-        return cloneUrlPreview(klipyPreview.preview);
+    const klipyUrl = klipyShareUrl(sourceUrl);
+    const tenorUrl = tenorShareUrl(sourceUrl);
+    const xStatusRequest = xStatusApiUrl(sourceUrl);
+    if (allowDirectMedia && (klipyUrl || tenorUrl || xStatusRequest)) {
+        const directPreview = klipyUrl
+            ? await klipyUrlPreview(klipyUrl)
+            : tenorUrl
+                ? await tenorUrlPreview(tenorUrl)
+                : await xUrlPreview(sourceUrl, xStatusRequest!);
+        if (!directPreviewPolicyAllowed) return undefined;
+        if (directPreview) {
+            // Keep the message's original link as cache identity and DTO display.
+            directPreview.sourceUrl = sourceUrl;
+            directPreview.preview.url = sourceUrl;
+            cacheUrlPreview(key, directPreview);
+            return cloneUrlPreview(directPreview.preview);
+        }
     }
+
+    // Asking the homeserver to preview any URL from an encrypted room would
+    // reveal plaintext which the room deliberately hid from that server.
+    if (encrypted) return undefined;
 
     let preview: Awaited<ReturnType<MatrixClient["getUrlPreview"]>>;
     try {
@@ -8530,8 +8908,7 @@ async function urlPreview(command: Extract<MatrixWorkerCommand, { type: "urlPrev
     }
 
     let videoMxc: string | undefined;
-    let videoUrl: string | undefined;
-    const videoSource = previewVideoSource(preview, sourceUrl);
+    const videoSource = previewVideoSource(preview);
     const videoMimeType = normalizedMimeType(preview["og:video:type"]);
     const videoDimensions = previewDimensions(preview["og:video:width"], preview["og:video:height"]);
     const videoSize = Number.isSafeInteger(preview["matrix:video:size"]) && Number(preview["matrix:video:size"]) >= 0
@@ -8550,13 +8927,36 @@ async function urlPreview(command: Extract<MatrixWorkerCommand, { type: "urlPrev
             encrypted: false
         };
         videoMxc = videoSource.mxc;
-        videoUrl = videoSource.url;
     }
-    cacheUrlPreview(key, { sourceUrl, imageMxc: cachedImageMxc, videoMxc, videoUrl, preview: result });
+    cacheUrlPreview(key, { sourceUrl, imageMxc: cachedImageMxc, videoMxc, preview: result });
     return cloneUrlPreview(result);
 }
 
+function validDirectPreviewCache(preview: CachedUrlPreview): boolean {
+    if (preview.imageMxc || preview.videoMxc) return false;
+    switch (preview.directProvider) {
+        case "klipy":
+            return klipyShareUrl(preview.sourceUrl) != null
+                && klipyMediaUrl(preview.imageUrl) === preview.imageUrl
+                && preview.videoUrl == null;
+        case "x":
+            return xStatusApiUrl(preview.sourceUrl) != null
+                && xPosterUrl(preview.imageUrl) === preview.imageUrl
+                && xVideoUrl(preview.videoUrl) === preview.videoUrl;
+        case "tenor":
+            return tenorShareUrl(preview.sourceUrl) != null
+                && tenorMediaUrl(preview.imageUrl) === preview.imageUrl
+                && (preview.videoUrl == null || tenorMediaUrl(preview.videoUrl) === preview.videoUrl);
+        default:
+            return false;
+    }
+}
+
 async function downloadMedia(command: Extract<MatrixWorkerCommand, { type: "downloadMedia"; }>): Promise<MatrixMediaDownloadResult> {
+    if (typeof command.allowDirectMedia !== "boolean") {
+        fail("MATRIX_INVALID_ARGUMENT", "The provider-preview policy is invalid.");
+    }
+    const allowDirectMedia = command.allowDirectMedia && directPreviewPolicyAllowed;
     if (!Number.isSafeInteger(command.attachmentIndex)
         || (command.attachmentIndex !== 0 && command.attachmentIndex !== 1)) {
         fail("MATRIX_INVALID_ARGUMENT", "The Matrix attachment index is invalid.");
@@ -8574,7 +8974,8 @@ async function downloadMedia(command: Extract<MatrixWorkerCommand, { type: "down
         fail("MATRIX_MEDIA_MISSING", "This Matrix event has no downloadable attachment.");
     }
     const preview = !attachment ? urlPreviewMedia.get(previewCacheKey(room.roomId, eventId)) : undefined;
-    if (preview && room.hasEncryptionStateEvent()) {
+    if (preview && ((!preview.directProvider && room.hasEncryptionStateEvent())
+        || (preview.directProvider && (!allowDirectMedia || !validDirectPreviewCache(preview))))) {
         urlPreviewMedia.delete(previewCacheKey(room.roomId, eventId));
         fail("MATRIX_MEDIA_MISSING", "This Matrix event has no downloadable attachment.");
     }
@@ -8609,14 +9010,35 @@ async function downloadMedia(command: Extract<MatrixWorkerCommand, { type: "down
         fail("MATRIX_MEDIA_INVALID", "The Matrix media URI is invalid.");
     }
     const downloaded = externalImageUrl
-        ? await fetchKlipyGif(externalImageUrl)
+        ? preview?.directProvider === "klipy"
+            ? await fetchKlipyGif(externalImageUrl)
+            : preview?.directProvider === "x"
+                ? await fetchXPoster(externalImageUrl)
+                : preview?.directProvider === "tenor"
+                    ? await fetchTenorMedia(externalImageUrl)
+                    : fail("MATRIX_MEDIA_INVALID", "The provider preview cache was invalid.")
         : externalVideoUrl
-            ? await fetchPreviewVideo(externalVideoUrl)
+            ? preview?.directProvider === "tenor"
+                ? await fetchTenorMedia(externalVideoUrl)
+                : preview?.directProvider === "x"
+                    ? await fetchPreviewVideo(externalVideoUrl)
+                    : fail("MATRIX_MEDIA_INVALID", "The provider preview cache was invalid.")
             : await fetchMedia(mxc!, maximumBytes);
+    if (preview?.directProvider && !directPreviewPolicyAllowed) {
+        fail("MATRIX_MEDIA_MISSING", "This provider preview was disabled while it was loading.");
+    }
     const bytes = encryptedFile ? await decryptMedia(downloaded.bytes, encryptedFile) : downloaded.bytes;
     const sniffed = sniffedMedia(bytes, attachment.mimeType, downloaded.mimeType);
-    if (externalImageUrl && sniffed.mimeType !== "image/gif") {
-        fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The KLIPY preview image had an invalid format.");
+    if (externalImageUrl && (
+        preview?.directProvider === "klipy" ? sniffed.mimeType !== "image/gif"
+            : preview?.directProvider === "x" ? !["image/jpeg", "image/png", "image/webp"].includes(sniffed.mimeType)
+                : preview?.directProvider === "tenor" ? !["image/gif", "image/webp"].includes(sniffed.mimeType)
+                    : true
+    )) {
+        fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The provider preview image had an invalid format.");
+    }
+    if (externalVideoUrl && sniffed.mimeType !== "video/mp4") {
+        fail("MATRIX_MEDIA_DOWNLOAD_FAILED", "The provider preview video had an invalid format.");
     }
     const videoDimensions = sniffed.mimeType.startsWith("video/")
         && attachment.width != null && attachment.height != null
@@ -8630,6 +9052,22 @@ async function downloadMedia(command: Extract<MatrixWorkerCommand, { type: "down
         height: sniffed.height ?? videoDimensions?.height,
         animated: sniffed.animated
     };
+}
+
+function updateProviderPreviewPolicy(
+    command: Extract<MatrixWorkerCommand, { type: "providerPreviewPolicy"; }>
+): undefined {
+    if (typeof command.allowDirectMedia !== "boolean") {
+        fail("MATRIX_INVALID_ARGUMENT", "The provider-preview policy is invalid.");
+    }
+    directPreviewPolicyAllowed = command.allowDirectMedia;
+    for (const [key, preview] of urlPreviewMedia) {
+        if (preview.directProvider) urlPreviewMedia.delete(key);
+    }
+    if (!directPreviewPolicyAllowed) {
+        for (const controller of activeDirectPreviewControllers) controller.abort();
+    }
+    return undefined;
 }
 
 async function handleCommand(
@@ -8673,6 +9111,7 @@ async function handleCommand(
         case "suggestedSpaceChannelPlan": return await suggestedSpaceChannelPlan(command);
         case "joinSuggestedSpaceChannels": return await joinSuggestedSpaceChannels(command, mutationDispatched);
         case "openDirectMessage": return await openDirectMessage(command);
+        case "providerPreviewPolicy": return updateProviderPreviewPolicy(command);
         case "downloadMedia": return await downloadMedia(command);
         case "urlPreview": return await urlPreview(command);
         case "sendText": return await sendText(command);
@@ -8936,6 +9375,16 @@ function executeOrdered(request: MatrixWorkerRequest, lifecycle: boolean): void 
 }
 
 function execute(request: MatrixWorkerRequest): void {
+    if (request.command.type === "providerPreviewPolicy") {
+        window.MatrixBridgeWorkerHost.respond({ kind: "started", id: request.id });
+        try {
+            const result = updateProviderPreviewPolicy(request.command);
+            window.MatrixBridgeWorkerHost.respond({ kind: "response", id: request.id, ok: true, result });
+        } catch (error) {
+            respondFailure(request, error);
+        }
+        return;
+    }
     const lifecycle = lifecycleCommand(request.command);
     if (lifecycle) {
         schedulerGeneration++;

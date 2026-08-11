@@ -71,6 +71,7 @@ import {
     sendMatrixAttachment,
     sendMatrixMessage,
     sendMatrixSticker,
+    setEncryptedRoomProviderPreviewsPolicy,
     startBridge,
     subscribeMatrixSpaceProjection,
     suspendBridge,
@@ -91,6 +92,17 @@ import { openMatrixSpaceChildModal } from "./spaceCreate";
 import type { MatrixAttachmentGroupDTO, MatrixPowerLevelPermissionDTO } from "./types";
 
 const settings = definePluginSettings({
+    encryptedRoomProviderPreviews: {
+        type: OptionType.BOOLEAN,
+        displayName: "Encrypted-room GIF, Tenor, and X previews",
+        description: "Automatically load supported cards directly in encrypted Matrix rooms. KLIPY (klipy.com, static.klipy.com, static2.klipy.com), Tenor (tenor.com, media.tenor.com, media1.tenor.com), FxTwitter (api.fxtwitter.com), and X media hosts (pbs.twimg.com, video.twimg.com) can see your IP address, the public link, and request timing. Other encrypted-room link previews remain disabled.",
+        default: true,
+        onChange: enabled => {
+            void setEncryptedRoomProviderPreviewsPolicy(enabled).catch(() => {
+                showToast("Matrix could not apply the encrypted-room preview setting.", Toasts.Type.FAILURE);
+            });
+        },
+    },
     matrix: {
         type: OptionType.COMPONENT,
         component: MatrixSettings,
@@ -1478,7 +1490,15 @@ export default definePlugin({
                 Icon: MatrixIcon,
             });
         }
-        void pendingPluginShutdown.then(() => {
+        void pendingPluginShutdown.then(async () => {
+            if (lifecycleGeneration !== pluginLifecycleGeneration) return;
+            try {
+                await setEncryptedRoomProviderPreviewsPolicy(settings.store.encryptedRoomProviderPreviews);
+            } catch {
+                // Preview policy synchronization must never prevent Matrix
+                // startup. Every later native request still re-reads the
+                // authoritative main-process setting.
+            }
             if (lifecycleGeneration === pluginLifecycleGeneration) return startBridge();
         });
     },
