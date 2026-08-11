@@ -112,9 +112,7 @@ jobs:
                   pnpm testTsc
                   pnpm lint
                   pnpm lint-styles
-                  pnpm exec tsx scripts/testMatrixHistoryTimeline.ts
-                  pnpm exec tsx scripts/testMatrixMessageMentions.ts
-                  pnpm exec tsx scripts/testMatrixReactionProjection.ts
+                  pnpm test:matrix
                   pnpm exec tsx scripts/testReleaseUpdater.ts
 
             - name: Build updater-enabled standalone runtime

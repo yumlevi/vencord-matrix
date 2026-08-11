@@ -113,8 +113,10 @@ function statusLabel(status: any) {
     if (!status) return "Not configured";
     const state = status.state ?? status.status ?? status.connectionState;
     const code = status.error?.code;
+    const causeCode = matrixErrorCode({ code: status.error?.causeCode });
     const detail = status.error?.message ?? status.error ?? status.message;
-    return [state, code, detail].filter(Boolean).join(" - ") || "Not configured";
+    const cause = causeCode && causeCode !== code ? `cause ${causeCode}` : undefined;
+    return [state, code, cause, detail].filter(Boolean).join(" - ") || "Not configured";
 }
 
 function matrixAccountActionRequired(status: any) {

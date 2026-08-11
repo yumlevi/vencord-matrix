@@ -2909,16 +2909,32 @@ const WORKER_RECOVERY_ERRORS = new Set([
     "MATRIX_PROTOCOL_ERROR",
 ]);
 
+function matrixErrorCauseCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    return matrixErrorCode({ code: (error as { causeCode?: unknown; }).causeCode });
+}
+
+const RETRYABLE_STARTUP_SESSION_CAUSES = new Set([
+    "MATRIX_NETWORK_ERROR",
+    "MATRIX_REQUEST_TIMEOUT",
+    "MATRIX_SERVER_UNAVAILABLE",
+]);
+
 function retryableStartFailure(error: unknown): boolean {
-    const code = matrixErrorCode(error);
-    return code == null || ![
-        "MATRIX_ACCOUNT_MISSING",
-        "MATRIX_ACCOUNT_CORRUPT",
-        "MATRIX_PLUGIN_SUSPENDED",
-        "MATRIX_SECURE_STORAGE_UNAVAILABLE",
-        "MATRIX_STORAGE_CLEANUP_FAILED",
-        "MATRIX_INVALID_ARGUMENT",
-    ].includes(code);
+    const statusCode = matrixErrorCode(error);
+    const causeCode = matrixErrorCauseCode(error);
+    return statusCode === "MATRIX_STARTUP_SESSION_FAILED" && causeCode != null
+        && RETRYABLE_STARTUP_SESSION_CAUSES.has(causeCode);
+}
+
+function logStartupFailure(error: unknown) {
+    const code = matrixErrorCode(error) ?? "MATRIX_STARTUP_FAILED";
+    const causeCode = matrixErrorCauseCode(error);
+    logger.warn(
+        "Matrix startup failed",
+        code,
+        ...(causeCode && causeCode !== code ? [`cause ${causeCode}`] : [])
+    );
 }
 
 function scheduleBridgeReconnect(
@@ -2986,10 +3002,9 @@ async function connectBridge(
     try {
         const snapshot = await Native.start() as MatrixSnapshotDto;
         if (!bridgeActive || generation !== pollGeneration) return;
-        const startupErrorCode = snapshot.status?.state === "error"
-            ? matrixErrorCode(snapshot.status.error)
-            : undefined;
-        if (startupErrorCode) logger.warn("Matrix startup failed", startupErrorCode);
+        const startupStatusError = snapshot.status?.state === "error" ? snapshot.status.error : undefined;
+        const startupErrorCode = matrixErrorCode(startupStatusError);
+        if (startupErrorCode) logStartupFailure(startupStatusError);
         clearReconnectTimer();
         if (snapshot.status?.state === "ready") reconnectAttempt = 0;
         const snapshotSequence = Number(snapshot.seq);
@@ -3015,8 +3030,15 @@ async function connectBridge(
         }
         void pollEvents(generation);
     } catch (error) {
-        logger.info("Matrix is not configured yet", error);
-        if (bridgeActive && generation === pollGeneration && retryableStartFailure(error)) {
+        let statusError: unknown;
+        try {
+            statusError = (await Native.getStatus())?.error;
+        } catch {
+            // The thrown IPC error still supplies the bounded primary code.
+        }
+        const startupError = statusError ?? error;
+        logStartupFailure(startupError);
+        if (bridgeActive && generation === pollGeneration && retryableStartFailure(startupError)) {
             scheduleBridgeReconnect(generation, selectedAtStart, routePreference);
         }
     }

@@ -9,6 +9,8 @@ export type MatrixBridgeState = "logged_out" | "stopped" | "starting" | "syncing
 export interface MatrixBridgeError {
     code: string;
     message: string;
+    /** Sanitized code-only provenance for a wrapped startup-stage failure. */
+    causeCode?: string;
 }
 
 export interface MatrixAccountDTO {

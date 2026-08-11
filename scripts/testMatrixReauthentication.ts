@@ -44,6 +44,13 @@ assert.match(nativeReauth, /startupFailure\?\.error\.code !== "MATRIX_REAUTH_REQ
     "native must independently gate reauthentication on the verified soft-logout latch");
 assert.match(native, /function latchActiveSessionFailure\([\s\S]*activeWorkerBinding[\s\S]*startupFailureLatch =/u,
     "a live soft/hard session failure must be bound and latched before its worker is destroyed");
+const recoveryClassifier = native.slice(
+    native.indexOf("function isSessionRecoveryError("),
+    native.indexOf("function latchActiveSessionFailure(")
+);
+assert.match(recoveryClassifier, /error\.code === "MATRIX_REAUTH_REQUIRED" \|\| error\.code === "MATRIX_SESSION_RESET_REQUIRED"/u);
+assert.doesNotMatch(recoveryClassifier, /causeCode/u,
+    "an underlying startup cause must never authorize credential replacement");
 assert.match(native, /event\.type === "status"[\s\S]*isSessionRecoveryError\(event\.status\.error\)[\s\S]*latchActiveSessionFailure/u,
     "an asynchronous sync auth failure must enable the same safe recovery path as startup");
 assert.match(nativeReauth, /terminateWorker\([\s\S]*clearEventStream\(\)[\s\S]*callWorker\(\{ type: "reauthenticate"/u,
