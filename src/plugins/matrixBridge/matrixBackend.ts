@@ -1776,6 +1776,10 @@ function normalizeMessage(room: Room, event: MatrixEvent, reactions?: MatrixReac
     if (senderName) message.senderName = senderName;
     const mentionedUserIds = normalizedMessageMentionUserIds(room, content);
     if (mentionedUserIds) message.mentionedUserIds = mentionedUserIds;
+    if (content.format === "org.matrix.custom.html") {
+        const formattedBody = safeMessageBody(content.formatted_body);
+        if (formattedBody) message.formattedBody = formattedBody;
+    }
     if (type === EventType.Sticker) message.sticker = true;
     if (event.replacingEvent()) message.edited = true;
     if (replyToEventId) message.replyToEventId = replyToEventId;

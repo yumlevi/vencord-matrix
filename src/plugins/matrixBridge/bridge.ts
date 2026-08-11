@@ -144,6 +144,7 @@ export interface MatrixMessageDto {
     timestamp: number;
     body: string;
     mentionedUserIds?: string[];
+    formattedBody?: string;
     sticker?: true;
     edited?: boolean;
     editedAt?: number;
@@ -1137,7 +1138,8 @@ function inboundMessageMentions(message: MatrixMessageDto, injected: InjectedRoo
             return matrixUserId && stableSyntheticId("user", matrixUserId) === syntheticUserId
                 ? resolveMatrixUserId(matrixUserId)
                 : undefined;
-        }
+        },
+        message.formattedBody
     );
     return {
         body: projection.body,

@@ -35,6 +35,7 @@ import { AuthenticationStore, ChannelStore, FluxDispatcher, Menu, MessageStore, 
 import overlayStyle from "./deleteStyleOverlay.css?managed";
 import textStyle from "./deleteStyleText.css?managed";
 import { openHistoryModal } from "./HistoryModal";
+import { EDITED_MESSAGE_TRANSFORM_PATCH, patchEditedMessageTransform } from "./messageUpdatePatch";
 
 interface MLMessage extends Message {
     deleted?: boolean;
@@ -459,9 +460,8 @@ export default definePlugin({
             replacement: [
                 {
                     // Pass through editHistory & deleted to the "edited message" transformer
-                    match: /(?<=null!=\i\.edited_timestamp\)return )\i\(\i,\{reactions:(\i)\.reactions.{0,50}\}\)/,
-                    replace:
-                        "Object.assign($&,{ deleted:$1.deleted, editHistory:$1.editHistory, firstEditTimestamp:$1.firstEditTimestamp })"
+                    match: EDITED_MESSAGE_TRANSFORM_PATCH,
+                    replace: patchEditedMessageTransform
                 },
                 // just mark deleted attachments as deleted on MESSAGE_UPDATE
                 {
