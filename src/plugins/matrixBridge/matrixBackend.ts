@@ -42,6 +42,7 @@ import {
     materializeOutboundMatrixMentions,
     MAX_MATRIX_MESSAGE_MENTIONS
 } from "./messageMentions";
+import { allocateFairSnapshotQuotas, selectFairSnapshotMessages } from "./snapshotBounds";
 import { searchMatrixSpaceGraph } from "./spaceSearchGraph";
 import type {
     MatrixActionResult,
@@ -129,6 +130,12 @@ import type {
     MatrixWorkerResult,
     MatrixWorkerStartupStage
 } from "./workerProtocol";
+import {
+    parseFxTwitterStatus,
+    validXPreviewMediaCache,
+    xPosterUrl as validatedXPosterUrl,
+    xVideoUrl as validatedXVideoUrl
+} from "./xPreview";
 
 const MAX_TIMELINE_MESSAGES = 100;
 const MAX_SNAPSHOT_ROOMS = 250;
@@ -156,8 +163,9 @@ const MAX_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
 const MAX_SUGGESTED_SPACE_CHANNEL_PLAN_ROWS = 16;
 const MAX_RESOLVED_SPACE_ACCESS_REQUESTS = 1_000;
 const MAX_SNAPSHOT_MESSAGES = 1_000;
-const MAX_SNAPSHOT_MEMBERS = 2_000;
-const MAX_SNAPSHOT_MESSAGE_JSON_CHARS = 2 * 1024 * 1024;
+const MAX_SNAPSHOT_MEMBERS = 2_500;
+const MAX_SNAPSHOT_MESSAGE_JSON_BYTES = 2 * 1024 * 1024;
+const MAX_TIMELINE_ANCHOR_SCAN = 1_000;
 const MAX_MESSAGE_BODY_CHARS = 65_536;
 const MAX_EVENT_TIMESTAMP = 4_102_444_800_000; // 2100-01-01T00:00:00.000Z
 const MAX_SEARCH_ROOMS = 200;
@@ -195,7 +203,6 @@ const MAX_URL_PREVIEW_CACHE = 256;
 const MAX_PROVIDER_PREVIEW_DOCUMENT_CHARS = 512 * 1024;
 const KLIPY_MEDIA_HOSTS = new Set(["static.klipy.com", "static2.klipy.com"]);
 const TENOR_MEDIA_HOSTS = new Set(["media.tenor.com", "media1.tenor.com"]);
-const X_POSTER_HOST = "pbs.twimg.com";
 // Discord documents a 512 KiB guild-upload limit. Leave bounded headroom for
 // larger first-party/legacy assets without sharing the Matrix media limit.
 const MAX_DISCORD_STICKER_BYTES = 2 * 1024 * 1024;
@@ -806,8 +813,15 @@ function throwAuthenticationError(error: unknown, method: "password" | "access_t
 }
 
 let workerRevision = 0;
+let startupProjectionSuppressed = false;
 
 function emit(event: MatrixWorkerEvent): void {
+    // Initial /sync can surface thousands of historical room/timeline
+    // callbacks after startClient launches its detached sync loop but before
+    // SyncState.Prepared. The single prepared snapshot is authoritative for
+    // that bounded history; only later live deltas belong in the replay queue.
+    // Status events remain ordered and replayable.
+    if (startupProjectionSuppressed && event.type !== "status") return;
     window.MatrixBridgeWorkerHost.respond({ kind: "event", revision: ++workerRevision, event });
 }
 
@@ -1182,29 +1196,7 @@ async function fetchKlipyGif(url: string): Promise<{ bytes: Uint8Array<ArrayBuff
 }
 
 function xPosterUrl(value: unknown): string | undefined {
-    if (typeof value !== "string" || value.length === 0 || value.length > 4_096
-        || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
-    try {
-        const url = new URL(value);
-        if (url.protocol !== "https:" || url.hostname !== X_POSTER_HOST
-            || url.username || url.password || url.port || url.hash || url.href !== value
-            || !/^\/(?:media|tweet_video_thumb|ext_tw_video_thumb|amplify_video_thumb)\/[A-Za-z0-9_./-]{1,1024}$/u.test(url.pathname)) {
-            return undefined;
-        }
-        const parameters = Array.from(url.searchParams.entries());
-        if (parameters.some(([name, parameter]) =>
-            name === "format"
-                ? !/^(?:jpe?g|png|webp)$/iu.test(parameter)
-                : name === "name"
-                    ? !/^[A-Za-z0-9_]{1,32}$/u.test(parameter)
-                    : true)
-            || new Set(parameters.map(([name]) => name)).size !== parameters.length) {
-            return undefined;
-        }
-        return url.href;
-    } catch {
-        return undefined;
-    }
+    return validatedXPosterUrl(value);
 }
 
 async function fetchXPoster(url: string): Promise<{ bytes: Uint8Array<ArrayBuffer>; mimeType?: string; }> {
@@ -1972,13 +1964,19 @@ function normalizeMember(member: ReturnType<Room["getMembers"]>[number]): Matrix
 
 function prioritizedRoomMembers(room: Room): ReturnType<Room["getMembers"]> {
     const selfUserId = activeCredentials?.userId;
+    const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
+    const creatorId = createEvent && !Array.isArray(createEvent)
+        ? optionalUserId(createEvent.getSender())
+        : undefined;
     const powerLevel = (member: ReturnType<Room["getMembers"]>[number]) =>
         Number.isSafeInteger(member.powerLevel) ? member.powerLevel : 0;
     const membershipOrder = (member: ReturnType<Room["getMembers"]>[number]) =>
         member.membership === "join" ? 0 : member.membership === "invite" ? 1 : 2;
     return [...room.getMembers()].sort((left, right) => {
         const selfOrder = Number(right.userId === selfUserId) - Number(left.userId === selfUserId);
+        const creatorOrder = Number(right.userId === creatorId) - Number(left.userId === creatorId);
         return selfOrder
+            || creatorOrder
             || membershipOrder(left) - membershipOrder(right)
             || powerLevel(right) - powerLevel(left)
             || left.userId.localeCompare(right.userId);
@@ -2678,40 +2676,95 @@ function visibleRooms(): Room[] {
 function snapshot(): MatrixSnapshot {
     const directRooms = directAccountData().roomToUser;
     const parentMap = inferredSpaceParents();
-    let messagesRemaining = MAX_SNAPSHOT_MESSAGES;
-    let membersRemaining = MAX_SNAPSHOT_MEMBERS;
-    let messageJsonRemaining = MAX_SNAPSHOT_MESSAGE_JSON_CHARS;
-    const rooms = visibleRooms().slice(0, MAX_SNAPSHOT_ROOMS).map(room => {
+    const visible = visibleRooms();
+    const prioritized = visible.map(room => {
+        const events = room.getLiveTimeline().getEvents();
+        const newestTimestamp = events.at(-1)?.getTs() ?? 0;
+        const priority = {
+            roomId: room.roomId,
+            unreadCount: boundedNotificationCount(room.getUnreadNotificationCount()),
+            highlightCount: boundedNotificationCount(
+                room.getUnreadNotificationCount(NotificationCountType.Highlight)
+            ),
+            newestTimestamp: Number.isSafeInteger(newestTimestamp) && newestTimestamp >= 0
+                ? newestTimestamp
+                : 0
+        };
+        return {
+            room,
+            priority,
+            messageMaximum: room.getMyMembership() === "join" ? Math.min(25, events.length) : 0
+        };
+    });
+    const selectedRoomIds = new Set(
+        [...allocateFairSnapshotQuotas(
+            prioritized.map(candidate => ({ ...candidate.priority, maximum: 1 })),
+            MAX_SNAPSHOT_ROOMS
+        ).quotaByRoom]
+            .filter(([, quota]) => quota > 0)
+            .map(([roomId]) => roomId)
+    );
+    const selectedRooms = prioritized.filter(candidate => selectedRoomIds.has(candidate.room.roomId));
+    const messageQuotas = allocateFairSnapshotQuotas(
+        selectedRooms.map(candidate => ({ ...candidate.priority, maximum: candidate.messageMaximum })),
+        MAX_SNAPSHOT_MESSAGES
+    ).quotaByRoom;
+    const memberQuotas = allocateFairSnapshotQuotas(
+        selectedRooms.map(candidate => ({
+            ...candidate.priority,
+            // A bridge-created GROUP_DM has at most ten participants. With a
+            // 2,500 aggregate budget and at most 250 rooms, round-robin quota
+            // allocation can retain every participant in every tagged group.
+            maximum: Math.min(
+                groupChatRoomIdentity(candidate.room) ? 10 : 100,
+                candidate.room.getMembers().length
+            )
+        })),
+        MAX_SNAPSHOT_MEMBERS
+    ).quotaByRoom;
+    const roomStateComplete = visible.length <= MAX_SNAPSHOT_ROOMS
+        && selectedRooms.every(candidate => (memberQuotas.get(candidate.room.roomId) ?? 0)
+            >= Math.min(MAX_ROOM_MEMBERS, candidate.room.getMembers().length));
+    const candidates = selectedRooms.map(({ room, priority }) => {
         const normalized = normalizeRoom(
             room,
             directRooms,
             parentMap,
-            messageJsonRemaining > 0 ? Math.min(25, messagesRemaining) : 0,
-            Math.min(100, membersRemaining)
+            messageQuotas.get(room.roomId) ?? 0,
+            memberQuotas.get(room.roomId) ?? 0
         );
-        membersRemaining -= normalized.members.length;
-        const boundedMessages: MatrixMessageDTO[] = [];
-        // Keep one contiguous newest suffix. Skipping a middle event and then
-        // including a smaller newer one would create a gap that backward-only
-        // pagination can never recover from.
-        for (const message of [...normalized.messages].reverse()) {
-            let size: number;
-            try {
-                size = JSON.stringify(message).length;
-            } catch {
-                break;
+        const { messages } = normalized;
+        normalized.messages = [];
+        return {
+            normalized,
+            selection: {
+                ...priority,
+                messages
             }
-            if (size > messageJsonRemaining) break;
-            messageJsonRemaining -= size;
-            messagesRemaining--;
-            boundedMessages.unshift(message);
-        }
-        normalized.messages = boundedMessages;
-        return normalized;
+        };
     });
+    const encoder = new TextEncoder();
+    const selected = selectFairSnapshotMessages(
+        candidates.map(candidate => candidate.selection),
+        MAX_SNAPSHOT_MESSAGES,
+        MAX_SNAPSHOT_MESSAGE_JSON_BYTES,
+        message => encoder.encode(JSON.stringify(message)).byteLength
+    );
+    const rooms = candidates.map(candidate => ({
+        ...candidate.normalized,
+        messages: [...(selected.messagesByRoom.get(candidate.normalized.roomId) ?? [])]
+    }));
     return {
         seq: 0,
         revision: workerRevision,
+        coverage: {
+            roomsComplete: visible.length <= MAX_SNAPSHOT_ROOMS,
+            roomStateComplete,
+            // Snapshot timelines are deliberately bounded newest suffixes.
+            // Native must replay worker deltas rather than treating this exact
+            // content revision as an acknowledgement for omitted messages.
+            timelinesComplete: !visible.some(room => room.getMyMembership() === "join")
+        },
         status: statusDTO(),
         account: accountDTO(),
         rooms
@@ -2768,6 +2821,31 @@ function emitReactions(room: Room, eventId: string): void {
     emit({ type: "reaction", roomId: room.roomId, eventId, reactions });
 }
 
+function liveTimelineAnchors(room: Room, event: MatrixEvent): {
+    previousEventId?: string;
+    nextEventId?: string;
+} {
+    const events = room.getLiveTimeline().getEvents();
+    const index = events.indexOf(event);
+    if (index < 0) return {};
+    let previousEventId: string | undefined;
+    const firstCandidateIndex = Math.max(0, index - MAX_TIMELINE_ANCHOR_SCAN);
+    for (let candidateIndex = index - 1; candidateIndex >= firstCandidateIndex; candidateIndex--) {
+        // Only anchor to rows the renderer can actually project. Pending
+        // encrypted neighbours are revisited when they decrypt; in either
+        // decryption order, the already-projected side becomes an anchor.
+        previousEventId = optionalEventId(normalizeMessage(room, events[candidateIndex])?.eventId);
+        if (previousEventId) break;
+    }
+    let nextEventId: string | undefined;
+    const lastCandidateIndex = Math.min(events.length, index + MAX_TIMELINE_ANCHOR_SCAN + 1);
+    for (let candidateIndex = index + 1; candidateIndex < lastCandidateIndex; candidateIndex++) {
+        nextEventId = optionalEventId(normalizeMessage(room, events[candidateIndex])?.eventId);
+        if (nextEventId) break;
+    }
+    return { previousEventId, nextEventId };
+}
+
 function convergeReactions(room: Room, eventId: string): void {
     invalidateReactionMap(room);
     try { emitReactions(room, eventId); } catch { }
@@ -2822,7 +2900,7 @@ function handleTimelineEvent(event: MatrixEvent, room: Room | undefined, removed
     }
 
     const message = normalizeMessage(room, event, buildReactionMap(room).get(eventId));
-    if (message) emit({ type: "message", roomId: room.roomId, message });
+    if (message) emit({ type: "message", roomId: room.roomId, message, ...liveTimelineAnchors(room, event) });
 }
 
 function attachClientListeners(client: MatrixClient): void {
@@ -2833,10 +2911,16 @@ function attachClientListeners(client: MatrixClient): void {
     client.on(ClientEvent.Sync, (state, _previous, data) => guarded(() => {
         lastSyncState = state;
         switch (state) {
-            case SyncState.Prepared:
+            case SyncState.Prepared: {
                 setStatus("ready");
-                emit({ type: "snapshot", snapshot: snapshot() });
+                const preparedSnapshot = snapshot();
+                // Release suppression immediately before publishing the
+                // authoritative cut. JavaScript dispatch is synchronous here,
+                // so no room/timeline callback can slip between these steps.
+                startupProjectionSuppressed = false;
+                emit({ type: "snapshot", snapshot: preparedSnapshot });
                 break;
+            }
             case SyncState.Syncing:
                 setStatus(workerState === "starting" ? "syncing" : "ready");
                 break;
@@ -3011,6 +3095,7 @@ async function disposeClient(clearStores: boolean): Promise<void> {
     matrixStore = null;
     cryptoDatabasePrefix = null;
     activeCredentials = null;
+    startupProjectionSuppressed = false;
     lastSyncState = null;
     reactionTargets.clear();
     publicDirectoryTargets.clear();
@@ -3193,6 +3278,10 @@ async function startAuthenticated(
         for (const room of client.getRooms()) observeRoom(room);
         setStatus("syncing");
         progress("client");
+        startupProjectionSuppressed = true;
+        // startClient only launches matrix-js-sdk's detached sync loop. Keep
+        // projection suppression active until its guarded Prepared callback
+        // publishes the authoritative bounded startup snapshot.
         await client.startClient({
             initialSyncLimit: 50,
             lazyLoadMembers: true
@@ -8470,17 +8559,7 @@ function xStatusApiUrl(value: string): { url: string; statusId: string; } | unde
 }
 
 function xVideoUrl(value: unknown): string | undefined {
-    if (typeof value !== "string" || value.length === 0 || value.length > 4_096
-        || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
-    try {
-        const url = new URL(value);
-        if (url.protocol !== "https:" || url.hostname !== "video.twimg.com"
-            || url.username || url.password || url.port || url.hash || url.href !== value
-            || !url.pathname.toLowerCase().endsWith(".mp4")) return undefined;
-        return url.href;
-    } catch {
-        return undefined;
-    }
+    return validatedXVideoUrl(value);
 }
 
 function previewText(value: unknown, maximum: number): string | undefined {
@@ -8620,23 +8699,6 @@ async function klipyUrlPreview(sourceUrl: string): Promise<CachedUrlPreview | un
     return { sourceUrl, directProvider: "klipy", imageUrl, preview };
 }
 
-function previewImageMime(value: unknown, url: string): "image/jpeg" | "image/png" | "image/webp" | undefined {
-    const declared = normalizedMimeType(value);
-    if (declared === "image/jpeg" || declared === "image/png" || declared === "image/webp") return declared;
-    const candidate = new URL(url);
-    const format = candidate.searchParams.get("format")?.toLowerCase();
-    if (format === "jpg" || format === "jpeg" || /\.jpe?g$/iu.test(candidate.pathname)) return "image/jpeg";
-    if (format === "png" || /\.png$/iu.test(candidate.pathname)) return "image/png";
-    if (format === "webp" || /\.webp$/iu.test(candidate.pathname)) return "image/webp";
-    return undefined;
-}
-
-function fxTwitterRecord(value: unknown): Record<string, unknown> | undefined {
-    return value != null && typeof value === "object" && !Array.isArray(value)
-        ? value as Record<string, unknown>
-        : undefined;
-}
-
 async function xUrlPreview(
     sourceUrl: string,
     request: { url: string; statusId: string; }
@@ -8649,75 +8711,48 @@ async function xUrlPreview(
     }
     if (!raw || raw.length > MAX_PROVIDER_PREVIEW_DOCUMENT_CHARS) return undefined;
 
-    let response: Record<string, unknown> | undefined;
+    let response: unknown;
     try {
-        response = fxTwitterRecord(JSON.parse(raw));
+        response = JSON.parse(raw);
     } catch {
         return undefined;
     }
-    const status = fxTwitterRecord(response?.status);
-    const author = fxTwitterRecord(status?.author);
-    const media = fxTwitterRecord(status?.media);
-    const videos = media?.videos;
-    const screenName = author?.screen_name;
-    const authorName = author?.name;
-    const text = status?.text;
-    if (response?.code !== 200 || status?.type !== "status" || status.id !== request.statusId
-        || status.provider !== "twitter" || status.embed_card !== "player"
-        || typeof screenName !== "string" || !/^[A-Za-z0-9_]{1,15}$/u.test(screenName)
-        || (authorName != null && (typeof authorName !== "string" || authorName.length > 256))
-        || typeof text !== "string" || text.length > 65_536
-        || !Array.isArray(videos) || videos.length === 0 || videos.length > 16) {
-        return undefined;
-    }
-
-    let video: {
-        url: string;
-        posterUrl: string;
-        posterMimeType: "image/jpeg" | "image/png" | "image/webp";
-        dimensions: { width: number; height: number; };
-    } | undefined;
-    for (const value of videos) {
-        const candidate = fxTwitterRecord(value);
-        if (!candidate || candidate.type !== "video" || candidate.format !== "video/mp4") continue;
-        const url = xVideoUrl(candidate.url);
-        const posterUrl = xPosterUrl(candidate.thumbnail_url);
-        const posterMimeType = posterUrl ? previewImageMime(undefined, posterUrl) : undefined;
-        const dimensions = previewDimensions(candidate.width, candidate.height);
-        if (url && posterUrl && posterMimeType && dimensions) {
-            video = { url, posterUrl, posterMimeType, dimensions };
-            break;
-        }
-    }
-    if (!video) return undefined;
+    const parsed = parseFxTwitterStatus(response, request.statusId);
+    if (!parsed) return undefined;
 
     const preview: MatrixUrlPreviewDTO = {
         url: sourceUrl,
         provider: { name: "X" },
-        title: previewText(authorName ? `${authorName} (@${screenName})` : `@${screenName}`, 512),
-        description: previewText(text, 4_096),
-        image: {
-            name: `x-preview.${video.posterMimeType.split("/")[1].replace("jpeg", "jpg")}`,
-            mimeType: video.posterMimeType,
-            ...video.dimensions,
+        title: parsed.title,
+        description: parsed.description
+    };
+    if (parsed.image) {
+        preview.image = {
+            name: `x-preview.${parsed.image.mimeType.split("/")[1].replace("jpeg", "jpg")}`,
+            mimeType: parsed.image.mimeType,
+            width: parsed.image.width,
+            height: parsed.image.height,
             downloadable: true,
             downloadIndex: 0,
             encrypted: false
-        },
-        video: {
+        };
+    }
+    if (parsed.video) {
+        preview.video = {
             name: "x-preview.mp4",
             mimeType: "video/mp4",
-            ...video.dimensions,
+            width: parsed.video.width,
+            height: parsed.video.height,
             downloadable: true,
             downloadIndex: 1,
             encrypted: false
-        }
-    };
+        };
+    }
     return {
         sourceUrl,
         directProvider: "x",
-        imageUrl: video.posterUrl,
-        videoUrl: video.url,
+        imageUrl: parsed.image?.url,
+        videoUrl: parsed.video?.url,
         preview
     };
 }
@@ -8941,8 +8976,14 @@ function validDirectPreviewCache(preview: CachedUrlPreview): boolean {
                 && preview.videoUrl == null;
         case "x":
             return xStatusApiUrl(preview.sourceUrl) != null
-                && xPosterUrl(preview.imageUrl) === preview.imageUrl
-                && xVideoUrl(preview.videoUrl) === preview.videoUrl;
+                && (preview.preview.image == null || preview.preview.image.downloadIndex === 0)
+                && (preview.preview.video == null || preview.preview.video.downloadIndex === 1)
+                && validXPreviewMediaCache({
+                    imageUrl: preview.imageUrl,
+                    videoUrl: preview.videoUrl,
+                    hasImage: preview.preview.image != null,
+                    hasVideo: preview.preview.video != null
+                });
         case "tenor":
             return tenorShareUrl(preview.sourceUrl) != null
                 && tenorMediaUrl(preview.imageUrl) === preview.imageUrl

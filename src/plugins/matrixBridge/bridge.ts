@@ -38,6 +38,11 @@ const DISCORD_EPOCH = 1_420_070_400_000n;
 const SYNTHETIC_ID_BASE = Date.UTC(2020, 0, 1);
 const SYNTHETIC_JOINED_AT = new Date(SYNTHETIC_ID_BASE).toISOString();
 const LOW_SNOWFLAKE_BITS = (1n << 22n) - 1n;
+const MAX_SNOWFLAKE = (1n << 64n) - 1n;
+// Leave a very wide insertion gap between adjacent Matrix rows. Matrix's
+// timeline order is authoritative; origin timestamps are display metadata and
+// can be equal or skewed by remote homeservers.
+const MESSAGE_ORDER_STRIDE = 1n << 12n;
 const MAX_DISCORD_SNOWFLAKE_TIMESTAMP = Number(DISCORD_EPOCH + (1n << 42n) - 1n);
 const MAX_HYDRATED_MEDIA = 24;
 const MAX_ACTIVE_MEDIA_DOWNLOADS = 3;
@@ -51,6 +56,14 @@ const MATRIX_ROUTE_KEY = "MatrixBridge_lastRoute";
 // older lower-priority blobs are still evicted before this limit is crossed.
 const MAX_HYDRATED_MEDIA_ITEM_BYTES = 96 * 1024 * 1024;
 const MAX_HYDRATED_MEDIA_BYTES = 128 * 1024 * 1024;
+const PROJECTED_X_HOSTS = new Set([
+    "x.com",
+    "www.x.com",
+    "mobile.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "mobile.twitter.com",
+]);
 
 const createChannelRecordFromServer = findByCodeLazy(".GUILD_TEXT]", "fromServer)");
 
@@ -141,6 +154,8 @@ export interface MatrixMessageDto {
     edited?: boolean;
     editedAt?: number;
     replyToEventId?: string;
+    previousEventId?: string;
+    nextEventId?: string;
     attachments?: MatrixAttachmentDto[];
     attachmentGroup?: MatrixAttachmentGroupDTO;
     reactions?: MatrixReactionDto[];
@@ -281,6 +296,8 @@ let eventCursor = 0;
 let bridgeActive = false;
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+let connectionProjectionGeneration: number | undefined;
+let connectionProjectionRestartIfMissing = false;
 
 const roomsByChannel = new Map<string, InjectedRoom>();
 const injectedChannelIds = new Set<string>();
@@ -304,17 +321,31 @@ const matrixUserIdsBySyntheticId = new Map<string, string>();
 const spaceIdsBySyntheticUserId = new Map<string, Set<string>>();
 const protectedSyntheticIds = new Set<string>();
 const messageIdsByEventId = new Map<string, string>();
+const orderedMessageIdsByRoom = new Map<string, Map<string, string>>();
+const messageIdOwners = new Map<string, string>();
+const provisionalContextEventIdsByRoom = new Map<string, Set<string>>();
 const reservedReplyEventIds = new Set<string>();
 const reservedReplyTargets = new Map<string, { roomId: string; eventId: string; }>();
 const eventIdsByTransaction = new Map<string, string>();
 const roomHistoryById = new Map<string, RoomHistoryState>();
 const paginationRequestsByRoom = new Map<string, number>();
+interface MessageStoreConvergence {
+    generation: number;
+    roomId: string;
+    channelId: string;
+    targets: Set<string>;
+    attempts: number;
+    timer?: ReturnType<typeof setTimeout>;
+}
+const messageStoreConvergenceByChannel = new Map<string, MessageStoreConvergence>();
 const matrixSearchModalKeys = new Set<string>();
 const matrixManagementModalKeys = new Set<string>();
 const mediaFocusEventIdsByRoom = new Map<string, string[]>();
 const typingUsersByRoom = new Map<string, Set<string>>();
 const lastOutgoingTyping = new Map<string, number>();
 const pendingReceiptsByRoom = new Map<string, {
+    channelId: string;
+    messageId: string;
     eventId: string;
     timer: ReturnType<typeof setTimeout>;
 }>();
@@ -329,6 +360,12 @@ const matrixUnreadByChannel = new Map<string, {
     highlightCount: number;
     lastMessageId: string | null;
 }>();
+interface MatrixRoomUnreadFloor {
+    unreadCount: number;
+    highlightCount: number;
+    acknowledgedMessageId?: string;
+}
+const matrixUnreadFloorByRoom = new Map<string, MatrixRoomUnreadFloor>();
 let matrixUnreadRevision = 0;
 const mediaCache = new Map<string, MediaCacheEntry>();
 let wantedMediaKeys = new Set<string>();
@@ -376,34 +413,238 @@ function trimMessageIdCache() {
     if (messageIdsByEventId.size <= MAX_MESSAGE_ID_CACHE) return;
     for (const eventId of messageIdsByEventId.keys()) {
         if (reservedReplyEventIds.has(eventId)) continue;
+        const id = messageIdsByEventId.get(eventId)!;
         messageIdsByEventId.delete(eventId);
+        const retainedByRoom = [...orderedMessageIdsByRoom.values()]
+            .some(ordered => ordered.get(eventId) === id);
+        if (!retainedByRoom && messageIdOwners.get(id) === eventId) messageIdOwners.delete(id);
         if (messageIdsByEventId.size <= MAX_MESSAGE_ID_CACHE) return;
     }
     while (messageIdsByEventId.size > MAX_MESSAGE_ID_CACHE) {
         const eventId = messageIdsByEventId.keys().next().value!;
+        const id = messageIdsByEventId.get(eventId)!;
         messageIdsByEventId.delete(eventId);
         reservedReplyEventIds.delete(eventId);
+        const retainedByRoom = [...orderedMessageIdsByRoom.values()]
+            .some(ordered => ordered.get(eventId) === id);
+        if (!retainedByRoom && messageIdOwners.get(id) === eventId) messageIdOwners.delete(id);
     }
 }
 
-function messageSyntheticId(eventId: string, timestamp: number, reserveReply = false) {
-    if (reserveReply) reserveReplyEventId(eventId);
-    const existing = messageIdsByEventId.get(eventId);
-    if (existing) {
-        messageIdsByEventId.delete(eventId);
-        messageIdsByEventId.set(eventId, existing);
-        return existing;
-    }
+function timestampMessageId(eventId: string, timestamp: number) {
     const hash = hash64(`event\0${eventId}`);
     const safeTimestamp = Number.isFinite(timestamp)
         && timestamp > Number(DISCORD_EPOCH)
         && timestamp <= MAX_DISCORD_SNOWFLAKE_TIMESTAMP
         ? Math.floor(timestamp)
         : SYNTHETIC_ID_BASE + Number((hash >> 22n) & 0xffff_ffffn);
-    const id = ((BigInt(safeTimestamp) - DISCORD_EPOCH) << 22n | (hash & LOW_SNOWFLAKE_BITS)).toString();
+    return ((BigInt(safeTimestamp) - DISCORD_EPOCH) << 22n | (hash & LOW_SNOWFLAKE_BITS));
+}
+
+function rememberMessageId(eventId: string, id: string) {
+    const previousId = messageIdsByEventId.get(eventId);
+    if (previousId && previousId !== id && messageIdOwners.get(previousId) === eventId) {
+        messageIdOwners.delete(previousId);
+    }
+    const owner = messageIdOwners.get(id);
+    if (owner && owner !== eventId) throw new Error("Matrix message snowflake collision");
+    messageIdOwners.set(id, eventId);
+    messageIdsByEventId.delete(eventId);
     messageIdsByEventId.set(eventId, id);
     trimMessageIdCache();
     return id;
+}
+
+function unclaimedMessageId(candidate: bigint, eventId: string, upperExclusive = MAX_SNOWFLAKE + 1n) {
+    while (candidate < upperExclusive) {
+        const owner = messageIdOwners.get(candidate.toString());
+        if (!owner || owner === eventId) return candidate;
+        candidate++;
+    }
+    throw new Error("Matrix message snowflake range exhausted");
+}
+
+function unclaimedMessageIdBefore(candidate: bigint, eventId: string, lowerExclusive = 0n) {
+    while (candidate > lowerExclusive) {
+        const owner = messageIdOwners.get(candidate.toString());
+        if (!owner || owner === eventId) return candidate;
+        candidate--;
+    }
+    throw new Error("Matrix message snowflake range exhausted");
+}
+
+function messageSyntheticId(eventId: string, timestamp: number, reserveReply = false, roomId?: string) {
+    if (reserveReply) reserveReplyEventId(eventId);
+    const ordered = roomId ? orderedMessageIdsByRoom.get(roomId)?.get(eventId) : undefined;
+    if (ordered) return rememberMessageId(eventId, ordered);
+    const existing = messageIdsByEventId.get(eventId);
+    if (existing) {
+        messageIdsByEventId.delete(eventId);
+        messageIdsByEventId.set(eventId, existing);
+        return existing;
+    }
+    const candidate = unclaimedMessageId(timestampMessageId(eventId, timestamp), eventId);
+    return rememberMessageId(eventId, candidate.toString());
+}
+
+/**
+ * Assigns stable session IDs from Matrix's authoritative oldest-first order.
+ * Existing rows are immutable anchors. Backfill is placed before the first
+ * anchor, live events after the last, and a bounded middle run is interpolated.
+ */
+function ensureRoomMessageIds(roomId: string, messages: readonly MatrixMessageDto[]) {
+    let ordered = orderedMessageIdsByRoom.get(roomId);
+    if (!ordered) orderedMessageIdsByRoom.set(roomId, ordered = new Map());
+
+    const seenEventIds = new Set<string>();
+    const sequence: MatrixMessageDto[] = [];
+    for (const message of messages) {
+        if (seenEventIds.has(message.eventId)) continue;
+        seenEventIds.add(message.eventId);
+        sequence.push(message);
+    }
+    for (let cursor = 0; cursor < sequence.length;) {
+        if (ordered.has(sequence[cursor].eventId)) {
+            cursor++;
+            continue;
+        }
+        const start = cursor;
+        while (cursor < sequence.length && !ordered.has(sequence[cursor].eventId)) cursor++;
+        const count = cursor - start;
+        const left = start > 0 ? BigInt(ordered.get(sequence[start - 1].eventId)!) : undefined;
+        const right = cursor < sequence.length ? BigInt(ordered.get(sequence[cursor].eventId)!) : undefined;
+        const values: bigint[] = [];
+        if (left != null && right != null) {
+            const available = right - left - 1n;
+            if (available < BigInt(count)) {
+                throw new Error(`Matrix message order anchors exhausted for ${roomId}`);
+            }
+            const step = (right - left) / BigInt(count + 1);
+            for (let offset = 1; offset <= count; offset++) values.push(left + step * BigInt(offset));
+        } else if (left != null) {
+            let previous = left;
+            for (let offset = 0; offset < count; offset++) {
+                const message = sequence[start + offset];
+                const candidate = timestampMessageId(message.eventId, message.timestamp);
+                const value = unclaimedMessageId(
+                    candidate >= previous + MESSAGE_ORDER_STRIDE
+                        ? candidate
+                        : previous + MESSAGE_ORDER_STRIDE,
+                    message.eventId
+                );
+                values.push(value);
+                previous = value;
+            }
+        } else if (right != null) {
+            let next = right;
+            values.length = count;
+            for (let offset = count - 1; offset >= 0; offset--) {
+                const message = sequence[start + offset];
+                const candidate = timestampMessageId(message.eventId, message.timestamp);
+                const value = unclaimedMessageIdBefore(
+                    candidate <= next - MESSAGE_ORDER_STRIDE
+                        ? candidate
+                        : next - MESSAGE_ORDER_STRIDE,
+                    message.eventId
+                );
+                values[offset] = value;
+                next = value;
+            }
+        } else {
+            let next = unclaimedMessageIdBefore(
+                timestampMessageId(sequence.at(-1)!.eventId, sequence.at(-1)!.timestamp),
+                sequence.at(-1)!.eventId
+            ) + 1n;
+            values.length = count;
+            for (let offset = count - 1; offset >= 0; offset--) {
+                const message = sequence[start + offset];
+                const candidate = timestampMessageId(message.eventId, message.timestamp);
+                const value = unclaimedMessageIdBefore(
+                    candidate <= next - MESSAGE_ORDER_STRIDE
+                        ? candidate
+                        : next - MESSAGE_ORDER_STRIDE,
+                    message.eventId
+                );
+                values[offset] = value;
+                next = value;
+            }
+        }
+        for (let offset = 0; offset < count; offset++) {
+            const { eventId } = sequence[start + offset];
+            const upper = offset + 1 < values.length
+                ? values[offset + 1]
+                : right ?? MAX_SNOWFLAKE + 1n;
+            const value = unclaimedMessageId(values[offset], eventId, upper);
+            if (value <= 0n || value > MAX_SNOWFLAKE) {
+                throw new Error(`Matrix message order is outside Discord's snowflake range for ${roomId}`);
+            }
+            const id = value.toString();
+            ordered.set(eventId, id);
+            rememberMessageId(eventId, id);
+        }
+    }
+
+    let previous = -1n;
+    for (const message of sequence) {
+        const id = BigInt(ordered.get(message.eventId)!);
+        if (id <= previous) throw new Error(`Matrix timeline order invariant failed for ${roomId}`);
+        previous = id;
+    }
+    return ordered;
+}
+
+function clearRoomMessageOrder(roomId: string) {
+    const ordered = orderedMessageIdsByRoom.get(roomId);
+    if (ordered) {
+        for (const [eventId, id] of ordered) {
+            if (messageIdOwners.get(id) === eventId) messageIdOwners.delete(id);
+            if (messageIdsByEventId.get(eventId) === id) messageIdsByEventId.delete(eventId);
+        }
+    }
+    orderedMessageIdsByRoom.delete(roomId);
+    provisionalContextEventIdsByRoom.delete(roomId);
+    matrixUnreadFloorByRoom.delete(roomId);
+}
+
+function markProvisionalContextMessages(roomId: string, messages: readonly MatrixMessageDto[]) {
+    const authoritative = new Set(roomHistoryById.get(roomId)?.messages.map(message => message.eventId) ?? []);
+    let provisional = provisionalContextEventIdsByRoom.get(roomId);
+    if (!provisional) provisionalContextEventIdsByRoom.set(roomId, provisional = new Set());
+    for (const message of messages) if (!authoritative.has(message.eventId)) provisional.add(message.eventId);
+}
+
+function releaseProvisionalContextMessageIds(roomId: string, messages: readonly MatrixMessageDto[]) {
+    const provisional = provisionalContextEventIdsByRoom.get(roomId);
+    const ordered = orderedMessageIdsByRoom.get(roomId);
+    if (!provisional || !ordered) return;
+    for (const message of messages) {
+        if (!provisional.delete(message.eventId)) continue;
+        const id = ordered.get(message.eventId);
+        ordered.delete(message.eventId);
+        if (id && messageIdOwners.get(id) === message.eventId) messageIdOwners.delete(id);
+        if (id && messageIdsByEventId.get(message.eventId) === id) messageIdsByEventId.delete(message.eventId);
+    }
+    if (!provisional.size) provisionalContextEventIdsByRoom.delete(roomId);
+}
+
+function pruneRoomMessageOrder(roomId: string, retainedMessages: readonly MatrixMessageDto[]) {
+    const ordered = orderedMessageIdsByRoom.get(roomId);
+    if (!ordered) return;
+    const retained = new Set(retainedMessages.map(message => message.eventId));
+    for (const projection of roomsByChannel.values()) {
+        if (projection.room.roomId !== roomId) continue;
+        for (const eventId of projection.messageIds.keys()) retained.add(eventId);
+    }
+    for (const target of reservedReplyTargets.values()) {
+        if (target.roomId === roomId) retained.add(target.eventId);
+    }
+    for (const [eventId, id] of ordered) {
+        if (retained.has(eventId)) continue;
+        ordered.delete(eventId);
+        if (messageIdOwners.get(id) === eventId) messageIdOwners.delete(id);
+        if (messageIdsByEventId.get(eventId) === id) messageIdsByEventId.delete(eventId);
+    }
+    if (!ordered.size) orderedMessageIdsByRoom.delete(roomId);
 }
 
 function rememberReservedReplyTarget(channelId: string, messageId: string, roomId: string, eventId: string) {
@@ -523,9 +764,17 @@ function messageEchoIdentity(message: MatrixMessageDto) {
 }
 
 function preserveLocalEchoMessageId(localEventId: string, remote: MatrixMessageDto) {
-    const pendingMessageId = messageIdsByEventId.get(localEventId);
+    const ordered = orderedMessageIdsByRoom.get(remote.roomId);
+    const pendingMessageId = ordered?.get(localEventId) ?? messageIdsByEventId.get(localEventId);
     if (!pendingMessageId) return false;
-    messageIdsByEventId.set(remote.eventId, pendingMessageId);
+    if (ordered) {
+        ordered.set(remote.eventId, pendingMessageId);
+        ordered.delete(localEventId);
+    }
+    if (messageIdOwners.get(pendingMessageId) === localEventId) {
+        messageIdOwners.set(pendingMessageId, remote.eventId);
+    }
+    rememberMessageId(remote.eventId, pendingMessageId);
     messageIdsByEventId.delete(localEventId);
     return true;
 }
@@ -544,8 +793,9 @@ function singleProjectedMessage(
 ): ProjectedTimelineMessage {
     const attachmentGroup = validAttachmentGroup(message);
     const missingAnchor = Boolean(attachmentGroup && attachmentGroup.index !== 0);
-    const messageId = previous?.messageIds.get(message.eventId)
-        ?? messageSyntheticId(message.eventId, message.timestamp);
+    const messageId = orderedMessageIdsByRoom.get(message.roomId)?.get(message.eventId)
+        ?? previous?.messageIds.get(message.eventId)
+        ?? messageSyntheticId(message.eventId, message.timestamp, false, message.roomId);
     return {
         message,
         messageId,
@@ -577,6 +827,14 @@ function projectedTimelineMessages(
         position: number;
         message: MatrixMessageDto;
         group: MatrixAttachmentGroupDTO;
+    }
+
+    const roomId = messages[0]?.roomId;
+    if (roomId) {
+        if (messages.some(message => message.roomId !== roomId)) {
+            throw new Error("A Matrix projection cannot mix rooms.");
+        }
+        ensureRoomMessageIds(roomId, messages);
     }
 
     // Validate the complete visible occurrence set for a marker before
@@ -626,9 +884,11 @@ function projectedTimelineMessages(
         // Only index zero may supply the aggregate row identity. Reusing a
         // suffix member's temporary row would make pagination/search produce
         // a different Discord ID than a clean restart with the full group.
-        const existingMessageId = previous?.messageIds.get(base.eventId)
+        const existingMessageId = orderedMessageIdsByRoom.get(base.roomId)?.get(base.eventId)
+            ?? previous?.messageIds.get(base.eventId)
             ?? messageIdsByEventId.get(base.eventId);
-        const messageId = existingMessageId ?? messageSyntheticId(base.eventId, base.timestamp);
+        const messageId = existingMessageId
+            ?? messageSyntheticId(base.eventId, base.timestamp, false, base.roomId);
         result.push({
             message: {
                 ...action,
@@ -661,7 +921,7 @@ function projectedTimelineMessages(
     const usedMessageIds = new Set<string>();
     for (const item of result) {
         if (usedMessageIds.has(item.messageId)) {
-            item.messageId = messageSyntheticId(item.message.eventId, item.message.timestamp);
+            throw new Error(`Matrix projected message ID collision in ${item.message.roomId}`);
         }
         usedMessageIds.add(item.messageId);
     }
@@ -760,6 +1020,11 @@ function mergeRoomHistory(
         completedRemoteEchoEventIds?: Set<string>;
     } = {}
 ) {
+    // Search/reply contexts are detached from contiguous history. Once a
+    // context event arrives through an authoritative page/delta, discard its
+    // provisional label so the complete sequence can allocate it between its
+    // real neighbours and atomically rebuild every reply reference.
+    releaseProvisionalContextMessageIds(roomId, messages);
     const current = roomHistoryById.get(roomId);
     const timelineGeneration = options.timelineGeneration ?? current?.timelineGeneration ?? 0;
     const generationChanged = current != null && current.timelineGeneration !== timelineGeneration;
@@ -795,11 +1060,20 @@ function mergeRoomHistory(
                 break;
             }
         }
-        if (nextAnchor) {
-            const anchorIndex = merged.findIndex(message => message.eventId === nextAnchor);
+        const externalNextAnchor = segment
+            .map(message => message.nextEventId)
+            .find((eventId): eventId is string => Boolean(eventId && retainedIds.has(eventId)));
+        const externalPreviousAnchor = [...segment]
+            .reverse()
+            .map(message => message.previousEventId)
+            .find((eventId): eventId is string => Boolean(eventId && retainedIds.has(eventId)));
+        const resolvedNextAnchor = nextAnchor ?? externalNextAnchor;
+        if (resolvedNextAnchor) {
+            const anchorIndex = merged.findIndex(message => message.eventId === resolvedNextAnchor);
             merged.splice(Math.max(0, anchorIndex), 0, ...segment);
-        } else if (previousAnchor) {
-            const anchorIndex = merged.findIndex(message => message.eventId === previousAnchor);
+        } else if (previousAnchor ?? externalPreviousAnchor) {
+            const anchorIndex = merged.findIndex(message =>
+                message.eventId === (previousAnchor ?? externalPreviousAnchor));
             merged.splice(anchorIndex + 1, 0, ...segment);
         } else if (options.placement === "before") {
             merged.unshift(...segment);
@@ -830,6 +1104,7 @@ function mergeRoomHistory(
         capped,
     };
     roomHistoryById.set(roomId, state);
+    pruneRoomMessageOrder(roomId, state.messages);
     return state;
 }
 
@@ -1142,6 +1417,32 @@ function safePreviewEmbedUrl(candidate: string) {
     } catch {
         return undefined;
     }
+}
+
+export function projectMatrixDisplayUrl(candidate: string): string | undefined {
+    if (!candidate || candidate.length > 2_048 || /[\u0000-\u001f\u007f]/u.test(candidate)) return undefined;
+    try {
+        const url = new URL(candidate);
+        if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) return undefined;
+        const hostname = url.hostname.toLowerCase();
+        if (!PROJECTED_X_HOSTS.has(hostname)) return candidate;
+        const authorityStart = candidate.indexOf("://") + 3;
+        const authorityTail = candidate.slice(authorityStart);
+        const separator = authorityTail.search(/[/?#]/u);
+        const authorityEnd = separator === -1 ? candidate.length : authorityStart + separator;
+        const rawAuthority = candidate.slice(authorityStart, authorityEnd).toLowerCase();
+        const allowedAuthorities = url.protocol === "https:"
+            ? [hostname, `${hostname}:443`]
+            : [hostname, `${hostname}:80`];
+        if (!allowedAuthorities.includes(rawAuthority)) return candidate;
+        return `https://girlcockx.com${candidate.slice(authorityEnd)}`;
+    } catch {
+        return undefined;
+    }
+}
+
+export function projectMatrixDisplayText(body: string) {
+    return body.replace(/https?:\/\/[^\s<>"']+/giu, candidate => projectMatrixDisplayUrl(candidate) ?? candidate);
 }
 
 function previewMediaKey(message: MatrixMessageDto) {
@@ -1483,7 +1784,8 @@ function rawPreviewEmbeds(message: MatrixMessageDto) {
     const key = previewMediaKey(message);
     const entry = key ? mediaCache.get(key) : undefined;
     const preview = entry?.preview;
-    const sourceUrl = preview ? safePreviewEmbedUrl(preview.url) : undefined;
+    const canonicalSourceUrl = preview ? safePreviewEmbedUrl(preview.url) : undefined;
+    const sourceUrl = canonicalSourceUrl ? projectMatrixDisplayUrl(canonicalSourceUrl) : undefined;
     const imageEntry = key && preview?.image
         ? mediaCache.get(previewAssetKey(key, "image", preview.image))
         : undefined;
@@ -1549,7 +1851,7 @@ function rawStickerImage(image: MatrixAttachmentDto) {
 }
 
 function stickerBodyFallback(body: string) {
-    return body
+    return projectMatrixDisplayText(body)
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
         .trim()
         .slice(0, STICKER_BODY_FALLBACK_MAX)
@@ -1607,7 +1909,7 @@ function rawMessage(projected: ProjectedTimelineMessage, injected: InjectedRoom,
         && actionAttachments.some(attachment =>
             message.body === (attachment.fileName ?? attachment.name));
     const projectedMentions = inboundMessageMentions(message, injected);
-    const projectedBody = projectedMentions.body;
+    const projectedBody = projectMatrixDisplayText(projectedMentions.body);
     const visibleBody = filenameOnlyBody ? "" : projectedBody;
     const attachmentFallback = (message.attachments ?? [])
         .slice(0, 10)
@@ -1700,6 +2002,19 @@ function toRawMessage(message: ProjectedTimelineMessage, injected: InjectedRoom)
     return rawMessage(message, injected);
 }
 
+function newestFirstRawMessages(messages: readonly ProjectedTimelineMessage[], injected: InjectedRoom) {
+    const raw = [...messages].reverse().map(message => toRawMessage(message, injected));
+    const ids = new Set<string>();
+    for (let index = 0; index < raw.length; index++) {
+        const id = String(raw[index].id);
+        if (ids.has(id) || index > 0 && BigInt(raw[index - 1].id) <= BigInt(id)) {
+            throw new Error(`Matrix LOAD order invariant failed for ${injected.room.roomId}`);
+        }
+        ids.add(id);
+    }
+    return raw;
+}
+
 /**
  * LOAD_MESSAGES_SUCCESS intentionally preserves Discord's optimistic rows.
  * Complete only exact Matrix echoes collected while replacing a local event;
@@ -1756,12 +2071,34 @@ function safeUnreadCount(value: number | undefined) {
         : 0;
 }
 
-function syncProjectionUnread(channelId: string, room: MatrixRoomDto) {
+function roomUnreadFloor(roomId: string) {
+    let floor = matrixUnreadFloorByRoom.get(roomId);
+    if (!floor) {
+        floor = {
+            unreadCount: 0,
+            highlightCount: 0,
+        };
+        matrixUnreadFloorByRoom.set(roomId, floor);
+    }
+    return floor;
+}
+
+function syncProjectionUnread(channelId: string, room: MatrixRoomDto, guildId?: string) {
     const messages = roomMessages(room);
     const latest = projectedTimelineMessages(messages).at(-1);
+    const floor = roomUnreadFloor(room.roomId);
+    const snapshotIsAcknowledged = floor.acknowledgedMessageId != null
+        && latest != null
+        && BigInt(latest.messageId) <= BigInt(floor.acknowledgedMessageId);
+    if (!snapshotIsAcknowledged) {
+        floor.unreadCount = Math.max(floor.unreadCount, safeUnreadCount(room.unreadCount));
+        floor.highlightCount = Math.max(floor.highlightCount, safeUnreadCount(room.highlightCount));
+    }
     const next = {
-        unreadCount: safeUnreadCount(room.unreadCount),
-        highlightCount: safeUnreadCount(room.highlightCount),
+        unreadCount: floor.unreadCount,
+        // Discord treats every private/DM message as a Home-rail mention. Guild
+        // space channels retain Matrix's explicit highlight semantics.
+        highlightCount: guildId ? floor.highlightCount : floor.unreadCount,
         lastMessageId: latest?.messageId ?? null,
     };
     const previous = matrixUnreadByChannel.get(channelId);
@@ -1774,6 +2111,10 @@ function syncProjectionUnread(channelId: string, room: MatrixRoomDto) {
 }
 
 function removeInjectedChannel(channelId: string) {
+    const removedRoomId = roomsByChannel.get(channelId)?.room.roomId;
+    const convergence = messageStoreConvergenceByChannel.get(channelId);
+    if (convergence?.timer) clearTimeout(convergence.timer);
+    messageStoreConvergenceByChannel.delete(channelId);
     const channel = ChannelStore.getChannel(channelId);
     if (channel) {
         FluxDispatcher.dispatch({ type: "CHANNEL_DELETE", channel });
@@ -1782,11 +2123,24 @@ function removeInjectedChannel(channelId: string) {
     spaceCreateContextsByCategoryId.delete(channelId);
     roomsByChannel.delete(channelId);
     for (const key of reservedReplyTargets.keys()) {
-        if (key.startsWith(`${channelId}\0`)) reservedReplyTargets.delete(key);
+        if (!key.startsWith(`${channelId}\0`)) continue;
+        const target = reservedReplyTargets.get(key)!;
+        const reservedMessageId = key.slice(key.indexOf("\0") + 1);
+        reservedReplyTargets.delete(key);
+        if (!orderedMessageIdsByRoom.get(target.roomId)?.has(target.eventId)
+            && messageIdOwners.get(reservedMessageId) === target.eventId) {
+            messageIdOwners.delete(reservedMessageId);
+            if (messageIdsByEventId.get(target.eventId) === reservedMessageId) {
+                messageIdsByEventId.delete(target.eventId);
+            }
+        }
     }
     if (matrixUnreadByChannel.delete(channelId)) {
         matrixUnreadRevision++;
         (ReadStateStore as any).emitChange?.();
+    }
+    if (removedRoomId && ![...roomsByChannel.values()].some(projection => projection.room.roomId === removedRoomId)) {
+        clearRoomMessageOrder(removedRoomId);
     }
 }
 
@@ -2118,7 +2472,8 @@ function injectRoomTimeline(
     guildId?: string,
     parentId?: string,
     parentSpaceId?: string,
-    channelPosition?: number
+    channelPosition?: number,
+    scheduleRecovery = true
 ) {
     const messages = roomMessages(room);
     const projectedMessages = projectedTimelineMessages(messages, previous);
@@ -2140,6 +2495,28 @@ function injectRoomTimeline(
     };
     setProjectionIndexes(injected, projectedMessages);
 
+    const rawMessages = newestFirstRawMessages(projectedMessages, injected);
+    FluxDispatcher.dispatch({
+        type: "LOAD_MESSAGES_SUCCESS",
+        channelId,
+        // Discord's gateway/API payload is newest-first; its store reverses
+        // this list into display order. Matrix timelines are oldest-first.
+        messages: rawMessages,
+        isBefore: false,
+        isAfter: false,
+        jump: injected.isolatedContext ? injected.contextTargetMessageId ?? null : null,
+        hasMoreBefore: injected.isolatedContext ? false : !roomHistoryById.get(room.roomId)?.end,
+        hasMoreAfter: false,
+        isStale: false,
+        truncate: false,
+        avoidInitialScroll: Boolean(injected.isolatedContext),
+    });
+
+    // Commit renderer projection indexes only after Discord accepted the
+    // strictly-ordered payload. A reducer invariant must leave the previous
+    // timeline/read state intact instead of creating a split brain.
+    roomsByChannel.set(channelId, injected);
+    injectedChannelIds.add(channelId);
     const nextMessageIds = new Set(injected.eventIds.keys());
     for (const oldMessageId of previous?.eventIds.keys() ?? []) {
         if (!nextMessageIds.has(oldMessageId)) {
@@ -2150,25 +2527,13 @@ function injectRoomTimeline(
             });
         }
     }
-
-    roomsByChannel.set(channelId, injected);
-    injectedChannelIds.add(channelId);
-
-    FluxDispatcher.dispatch({
-        type: "LOAD_MESSAGES_SUCCESS",
-        channelId,
-        // Discord's gateway/API payload is newest-first; its store reverses
-        // this list into display order. Matrix timelines are oldest-first.
-        messages: [...projectedMessages].reverse().map(message => toRawMessage(message, injected)),
-        isBefore: false,
-        isAfter: false,
-        jump: injected.isolatedContext ? injected.contextTargetMessageId ?? null : null,
-        hasMoreBefore: injected.isolatedContext ? false : !roomHistoryById.get(room.roomId)?.end,
-        hasMoreAfter: false,
-        isStale: false,
-        truncate: false,
-        avoidInitialScroll: Boolean(injected.isolatedContext),
-    });
+    const storeReady = (MessageStore as any).isReady?.(channelId);
+    const accepted = rawMessages.length === 0
+        || storeReady !== false && Boolean(MessageStore.getMessage(channelId, rawMessages[0].id));
+    if (!accepted && scheduleRecovery && rawMessages[0]) {
+        scheduleMessageStoreConvergence(injected, rawMessages[0].id);
+    }
+    return accepted;
 }
 
 function reinjectRoomTimelines(roomId: string) {
@@ -2228,6 +2593,10 @@ export function applySnapshot(
         roomHistoryById.clear();
         mediaFocusEventIdsByRoom.clear();
         messageIdsByEventId.clear();
+        orderedMessageIdsByRoom.clear();
+        provisionalContextEventIdsByRoom.clear();
+        messageIdOwners.clear();
+        matrixUnreadFloorByRoom.clear();
         reservedReplyEventIds.clear();
         reservedReplyTargets.clear();
         eventIdsByTransaction.clear();
@@ -2276,6 +2645,7 @@ export function applySnapshot(
     for (const roomId of roomHistoryById.keys()) {
         if (!joinedRoomIds.has(roomId)) {
             roomHistoryById.delete(roomId);
+            clearRoomMessageOrder(roomId);
             mediaFocusEventIdsByRoom.delete(roomId);
             const pendingReceipt = pendingReceiptsByRoom.get(roomId);
             if (pendingReceipt) clearTimeout(pendingReceipt.timer);
@@ -2405,13 +2775,12 @@ export function applySnapshot(
     }
 
     for (const projection of projections) {
-        syncProjectionUnread(projection.channelId, projection.room);
         const previous = previousRooms.get(projection.channelId);
         const projectedTimelineRoom = previous?.isolatedContext
             ? projectedRoom(projection.room, roomMessages(previous.room))
             : projection.room;
         if (!previous || !timelineRoomIds || timelineRoomIds.has(projection.room.roomId)) {
-            injectRoomTimeline(
+            const accepted = injectRoomTimeline(
                 projectedTimelineRoom,
                 snapshot,
                 projection.channelId,
@@ -2421,6 +2790,12 @@ export function applySnapshot(
                 projection.parentSpaceId,
                 projection.channelPosition
             );
+            if (accepted) {
+                syncProjectionUnread(projection.channelId, projectedTimelineRoom, projection.guildId);
+                if (!projection.guildId) {
+                    FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel: projection.channel });
+                }
+            }
         } else {
             roomsByChannel.set(projection.channelId, {
                 ...previous,
@@ -2432,6 +2807,7 @@ export function applySnapshot(
                 selfMatrixId: accountUserId(snapshot),
             });
             injectedChannelIds.add(projection.channelId);
+            syncProjectionUnread(projection.channelId, projectedTimelineRoom, projection.guildId);
         }
     }
 
@@ -2506,10 +2882,11 @@ function loadProjectionMessages(
     setProjectionIndexes(injected, projectedRoomMessages);
     const projectedMessages = projectedRoomMessages.filter(message =>
         message.target.eventIds.some(eventId => pageEventIds.has(eventId)));
+    const rawMessages = newestFirstRawMessages(projectedMessages, injected);
     FluxDispatcher.dispatch({
         type: "LOAD_MESSAGES_SUCCESS",
         channelId: injected.channelId,
-        messages: [...projectedMessages].reverse().map(message => toRawMessage(message, injected)),
+        messages: rawMessages,
         isBefore,
         isAfter,
         jump,
@@ -2519,6 +2896,106 @@ function loadProjectionMessages(
         truncate: false,
         avoidInitialScroll: isBefore,
     });
+    const accepted = rawMessages.length === 0
+        || (MessageStore as any).isReady?.(injected.channelId) !== false
+            && Boolean(MessageStore.getMessage(injected.channelId, rawMessages[0].id));
+    if (!accepted && rawMessages[0]) {
+        scheduleMessageStoreConvergence(injected, rawMessages[0].id);
+    }
+    return accepted;
+}
+
+function projectionHasMessage(channelId: string, messageId: string) {
+    return Boolean(MessageStore.getMessage(channelId, messageId));
+}
+
+function publishConvergedUnread(injected: InjectedRoom) {
+    syncProjectionUnread(injected.channelId, injected.room, injected.guildId);
+    if (!injected.guildId && latestSnapshot) {
+        FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel: projectionChannelRecord(injected, latestSnapshot) });
+    }
+}
+
+function queueMessageStoreConvergence(state: MessageStoreConvergence, delay = 0) {
+    if (state.timer || state.generation !== pollGeneration) return;
+    state.timer = setTimeout(() => {
+        state.timer = undefined;
+        convergeMessageStore(state);
+    }, delay);
+}
+
+function scheduleMessageStoreConvergence(
+    injected: InjectedRoom,
+    messageId: string
+) {
+    let state = messageStoreConvergenceByChannel.get(injected.channelId);
+    if (state && (state.generation !== pollGeneration || state.roomId !== injected.room.roomId)) {
+        if (state.timer) clearTimeout(state.timer);
+        messageStoreConvergenceByChannel.delete(injected.channelId);
+        state = undefined;
+    }
+    if (!state) {
+        state = {
+            generation: pollGeneration,
+            roomId: injected.room.roomId,
+            channelId: injected.channelId,
+            targets: new Set(),
+            attempts: 0,
+        };
+        messageStoreConvergenceByChannel.set(injected.channelId, state);
+    }
+    state.targets.add(messageId);
+    queueMessageStoreConvergence(state);
+}
+
+function convergeMessageStore(state: MessageStoreConvergence) {
+    if (!bridgeActive || state.generation !== pollGeneration
+        || messageStoreConvergenceByChannel.get(state.channelId) !== state) return;
+    const injected = roomsByChannel.get(state.channelId);
+    if (!injected || injected.room.roomId !== state.roomId) {
+        messageStoreConvergenceByChannel.delete(state.channelId);
+        return;
+    }
+
+    for (const messageId of [...state.targets]) {
+        if (projectionHasMessage(state.channelId, messageId)) {
+            if (canAcknowledgeProjectedMessage(state.channelId, messageId)) {
+                void matrixReceipt(state.channelId, messageId);
+            }
+            state.targets.delete(messageId);
+        } else if (!injected.eventIds.has(messageId)) {
+            state.targets.delete(messageId);
+        }
+    }
+    if (!state.targets.size) {
+        messageStoreConvergenceByChannel.delete(state.channelId);
+        publishConvergedUnread(injected);
+        return;
+    }
+
+    const ready = (MessageStore as any).isReady?.(state.channelId) !== false;
+    if (ready) {
+        try {
+            // MESSAGE_CREATE has already fired exactly once. Recovery is a
+            // bounded full LOAD so notification and dependent reducers cannot
+            // observe a duplicate gateway event.
+            injectRoomTimeline(
+                injected.room,
+                latestSnapshot!,
+                injected.channelId,
+                injected,
+                injected.guildId,
+                injected.parentId,
+                injected.parentSpaceId,
+                injected.channelPosition,
+                false
+            );
+        } catch (error) {
+            logger.warn("Matrix message-store convergence LOAD failed", error);
+        }
+    }
+    state.attempts++;
+    queueMessageStoreConvergence(state, Math.min(2_000, 25 * (2 ** Math.min(state.attempts, 7))));
 }
 
 function snapshotRoom(roomId: string) {
@@ -2531,29 +3008,16 @@ function projectedRoom(room: MatrixRoomDto, messages: MatrixMessageDto[]): Matri
 
 function applyDeltaUnread(
     projections: InjectedRoom[],
-    message: MatrixMessageDto,
-    wasProjected: boolean,
     lastMessageId: string
 ) {
-    if (wasProjected) return;
-    const selectedChannelId = SelectedChannelStore.getChannelId();
-    const shouldMarkUnread = message.senderId !== accountUserId(latestSnapshot!)
-        && !message.pending
-        && !projections.some(projection => projection.channelId === selectedChannelId);
     for (const projection of projections) {
-        const current = matrixUnreadByChannel.get(projection.channelId) ?? {
-            unreadCount: 0,
-            highlightCount: 0,
-            lastMessageId: null,
-        };
-        matrixUnreadByChannel.set(projection.channelId, {
-            ...current,
-            unreadCount: current.unreadCount + (shouldMarkUnread ? 1 : 0),
-            lastMessageId,
-        });
+        const current = roomsByChannel.get(projection.channelId) ?? projection;
+        if (!projectionHasMessage(current.channelId, lastMessageId)) continue;
+        syncProjectionUnread(current.channelId, current.room, current.guildId);
+        if (!current.guildId && latestSnapshot) {
+            FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel: projectionChannelRecord(current, latestSnapshot) });
+        }
     }
-    matrixUnreadRevision++;
-    (ReadStateStore as any).emitChange?.();
 }
 
 function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInsert = true) {
@@ -2627,9 +3091,6 @@ function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInser
     const primary = projections.find(injected => injected.channelId === activeMatrixChannelId)
         ?? projections.find(injected => injected.guildId === SelectedGuildStore.getGuildId())
         ?? projections[0];
-    const eventWasProjected = projections.some(injected =>
-        injected.messageIds.has(message.eventId)
-        || Boolean(replacedEventId && injected.messageIds.has(replacedEventId)));
     const snapshotMessages = roomMessages(room);
     const snapshotIndex = snapshotMessages.findIndex(candidate => candidate.eventId === message.eventId);
     const replacedSnapshotIndex = replacedEventId
@@ -2639,9 +3100,10 @@ function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInser
     else if (replacedSnapshotIndex !== -1) snapshotMessages[replacedSnapshotIndex] = message;
     else snapshotMessages.push(message);
     const nextRoom = { ...room, messages: snapshotMessages.slice(-5_000), timeline: undefined };
-    updateLatestSnapshotRoom(nextRoom);
     const history = mergeRoomHistory(roomId, [message], { placement: "after" });
-    const nextProjectedRoom = projectedRoom(nextRoom, history.messages);
+    const canonicalNextRoom = projectedRoom(nextRoom, history.messages.slice(-5_000));
+    updateLatestSnapshotRoom(canonicalNextRoom);
+    const nextProjectedRoom = projectedRoom(canonicalNextRoom, history.messages);
     if (validAttachmentGroup(message)) {
         const groupUpdates = projections.map(projection => {
             const projectionRoom = projection.isolatedContext
@@ -2667,8 +3129,6 @@ function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInser
         }
         applyDeltaUnread(
             projections,
-            message,
-            eventWasProjected,
             groupUpdates[0]?.projected.messageId
                 ?? projectedTimelineMessages(history.messages)
                     .find(projected => projected.target.eventIds.includes(message.eventId))?.messageId
@@ -2722,6 +3182,11 @@ function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInser
                 message: raw,
                 optimistic: Boolean(projected.message.pending),
             });
+            // Emit the gateway-style action exactly once for notifications,
+            // sorting, and dependent stores. If MessageStore was unready or
+            // dropped it, convergence repairs with a full LOAD, never a second
+            // CREATE (which would duplicate notifications).
+            scheduleMessageStoreConvergence(next, projected.messageId);
         } else {
             loadProjectionMessages(next, [message], { isAfter: true });
         }
@@ -2732,8 +3197,6 @@ function applyMessageDelta(roomId: string, message: MatrixMessageDto, allowInser
 
     applyDeltaUnread(
         projections,
-        message,
-        wasProjected,
         projectionUpdates[0]?.projected.messageId ?? messageId
     );
 
@@ -2806,7 +3269,7 @@ function applyReactionDelta(roomId: string, eventId: string, reactions: MatrixRe
     const room = snapshotRoom(roomId);
     const message = roomHistoryById.get(roomId)?.messages.find(candidate => candidate.eventId === eventId)
         ?? roomMessages(room ?? { roomId }).find(candidate => candidate.eventId === eventId);
-    if (message) applyMessageDelta(roomId, { ...message, reactions });
+    if (message) applyMessageDelta(roomId, { ...message, reactions }, false);
 }
 
 function applyRoomDelta(room: MatrixRoomDto) {
@@ -2945,14 +3408,25 @@ async function pollEvents(generation: number) {
             if (!event) continue;
             const previousCursor = eventCursor;
             const nextCursor = Number(event.seq ?? eventCursor);
-            eventCursor = Math.max(eventCursor, nextCursor);
+            if (!Number.isSafeInteger(nextCursor) || nextCursor < 0) {
+                throw new Error("Matrix event has an invalid sequence number");
+            }
             if (event.type === "snapshot" && event.snapshot) {
                 applySnapshot(event.snapshot, undefined, Number.isSafeInteger(nextCursor) && nextCursor > previousCursor + 1);
             }
             else if (event.type === "room" && event.room) applyRoomDelta(event.room);
-            else if (event.type === "message" && event.message) applyMessageDelta(event.roomId, event.message);
+            else if (event.type === "message" && event.message) {
+                applyMessageDelta(event.roomId, {
+                    ...event.message,
+                    previousEventId: event.previousEventId,
+                    nextEventId: event.nextEventId,
+                });
+            }
             else if (event.type === "edit" && event.message) applyMessageDelta(event.roomId, event.message, false);
-            else if (event.type === "edit") continue;
+            else if (event.type === "edit") {
+                // A redacted/unsupported edit has no renderer mutation, but it
+                // is still intentionally consumed after native validation.
+            }
             else if (event.type === "redact") applyRedactionDelta(event.roomId, event.eventId);
             else if (event.type === "reaction") applyReactionDelta(event.roomId, event.eventId, event.reactions ?? []);
             else if (event.type === "typing") updateTypingUsers(event.roomId, event.userIds ?? []);
@@ -2962,13 +3436,19 @@ async function pollEvents(generation: number) {
                 if ((event.status?.state === "error" && statusErrorCode != null
                     && WORKER_RECOVERY_ERRORS.has(statusErrorCode))
                     || (event.status?.state === "stopped" && event.status?.account)) {
+                    eventCursor = Math.max(eventCursor, nextCursor);
                     scheduleBridgeReconnect(generation);
                     return;
                 }
-                continue;
             }
-            else if (event.type === "receipt") continue;
+            else if (event.type === "receipt") {
+                // Receipt events are intentionally represented by the SDK
+                // unread snapshot; there is no renderer row mutation here.
+            }
             else await refreshSnapshot();
+            // Commit only after the renderer/store application above succeeds.
+            // A thrown projection must be replayable after reconnect.
+            eventCursor = Math.max(eventCursor, nextCursor);
         } catch (error) {
             if (generation !== pollGeneration) return;
             logger.warn("Matrix event poll failed", error);
@@ -2985,7 +3465,7 @@ async function connectBridge(
     routePreference?: Promise<MatrixRoutePreference | undefined>
 ) {
     try {
-        const snapshot = await Native.start() as MatrixSnapshotDto;
+        const snapshot = await Native.start(eventCursor) as MatrixSnapshotDto;
         if (!bridgeActive || generation !== pollGeneration) return;
         const startupStatusError = snapshot.status?.state === "error" ? snapshot.status.error : undefined;
         const startupErrorCode = matrixErrorCode(startupStatusError);
@@ -2993,14 +3473,16 @@ async function connectBridge(
         clearReconnectTimer();
         if (snapshot.status?.state === "ready") reconnectAttempt = 0;
         const snapshotSequence = Number(snapshot.seq);
-        if (Number.isSafeInteger(snapshotSequence) && snapshotSequence >= 0) {
-            eventCursor = Math.max(eventCursor, snapshotSequence);
-        }
         // Chronological SDK local echoes are process-local and are not restored
         // by a fresh worker. Keeping them across a worker restart creates an
         // undismissable sending/failed ghost. A queue-gap reset uses the same
         // worker and still preserves its valid local echoes.
         applySnapshot(snapshot, undefined, recovering, !recovering);
+        if (Number.isSafeInteger(snapshotSequence) && snapshotSequence >= 0) {
+            // As with incremental events, do not advance beyond a snapshot
+            // until every renderer projection accepted it without throwing.
+            eventCursor = Math.max(eventCursor, snapshotSequence);
+        }
         if (routePreference) {
             const preference = await routePreference;
             if (!bridgeActive || generation !== pollGeneration) return;
@@ -3039,11 +3521,30 @@ export async function startBridge() {
     await connectBridge(generation, false, selectedAtStart, routePreference);
 }
 
+export function reapplyMatrixProjectionAfterConnectionOpen(restartIfMissing = true) {
+    const generation = pollGeneration;
+    connectionProjectionRestartIfMissing ||= restartIfMissing;
+    if (connectionProjectionGeneration === generation) return;
+    connectionProjectionGeneration = generation;
+    FluxDispatcher.wait(() => {
+        if (connectionProjectionGeneration !== generation) return;
+        connectionProjectionGeneration = undefined;
+        const shouldRestart = connectionProjectionRestartIfMissing;
+        connectionProjectionRestartIfMissing = false;
+        if (!bridgeActive || generation !== pollGeneration) return;
+        const snapshot = getLatestSnapshot();
+        if (snapshot) applySnapshot(snapshot);
+        else if (shouldRestart) void restartBridge(false);
+    });
+}
+
 export function stopBridge() {
     bridgeActive = false;
     pollGeneration++;
     clearReconnectTimer();
     reconnectAttempt = 0;
+    connectionProjectionGeneration = undefined;
+    connectionProjectionRestartIfMissing = false;
     latestSnapshot = undefined;
     for (const modalKey of [...matrixSearchModalKeys]) closeModal(modalKey);
     matrixSearchModalKeys.clear();
@@ -3061,6 +3562,14 @@ export function stopBridge() {
     roomHistoryById.clear();
     mediaFocusEventIdsByRoom.clear();
     messageIdsByEventId.clear();
+    orderedMessageIdsByRoom.clear();
+    provisionalContextEventIdsByRoom.clear();
+    messageIdOwners.clear();
+    matrixUnreadFloorByRoom.clear();
+    for (const convergence of messageStoreConvergenceByChannel.values()) {
+        if (convergence.timer) clearTimeout(convergence.timer);
+    }
+    messageStoreConvergenceByChannel.clear();
     reservedReplyEventIds.clear();
     reservedReplyTargets.clear();
     eventIdsByTransaction.clear();
@@ -3226,9 +3735,8 @@ function containsSyntheticId(value: unknown, depth = 0): boolean {
 function oldestProjectedUnreadMessageId(channelId: string, unreadCount: number) {
     const injected = roomsByChannel.get(channelId);
     if (!injected || !unreadCount) return null;
-    const messages = roomMessages(injected.room);
-    const message = messages[Math.max(0, messages.length - unreadCount)];
-    return message ? messageSyntheticId(message.eventId, message.timestamp) : null;
+    const messages = projectedTimelineMessages(roomMessages(injected.room), injected);
+    return messages[Math.max(0, messages.length - unreadCount)]?.messageId ?? null;
 }
 
 export function installReadStateProjection() {
@@ -3314,6 +3822,7 @@ export function removeReadStateProjection() {
     for (const [name, original] of originalReadStateMethods) store[name] = original;
     originalReadStateMethods.clear();
     matrixUnreadByChannel.clear();
+    matrixUnreadFloorByRoom.clear();
     matrixUnreadRevision++;
     store.emitChange?.();
 }
@@ -5122,6 +5631,7 @@ export function openMatrixSearchResult(result: MatrixMessageSearchResultDTO) {
         && !projections.some(projection => !projection.isolatedContext
             && projection.messageIds.has(result.message.eventId));
     const contextMessages = [...result.before, result.message, ...result.after] as MatrixMessageDto[];
+    if (useIsolatedContext) markProvisionalContextMessages(result.roomId, contextMessages);
     const history = useIsolatedContext ? undefined : mergeRoomHistory(result.roomId, contextMessages);
     const roomWithContext = projectedRoom(room, history?.messages ?? contextMessages);
     focusRoomMedia(result.roomId, [
@@ -5477,8 +5987,9 @@ async function flushMatrixReceipt(roomId: string) {
     if (!pending) return;
     pendingReceiptsByRoom.delete(roomId);
     clearTimeout(pending.timer);
+    if (!canAcknowledgeProjectedMessage(pending.channelId, pending.messageId)) return;
     const position = receiptPosition(roomId, pending.eventId);
-    if (!position) return;
+    if (!position || position.index !== position.latestIndex) return;
     const previousEventId = lastReceiptEventByRoom.get(roomId);
     const previousPosition = previousEventId ? receiptPosition(roomId, previousEventId) : undefined;
     if (previousEventId === pending.eventId
@@ -5490,7 +6001,12 @@ async function flushMatrixReceipt(roomId: string) {
         // room's unread badges unless this receipt still targets the newest
         // visible remote message after the async homeserver call completes.
         const currentPosition = receiptPosition(roomId, pending.eventId);
-        if (!currentPosition || currentPosition.index !== currentPosition.latestIndex) return;
+        if (!currentPosition || currentPosition.index !== currentPosition.latestIndex
+            || !projectionHasMessage(pending.channelId, pending.messageId)) return;
+        const floor = roomUnreadFloor(roomId);
+        floor.unreadCount = 0;
+        floor.highlightCount = 0;
+        floor.acknowledgedMessageId = pending.messageId;
         let changed = false;
         for (const injected of roomsByChannel.values()) {
             if (injected.room.roomId !== roomId) continue;
@@ -5529,12 +6045,12 @@ function receiptPosition(roomId: string, eventId: string): { index: number; late
 export async function matrixReceipt(channelId: string, messageId: string) {
     const injected = roomsByChannel.get(channelId);
     const target = injected?.messageTargets.get(messageId);
-    if (!injected || !target) return;
+    if (!injected || !target || !canAcknowledgeProjectedMessage(channelId, messageId)) return;
     const eventId = [...target.eventIds].reverse().find(validRemoteEventId);
     if (!eventId) return;
     const { roomId } = injected.room;
     const position = receiptPosition(roomId, eventId);
-    if (!position) return;
+    if (!position || position.index !== position.latestIndex) return;
     const lastEventId = lastReceiptEventByRoom.get(roomId);
     const lastPosition = lastEventId ? receiptPosition(roomId, lastEventId) : undefined;
     if (lastEventId === eventId || lastPosition && position.index <= lastPosition.index) return;
@@ -5545,9 +6061,19 @@ export async function matrixReceipt(channelId: string, messageId: string) {
         clearTimeout(previous.timer);
     }
     pendingReceiptsByRoom.set(roomId, {
+        channelId,
+        messageId,
         eventId,
         timer: setTimeout(() => void flushMatrixReceipt(roomId), 750),
     });
+}
+
+function canAcknowledgeProjectedMessage(channelId: string, messageId: string) {
+    return SelectedChannelStore.getChannelId() === channelId
+        && typeof document !== "undefined"
+        && document.visibilityState === "visible"
+        && document.hasFocus()
+        && Boolean(MessageStore.getMessage(channelId, messageId));
 }
 
 function requestedJumpMessageId(request: any): string | null | undefined {
@@ -5590,19 +6116,20 @@ function loadMatrixMessageContext(
     const injected = roomsByChannel.get(channelId);
     if (!injected || !latestSnapshot || context.roomId !== injected.room.roomId
         || context.message.roomId !== injected.room.roomId) return false;
+    const reserved = reservedReplyTargets.get(`${channelId}\0${requestedMessageId}`);
+    if (reserved && (reserved.roomId !== context.roomId || reserved.eventId !== context.message.eventId)) return false;
 
     const contextMessages = [...context.before, context.message, ...context.after] as MatrixMessageDto[];
+    markProvisionalContextMessages(context.roomId, contextMessages);
     const room = snapshotRoom(injected.room.roomId) ?? injected.room;
     const roomWithContext = projectedRoom(room, contextMessages);
-    const targetMessageId = messageSyntheticId(context.message.eventId, context.message.timestamp, true);
-    // The reserved snowflake is the capability binding between the native
-    // Discord reply row and this exact Matrix event. Never substitute another
-    // ID returned through a generic fetch request.
-    if (targetMessageId !== requestedMessageId) return false;
-
     const next = updateProjectionRoom(injected, roomWithContext);
     const projectedTarget = next.projectedMessagesByEventId.get(context.message.eventId);
     if (!projectedTarget) return false;
+    // `requestedMessageId` remains an opaque capability bound by
+    // reservedReplyTargets. Once the event materializes, the ordered allocator
+    // may safely replace that provisional ID; every reply reference and the
+    // jump below are rebuilt atomically from the canonical row ID.
     next.isolatedContext = true;
     next.contextTargetMessageId = projectedTarget.messageId;
     loadProjectionMessages(next, contextMessages, {

@@ -7,6 +7,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { parseFxTwitterStatus, validXPreviewMediaCache } from "../src/plugins/matrixBridge/xPreview";
+
 const backend = readFileSync("src/plugins/matrixBridge/matrixBackend.ts", "utf8");
 const bridge = readFileSync("src/plugins/matrixBridge/bridge.ts", "utf8");
 const index = readFileSync("src/plugins/matrixBridge/index.tsx", "utf8");
@@ -16,6 +18,7 @@ const settings = readFileSync("src/plugins/matrixBridge/settings.tsx", "utf8");
 const types = readFileSync("src/plugins/matrixBridge/types.ts", "utf8");
 const workerPreload = readFileSync("src/plugins/matrixBridge/workerPreload.ts", "utf8");
 const workerProtocol = readFileSync("src/plugins/matrixBridge/workerProtocol.ts", "utf8");
+const xPreview = readFileSync("src/plugins/matrixBridge/xPreview.ts", "utf8");
 
 function section(source: string, start: string, end: string): string {
     const startIndex = source.indexOf(start);
@@ -124,7 +127,7 @@ assert.match(securePreview, /!message\.eventId\.startsWith\("\$"\)/u);
 // Freeze the exact provider origins. Equality checks (rather than suffix
 // matching) reject credential tricks, lookalike hosts, and subdomain smuggling.
 const klipyHosts = section(backend, "const KLIPY_MEDIA_HOSTS", "const TENOR_MEDIA_HOSTS");
-const tenorHosts = section(backend, "const TENOR_MEDIA_HOSTS", "const X_POSTER_HOST");
+const tenorHosts = section(backend, "const TENOR_MEDIA_HOSTS", "const MAX_DISCORD_STICKER_BYTES");
 const socialHosts = section(backend, "const PROJECTED_SOCIAL_HOSTS", "const FIRST_HTTP_URL");
 assert.deepEqual(quotedValues(klipyHosts), ["static.klipy.com", "static2.klipy.com"]);
 assert.deepEqual(quotedValues(tenorHosts), ["media.tenor.com", "media1.tenor.com"]);
@@ -155,7 +158,7 @@ assert.match(xApi, /url: `https:\/\/api\.fxtwitter\.com\/2\/status\/\$\{match\[1
 assert.match(xApi, /statusId: match\[1\]/u);
 
 const klipyMedia = section(backend, "function klipyMediaUrl(", "async function fetchKlipyGif(");
-const xPoster = section(backend, "function xPosterUrl(", "async function fetchXPoster(");
+const xPoster = section(xPreview, "export function xPosterUrl(", "export function xVideoUrl(");
 const tenorMedia = section(backend, "function tenorMediaUrl(", "async function fetchTenorMedia(");
 assert.match(klipyMedia, /!KLIPY_MEDIA_HOSTS\.has\(url\.hostname\)/u);
 assert.match(klipyMedia, /endsWith\("\.gif"\)/u);
@@ -165,7 +168,7 @@ assert.match(xPoster, /name === "format"[\s\S]*name === "name"/u);
 assert.match(tenorMedia, /!TENOR_MEDIA_HOSTS\.has\(url\.hostname\)/u);
 assert.match(tenorMedia, /\^\\\/m\\\//u);
 assert.match(tenorMedia, /gif\|webp\|mp4/u);
-const xVideo = section(backend, "function xVideoUrl(", "function previewText(");
+const xVideo = section(xPreview, "export function xVideoUrl(", "function imageMime(");
 assert.match(xVideo, /url\.hostname !== "video\.twimg\.com"/u);
 assert.match(xVideo, /endsWith\("\.mp4"\)/u);
 
@@ -230,23 +233,28 @@ assertOrdered(urlPreview, [
 for (const constructor of ["klipyUrlPreview", "tenorUrlPreview", "xUrlPreview"]) {
     assert.match(urlPreview, new RegExp(constructor, "u"));
 }
-const xConstructor = section(backend, "function fxTwitterRecord(", "async function tenorUrlPreview(");
+const xConstructor = section(backend, "async function xUrlPreview(", "async function tenorUrlPreview(");
 for (const contract of [
     /fetchXStatus\(request\.url\)/u,
     /JSON\.parse\(raw\)/u,
-    /response\?\.code !== 200/u,
-    /status\?\.type !== "status"/u,
-    /status\.id !== request\.statusId/u,
-    /status\.provider !== "twitter"/u,
-    /status\.embed_card !== "player"/u,
-    /videos\.length === 0 \|\| videos\.length > 16/u,
-    /candidate\.type !== "video" \|\| candidate\.format !== "video\/mp4"/u,
-    /xVideoUrl\(candidate\.url\)/u,
-    /xPosterUrl\(candidate\.thumbnail_url\)/u,
-    /previewDimensions\(candidate\.width, candidate\.height\)/u,
+    /parseFxTwitterStatus\(response, request\.statusId\)/u,
+    /provider: \{ name: "X" \}/u,
+    /imageUrl: parsed\.image\?\.url/u,
+    /videoUrl: parsed\.video\?\.url/u,
     /url: sourceUrl/u
 ]) {
     assert.match(xConstructor, contract, `FxTwitter v2 schema contract is missing ${contract}`);
+}
+for (const contract of [
+    /"tweet", "summary", "summary_large_image", "player"/u,
+    /photos\.length > 4/u,
+    /videos\.length > 16/u,
+    /candidate\.type !== "photo" && candidate\.type !== "gif"/u,
+    /candidate\.type !== "video" && candidate\.type !== "gif"/u,
+    /xPosterUrl\(candidate\.url\)/u,
+    /xVideoUrl\(candidate\.url\)/u
+]) {
+    assert.match(xPreview, contract, `bounded X parser contract is missing ${contract}`);
 }
 const previewDto = section(types, "export interface MatrixUrlPreviewDTO", "export interface MatrixReactionDTO");
 assert.doesNotMatch(previewDto, /imageUrl|videoUrl|fxtwitter|twimg|klipy|tenor/iu,
@@ -257,7 +265,7 @@ assert.doesNotMatch(bridge, /projectSocialUrl|projectMatrixContent|api\.fxtwitte
 // Revocation invalidates cached authority, aborts both worker fetch and native
 // provider document requests, and refreshes both renderer surfaces.
 const directCacheValidator = section(backend, "function validDirectPreviewCache(", "async function downloadMedia(");
-for (const validator of ["klipyShareUrl", "klipyMediaUrl", "tenorShareUrl", "tenorMediaUrl", "xStatusApiUrl", "xPosterUrl", "xVideoUrl"]) {
+for (const validator of ["klipyShareUrl", "klipyMediaUrl", "tenorShareUrl", "tenorMediaUrl", "xStatusApiUrl", "validXPreviewMediaCache"]) {
     assert.match(directCacheValidator, new RegExp(validator, "u"));
 }
 const workerDownload = section(backend, "async function downloadMedia(", "function updateProviderPreviewPolicy(");
@@ -347,5 +355,89 @@ assert.match(nativeXHandler, /requestProviderPreview\(url, "json"\)/u);
 for (const sensitivePath of [providerBackend, providerRequest, providerNativeHandlers, nativePolicy]) {
     assert.doesNotMatch(sensitivePath, /\b(?:console|logger)\./u);
 }
+
+const xStatusId = "2040059770237849635";
+const xResponse = (embedCard: string, media: Record<string, unknown> = {}) => ({
+    code: 200,
+    status: {
+        type: "status",
+        id: xStatusId,
+        provider: "twitter",
+        embed_card: embedCard,
+        author: { type: "profile", screen_name: "matrix_test", name: "Matrix Test" },
+        text: "A bounded X preview",
+        media
+    }
+});
+const textOnly = parseFxTwitterStatus(xResponse("tweet"), xStatusId);
+assert.equal(textOnly?.title, "Matrix Test (@matrix_test)");
+assert.equal(textOnly?.description, "A bounded X preview");
+assert.equal(textOnly?.image, undefined);
+assert.equal(textOnly?.video, undefined);
+
+const photoUrl = "https://pbs.twimg.com/media/HE-_ijrXYAA_Wiq.jpg?name=orig";
+const imageOnly = parseFxTwitterStatus(xResponse("summary_large_image", {
+    photos: [{ type: "photo", url: photoUrl, width: 5_568, height: 3_712, format: "jpg" }]
+}), xStatusId);
+assert.deepEqual(imageOnly?.image, {
+    url: photoUrl,
+    mimeType: "image/jpeg",
+    width: 5_568,
+    height: 3_712
+});
+assert.equal(imageOnly?.video, undefined);
+const gifPoster = parseFxTwitterStatus(xResponse("summary", {
+    photos: [{ type: "gif", url: photoUrl, width: 1_200, height: 800, format: "jpg" }]
+}), xStatusId);
+assert.equal(gifPoster?.image?.url, photoUrl, "GIF photo entries may expose only a validated still poster");
+assert.equal(gifPoster?.video, undefined);
+
+const posterUrl = "https://pbs.twimg.com/ext_tw_video_thumb/2040059770237849635/pu/img/poster.jpg?name=orig";
+const videoUrl = "https://video.twimg.com/ext_tw_video/2040059770237849635/pu/vid/1280x720/video.mp4";
+const video = parseFxTwitterStatus(xResponse("player", {
+    photos: [{ type: "photo", url: photoUrl, width: 1_200, height: 800, format: "jpg" }],
+    videos: [{
+        type: "video",
+        format: "video/mp4",
+        url: videoUrl,
+        thumbnail_url: posterUrl,
+        width: 1_280,
+        height: 720
+    }]
+}), xStatusId);
+assert.equal(video?.image?.url, posterUrl, "valid video poster must win over a photo");
+assert.equal(video?.video?.url, videoUrl);
+const animatedGif = parseFxTwitterStatus(xResponse("player", {
+    videos: [{
+        type: "gif",
+        format: "video/mp4",
+        url: videoUrl,
+        thumbnail_url: posterUrl,
+        width: 1_280,
+        height: 720
+    }]
+}), xStatusId);
+assert.equal(animatedGif?.video?.url, videoUrl, "animated X GIFs must use their bounded MP4 rendition");
+assert.equal(parseFxTwitterStatus({
+    ...xResponse("tweet"),
+    status: { ...xResponse("tweet").status, author: { screen_name: "matrix_test" } }
+}, xStatusId), undefined, "the required profile author type must be exact");
+assert.equal(parseFxTwitterStatus(xResponse("unknown"), xStatusId), undefined);
+assert.equal(parseFxTwitterStatus(xResponse("tweet", { photos: Array(5).fill({}) }), xStatusId), undefined);
+assert.equal(parseFxTwitterStatus(xResponse("tweet", { videos: Array(17).fill({}) }), xStatusId), undefined);
+assert.equal(parseFxTwitterStatus(xResponse("summary", {
+    photos: [{ type: "photo", url: "https://evil.example/media/a.jpg", width: 100, height: 100, format: "jpg" }]
+}), xStatusId)?.image, undefined, "an external media host must fall back to the safe text card");
+
+assert.equal(validXPreviewMediaCache({ hasImage: false, hasVideo: false }), true);
+assert.equal(validXPreviewMediaCache({ imageUrl: photoUrl, hasImage: true, hasVideo: false }), true);
+assert.equal(validXPreviewMediaCache({
+    imageUrl: posterUrl,
+    videoUrl,
+    hasImage: true,
+    hasVideo: true
+}), true);
+assert.equal(validXPreviewMediaCache({ imageUrl: photoUrl, hasImage: false, hasVideo: false }), false);
+assert.equal(validXPreviewMediaCache({ videoUrl, hasImage: false, hasVideo: true }), false);
 
 console.log("Matrix provider preview privacy fixtures passed.");

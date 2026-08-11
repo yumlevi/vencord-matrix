@@ -63,6 +63,10 @@ for (const patchedDiscordConverter of [
     assert.doesNotMatch(patchedDiscordConverter, /D\(e\.reactions\?\?t\.reactions\)/u);
     assert.match(patchedDiscordConverter, /deleted:e\.deleted, editHistory:e\.editHistory/u);
 }
-assert.match(bridge, /function applyReactionDelta[\s\S]+applyMessageDelta\(roomId, \{ \.\.\.message, reactions \}\)/u);
+assert.match(
+    bridge,
+    /function applyReactionDelta[\s\S]+applyMessageDelta\(roomId, \{ \.\.\.message, reactions \}, false\)/u,
+    "reaction-only projection updates must not be treated as new live messages"
+);
 
 console.log("Matrix Discord reaction projection fixtures passed.");

@@ -40,11 +40,9 @@ import {
 import {
     activateMatrixChannel,
     addMatrixReaction,
-    applySnapshot,
     deleteMatrixMessage,
     editMatrixMessage,
     fetchMatrixMessages,
-    getLatestSnapshot,
     getMatrixAccessRequestContext,
     getMatrixCategoryCreateContext,
     getMatrixGroupChatCreateContext,
@@ -64,6 +62,7 @@ import {
     matrixReceipt,
     matrixTyping,
     openMatrixPrivateChannel,
+    reapplyMatrixProjectionAfterConnectionOpen,
     removeMatrixReaction,
     removeReadStateProjection,
     removeRestGuard,
@@ -1269,17 +1268,10 @@ export default definePlugin({
             queueMicrotask(() => activateMatrixChannel(channelId));
         },
         CONNECTION_OPEN() {
-            setTimeout(() => {
-                const snapshot = getLatestSnapshot();
-                if (snapshot) applySnapshot(snapshot);
-                else void restartBridge(false);
-            });
+            reapplyMatrixProjectionAfterConnectionOpen();
         },
         CONNECTION_OPEN_SUPPLEMENTAL() {
-            setTimeout(() => {
-                const snapshot = getLatestSnapshot();
-                if (snapshot) applySnapshot(snapshot);
-            });
+            reapplyMatrixProjectionAfterConnectionOpen(false);
         },
         BULK_ACK({ channels }: { channels?: Array<{ channelId: string; messageId?: string; }>; }) {
             for (const { channelId, messageId } of channels ?? []) {

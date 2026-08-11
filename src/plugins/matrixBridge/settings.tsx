@@ -1929,6 +1929,9 @@ export function MatrixSettings() {
                     <Paragraph>
                         Supported encrypted-room GIF, Tenor, and X previews load automatically by default. KLIPY, Tenor, FxTwitter, and their media hosts can see your IP address, the public link, and request timing. You can turn this off below. Other encrypted-room link previews stay disabled. Uploaded attachments are unaffected.
                     </Paragraph>
+                    <Paragraph>
+                        In Discord, visible x.com and Twitter links and their preview cards open through girlcockx.com. The original link remains unchanged in Matrix; opening the projected link contacts girlcockx.com.
+                    </Paragraph>
                     <Checkbox
                         value={matrixBridgeSettings.encryptedRoomProviderPreviews !== false}
                         size={20}

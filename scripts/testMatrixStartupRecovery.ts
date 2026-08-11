@@ -188,12 +188,12 @@ assert.doesNotMatch(bridgeStartupLogger, /\.message|JSON\.stringify|logger\.warn
     "startup diagnostics must log validated codes only");
 
 const startFunction = native.slice(
-    native.indexOf("async function start(_: IpcMainInvokeEvent)"),
+    native.indexOf("async function start(_: IpcMainInvokeEvent, afterSeq = 0)"),
     native.indexOf("async function suspend(_: IpcMainInvokeEvent)")
 );
 const latchCheck = startFunction.indexOf("startupFailureForAccount(account)");
 const emptySnapshot = startFunction.indexOf("return emptySnapshot();", latchCheck);
-const workerStart = startFunction.indexOf("startInternal(account)");
+const workerStart = startFunction.indexOf("startInternal(account, afterSeq)");
 assert.ok(latchCheck >= 0 && emptySnapshot > latchCheck && workerStart > emptySnapshot,
     "a latched account must return its error snapshot before creating another worker");
 

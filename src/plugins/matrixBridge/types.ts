@@ -707,10 +707,21 @@ export interface MatrixMessageContextDTO {
     isolated: true;
 }
 
+export interface MatrixSnapshotCoverage {
+    /** Every currently visible worker room is present in `rooms`. */
+    roomsComplete: boolean;
+    /** Every emitted room DTO field, including its bounded member list, is represented. */
+    roomStateComplete: boolean;
+    /** Every worker timeline event is present. False for ordinary bounded snapshots. */
+    timelinesComplete: boolean;
+}
+
 export interface MatrixSnapshot {
+    /** Native resume watermark; it may be older than `revision` for bounded content. */
     seq: number;
-    /** Monotonic worker-side state cut represented by this snapshot. */
+    /** Exact monotonic worker-side content cut observed while building this snapshot. */
     revision: number;
+    coverage: MatrixSnapshotCoverage;
     status: MatrixBridgeStatus;
     account?: MatrixAccountDTO;
     rooms: MatrixRoomDTO[];
@@ -719,7 +730,14 @@ export interface MatrixSnapshot {
 export type MatrixBridgeEvent =
     | { seq: number; type: "snapshot"; snapshot: MatrixSnapshot; }
     | { seq: number; type: "room"; room: MatrixRoomDTO; }
-    | { seq: number; type: "message"; roomId: string; message: MatrixMessageDTO; }
+    | {
+        seq: number;
+        type: "message";
+        roomId: string;
+        message: MatrixMessageDTO;
+        previousEventId?: string;
+        nextEventId?: string;
+    }
     | { seq: number; type: "edit"; roomId: string; eventId: string; message?: MatrixMessageDTO; }
     | { seq: number; type: "redact"; roomId: string; eventId: string; }
     | { seq: number; type: "reaction"; roomId: string; eventId: string; reactions: MatrixReactionDTO[]; }

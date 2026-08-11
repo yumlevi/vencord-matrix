@@ -48,6 +48,7 @@ import {
     type MatrixShellRoom,
     type MatrixShellSnapshot
 } from "./secureViewProtocol";
+import { conservativeSnapshotResumeSequence } from "./snapshotBounds";
 import type {
     MatrixActionResult,
     MatrixAttachmentDTO,
@@ -181,6 +182,7 @@ const MAX_IN_FLIGHT_ROOM_JOINS = 128;
 const MAX_IN_FLIGHT_SUGGESTED_SPACE_CHANNEL_JOINS = 8;
 const MAX_EVENT_QUEUE = 256;
 const MAX_SHELL_EVENT_QUEUE_BYTES = 4 * 1024 * 1024;
+const MAX_SNAPSHOT_MESSAGE_JSON_BYTES = 2 * 1024 * 1024;
 const LONG_POLL_MS = 25_000;
 const COMMAND_TIMEOUT_MS = 90_000;
 const GROUP_CHAT_CREATE_TIMEOUT_MS = 5 * 60_000;
@@ -432,6 +434,7 @@ let rendererEventsDroppedThroughSeq = 0;
 let shellEventQueueBytes = 0;
 let lastWorkerRevision = 0;
 let lastWorkerEventSequence = 0;
+let workerEventBaselineSequence = 0;
 const workerRevisionSequences = new Map<number, number>();
 const MAX_WORKER_REVISION_SEQUENCES = 4_096;
 const ambiguousSpaceChildCreates = new Map<string, PendingSpaceChildCreate>();
@@ -1622,6 +1625,14 @@ function validateProtocolSnapshot(value: unknown): MatrixSnapshot {
         || !Array.isArray(raw.rooms) || raw.rooms.length > 250) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix snapshot response was invalid.");
     }
+    if (!raw.coverage || typeof raw.coverage !== "object" || Array.isArray(raw.coverage)
+        || Object.keys(raw.coverage).some(key =>
+            key !== "roomsComplete" && key !== "roomStateComplete" && key !== "timelinesComplete")
+        || typeof raw.coverage.roomsComplete !== "boolean"
+        || typeof raw.coverage.roomStateComplete !== "boolean"
+        || typeof raw.coverage.timelinesComplete !== "boolean") {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix snapshot coverage response was invalid.");
+    }
     const status = validateProtocolStatus(raw.status);
     const rooms = raw.rooms.map(validateProtocolRoom);
     if (new Set(rooms.map(room => room.roomId)).size !== rooms.length) {
@@ -1629,10 +1640,25 @@ function validateProtocolSnapshot(value: unknown): MatrixSnapshot {
     }
     const totalMessages = rooms.reduce((total, room) => total + room.messages.length, 0);
     const totalMembers = rooms.reduce((total, room) => total + room.members.length, 0);
-    if (totalMessages > 1_000 || totalMembers > 2_000) {
+    let totalMessageJsonBytes = 0;
+    for (const room of rooms) {
+        for (const message of room.messages) {
+            totalMessageJsonBytes += Buffer.byteLength(JSON.stringify(message), "utf8");
+            if (totalMessageJsonBytes > MAX_SNAPSHOT_MESSAGE_JSON_BYTES) break;
+        }
+        if (totalMessageJsonBytes > MAX_SNAPSHOT_MESSAGE_JSON_BYTES) break;
+    }
+    if (totalMessages > 1_000 || totalMembers > 2_500
+        || totalMessageJsonBytes > MAX_SNAPSHOT_MESSAGE_JSON_BYTES) {
         throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix snapshot response exceeded its aggregate limits.");
     }
-    const snapshot: MatrixSnapshot = { seq: raw.seq!, revision: raw.revision!, status, rooms };
+    const snapshot: MatrixSnapshot = {
+        seq: raw.seq!,
+        revision: raw.revision!,
+        coverage: { ...raw.coverage },
+        status,
+        rooms
+    };
     if (raw.account != null) {
         if (typeof raw.account !== "object" || Array.isArray(raw.account)) {
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix snapshot account response was invalid.");
@@ -1678,7 +1704,24 @@ function validateWorkerEvent(value: unknown): MatrixWorkerEvent {
         case "room": return { type: "room", room: validateProtocolRoom(raw.room) };
         case "message": {
             const roomId = protocolRoomId(raw.roomId);
-            return { type: "message", roomId, message: validateProtocolMessage(raw.message, roomId) };
+            const message = validateProtocolMessage(raw.message, roomId);
+            const previousEventId = raw.previousEventId == null
+                ? undefined
+                : protocolTimelineEventId(raw.previousEventId, roomId);
+            const nextEventId = raw.nextEventId == null
+                ? undefined
+                : protocolTimelineEventId(raw.nextEventId, roomId);
+            if (previousEventId === message.eventId || nextEventId === message.eventId
+                || previousEventId != null && previousEventId === nextEventId) {
+                throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix message timeline anchors were invalid.");
+            }
+            return {
+                type: "message",
+                roomId,
+                message,
+                ...(previousEventId ? { previousEventId } : {}),
+                ...(nextEventId ? { nextEventId } : {})
+            };
         }
         case "edit": {
             const roomId = protocolRoomId(raw.roomId);
@@ -2731,16 +2774,23 @@ function updateStatus(state: MatrixBridgeState, account?: { userId: string; }, e
     });
 }
 
-function finalizeSnapshot(snapshot: MatrixSnapshot, sequenceWatermark: number): MatrixSnapshot {
+function finalizeSnapshot(
+    snapshot: MatrixSnapshot,
+    sequenceWatermark: number,
+    establishedSequence?: number
+): MatrixSnapshot {
     const validated = validateProtocolSnapshot(snapshot);
-    let snapshotSequence = sequenceWatermark;
+    let contentSequence = sequenceWatermark;
     if (validated.revision > 0) {
         const revisionSequence = workerRevisionSequences.get(validated.revision);
         if (revisionSequence == null || validated.revision > lastWorkerRevision) {
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix snapshot did not have a valid event cut.");
         }
-        snapshotSequence = Math.max(snapshotSequence, revisionSequence);
+        contentSequence = Math.max(contentSequence, revisionSequence);
     }
+    const snapshotSequence = establishedSequence == null
+        ? contentSequence
+        : conservativeSnapshotResumeSequence(contentSequence, establishedSequence, validated.coverage);
     const result = {
         ...validated,
         seq: snapshotSequence,
@@ -2749,7 +2799,7 @@ function finalizeSnapshot(snapshot: MatrixSnapshot, sequenceWatermark: number): 
     // Events published after the request began may describe state newer than
     // this snapshot. Keep their status instead of rolling it back while the
     // renderer replays those events from the conservative watermark.
-    if (sequence === snapshotSequence) currentStatus = result.status;
+    if (sequence === contentSequence) currentStatus = { ...result.status, seq: contentSequence };
     return result;
 }
 
@@ -2757,6 +2807,7 @@ function emptySnapshot(): MatrixSnapshot {
     return {
         seq: sequence,
         revision: 0,
+        coverage: { roomsComplete: true, roomStateComplete: true, timelinesComplete: true },
         status: { ...currentStatus, seq: sequence },
         account: currentStatus.account,
         rooms: []
@@ -4208,6 +4259,7 @@ async function ensureWorker(): Promise<void> {
 
     lastWorkerRevision = 0;
     lastWorkerEventSequence = 0;
+    workerEventBaselineSequence = sequence;
     workerRevisionSequences.clear();
     workerReady = new Promise<void>((resolve, reject) => {
         resolveWorkerReady = resolve;
@@ -4486,7 +4538,10 @@ function scheduleUnjoinedGroupChatInviteReceiptPrune(binding: MatrixAccountBindi
     }, 0);
 }
 
-async function startInternal(account: MatrixStoredAccount): Promise<MatrixSnapshot> {
+async function startInternal(
+    account: MatrixStoredAccount,
+    rendererSequence?: number
+): Promise<MatrixSnapshot> {
     return await runAccountLifecycleTransition(async () => {
         const binding = accountBinding(account)!;
         if (activeWorkerBinding && !sameAccountBinding(activeWorkerBinding, binding)) {
@@ -4499,7 +4554,11 @@ async function startInternal(account: MatrixStoredAccount): Promise<MatrixSnapsh
             if (!result || typeof result !== "object" || !("rooms" in result)) {
                 throw bridgeError("MATRIX_PROTOCOL_ERROR", "The isolated Matrix backend returned an invalid snapshot.");
             }
-            const finalized = finalizeSnapshot(result, sequenceWatermark);
+            const finalized = finalizeSnapshot(
+                result,
+                sequenceWatermark,
+                Math.max(workerEventBaselineSequence, rendererSequence ?? 0)
+            );
             activeWorkerBinding = binding;
             scheduleUnjoinedGroupChatInviteReceiptPrune(binding);
             return finalized;
@@ -4819,7 +4878,10 @@ async function logout(_: IpcMainInvokeEvent): Promise<void> {
     }));
 }
 
-async function start(_: IpcMainInvokeEvent): Promise<MatrixSnapshot> {
+async function start(_: IpcMainInvokeEvent, afterSeq = 0): Promise<MatrixSnapshot> {
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 || afterSeq > sequence) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix event cursor is invalid.");
+    }
     return runLifecycle(async () => {
         pluginSuspended = false;
         const account = await readStoredAccount();
@@ -4854,10 +4916,14 @@ async function start(_: IpcMainInvokeEvent): Promise<MatrixSnapshot> {
             && sameAccountBinding(activeWorkerBinding, accountBinding(account))) {
             const sequenceWatermark = sequence;
             const result = await callWorker<MatrixSnapshot>({ type: "snapshot" });
-            return finalizeSnapshot(result, sequenceWatermark);
+            return finalizeSnapshot(
+                result,
+                sequenceWatermark,
+                Math.max(workerEventBaselineSequence, afterSeq)
+            );
         }
         try {
-            return await startInternal(account);
+            return await startInternal(account, afterSeq);
         } catch (error) {
             const latchedFailure = startupFailureForAccount(account);
             if (latchedFailure && error instanceof Error && error.name === latchedFailure.error.code) {
@@ -4897,13 +4963,16 @@ async function suspend(_: IpcMainInvokeEvent): Promise<void> {
     }));
 }
 
-async function snapshot(_: IpcMainInvokeEvent): Promise<MatrixSnapshot> {
+async function snapshot(
+    _: IpcMainInvokeEvent,
+    establishedSequence?: number
+): Promise<MatrixSnapshot> {
     const account = await readStoredAccount();
     if (!account) return emptySnapshot();
     await requireStarted();
     const sequenceWatermark = sequence;
     const result = await callWorker<MatrixSnapshot>({ type: "snapshot" });
-    return finalizeSnapshot(result, sequenceWatermark);
+    return finalizeSnapshot(result, sequenceWatermark, establishedSequence);
 }
 
 async function publicRooms(_: IpcMainInvokeEvent): Promise<MatrixPublicRoomDirectoryDTO> {
@@ -8536,9 +8605,12 @@ async function runShellBoundary<T>(operation: () => Promise<T>): Promise<T> {
     }
 }
 
-async function rendererRecoverySnapshot(event: IpcMainInvokeEvent): Promise<MatrixSnapshot> {
+async function rendererRecoverySnapshot(
+    event: IpcMainInvokeEvent,
+    establishedSequence: number
+): Promise<MatrixSnapshot> {
     return await runSnapshotCut(() => commitAccountConsistentRead(
-        () => snapshot(event),
+        () => snapshot(event, establishedSequence),
         snapshotMatchesAccountBinding,
         value => value,
         undefined,
@@ -8561,7 +8633,15 @@ export async function nextEvent(
     }
 
     if (afterSeq < rendererEventsDroppedThroughSeq) {
-        const recovery = await rendererRecoverySnapshot(event);
+        const recovery = await rendererRecoverySnapshot(event, afterSeq);
+        if (recovery.seq <= rendererEventsDroppedThroughSeq) {
+            const error = bridgeError(
+                "MATRIX_EVENT_STREAM_GAP",
+                "The bounded Matrix event stream could not be recovered without skipping timeline events."
+            );
+            failWorker(error);
+            throw error;
+        }
         return { seq: recovery.seq, type: "snapshot", snapshot: recovery };
     }
     const queued = rendererEventQueue.find(item => item.seq > afterSeq);
