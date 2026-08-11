@@ -25,12 +25,23 @@ export interface MatrixInboundMentionProjection {
     localUserIds: string[];
 }
 
+interface MatrixFormattedMentionProjection {
+    body: string;
+    projectedUserIds: Set<string>;
+}
+
 const MATRIX_MENTION_PLACEHOLDER_PREFIX = "\ue000matrix-mention:";
 const MATRIX_MENTION_PLACEHOLDER_SUFFIX = "\ue001";
 const MATRIX_MENTION_PLACEHOLDER_PATTERN = /\ue000matrix-mention:\d{1,3}\ue001/u;
+const MATRIX_FORMATTED_MENTION_PLACEHOLDER_PREFIX = "\ue002matrix-formatted-mention:";
+const MATRIX_FORMATTED_MENTION_PLACEHOLDER_SUFFIX = "\ue003";
 
 function mentionPlaceholder(index: number): string {
     return `${MATRIX_MENTION_PLACEHOLDER_PREFIX}${index}${MATRIX_MENTION_PLACEHOLDER_SUFFIX}`;
+}
+
+function formattedMentionPlaceholder(index: number): string {
+    return `${MATRIX_FORMATTED_MENTION_PLACEHOLDER_PREFIX}${index}${MATRIX_FORMATTED_MENTION_PLACEHOLDER_SUFFIX}`;
 }
 
 function inertMentionText(identity: MatrixInboundMentionIdentity): string {
@@ -46,6 +57,181 @@ function inertMentionText(identity: MatrixInboundMentionIdentity): string {
 
 function escapeRegExp(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function decodeHtmlEntities(value: string): string {
+    return value.replace(/&(?:#(\d{1,7})|#x([\da-f]{1,6})|(amp|apos|gt|lt|nbsp|quot));/giu,
+        (entity, decimal: string | undefined, hexadecimal: string | undefined, named: string | undefined) => {
+            if (named) {
+                return named.toLowerCase() === "amp" ? "&"
+                    : named.toLowerCase() === "apos" ? "'"
+                        : named.toLowerCase() === "gt" ? ">"
+                            : named.toLowerCase() === "lt" ? "<"
+                                : named.toLowerCase() === "nbsp" ? "\u00a0"
+                                    : '"';
+            }
+            const codePoint = Number.parseInt(decimal ?? hexadecimal ?? "", decimal ? 10 : 16);
+            return Number.isSafeInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+                && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+                ? String.fromCodePoint(codePoint)
+                : entity;
+        });
+}
+
+function matrixMentionUserIdFromHref(rawHref: string): string | undefined {
+    const href = decodeHtmlEntities(rawHref).trim();
+    try {
+        if (/^https:\/\/matrix\.to\//iu.test(href)) {
+            const url = new URL(href);
+            if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "matrix.to" || url.port) return undefined;
+            const fragment = decodeURIComponent(url.hash.slice(1)).replace(/^\/+/, "");
+            const userId = fragment.split("?", 1)[0];
+            return userId.startsWith("@") ? userId : undefined;
+        }
+        if (/^matrix:/iu.test(href)) {
+            const path = href.slice("matrix:".length).replace(/^\/+/, "").split("?", 1)[0];
+            if (!/^u\//iu.test(path)) return undefined;
+            const userId = `@${decodeURIComponent(path.slice(2))}`;
+            return userId.length > 1 ? userId : undefined;
+        }
+    } catch { }
+    return undefined;
+}
+
+function htmlAnchorHref(tag: string): string | undefined {
+    const match = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/iu.exec(tag);
+    return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+const HTML_VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+const HTML_BLOCK_TAGS = new Set(["blockquote", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "ol", "p", "pre", "table", "tbody", "td", "th", "thead", "tr", "ul"]);
+const HTML_SUPPRESSED_TAGS = new Set(["mx-reply", "script", "style", "template"]);
+
+function appendFormattedText(target: string[], value: string): void {
+    if (!value) return;
+    // Reserved sentinels are stripped per source chunk so markup cannot join
+    // attacker-controlled fragments into one of our trusted placeholders.
+    target.push(decodeHtmlEntities(value).replace(/[\ue002\ue003]/gu, ""));
+}
+
+function appendFormattedBreak(target: string[]): void {
+    if (!target.length || target[target.length - 1].endsWith("\n")) return;
+    target.push("\n");
+}
+
+/**
+ * Convert Matrix custom HTML to inert plain text. The only active Discord
+ * syntax introduced here comes from an exact Matrix URI anchor whose MXID is
+ * also authorized by m.mentions; anchor labels are never identity evidence.
+ */
+function projectFormattedMatrixMentions(
+    formattedBody: string,
+    identities: ReadonlyMap<string, MatrixInboundMentionIdentity>
+): MatrixFormattedMentionProjection | undefined {
+    if (!formattedBody || formattedBody.length > 131_072 || !identities.size) return undefined;
+    const output: string[] = [];
+    const projectedUserIds = new Set<string>();
+    const projectedIdentities: MatrixInboundMentionIdentity[] = [];
+    const projectedIdentityIndexes = new Map<string, number>();
+    const stack: Array<{ name: string; suppress: boolean; }> = [];
+    let suppressionDepth = 0;
+    const suppressed = () => suppressionDepth > 0;
+    let cursor = 0;
+
+    while (cursor < formattedBody.length) {
+        const tagStart = formattedBody.indexOf("<", cursor);
+        if (tagStart === -1) {
+            if (!suppressed()) appendFormattedText(output, formattedBody.slice(cursor));
+            break;
+        }
+        if (tagStart > cursor && !suppressed()) {
+            appendFormattedText(output, formattedBody.slice(cursor, tagStart));
+        }
+        if (formattedBody.startsWith("<!--", tagStart)) {
+            const commentEnd = formattedBody.indexOf("-->", tagStart + 4);
+            cursor = commentEnd === -1 ? formattedBody.length : commentEnd + 3;
+            continue;
+        }
+
+        let quote = "";
+        let tagEnd = tagStart + 1;
+        for (; tagEnd < formattedBody.length; tagEnd++) {
+            const character = formattedBody[tagEnd];
+            if (quote) {
+                if (character === quote) quote = "";
+            } else if (character === '"' || character === "'") {
+                quote = character;
+            } else if (character === ">") {
+                break;
+            }
+        }
+        if (tagEnd >= formattedBody.length) {
+            return undefined;
+        }
+
+        const tag = formattedBody.slice(tagStart, tagEnd + 1);
+        cursor = tagEnd + 1;
+        const parsed = /^<\s*(\/?)\s*([a-z][\w:-]*)/iu.exec(tag);
+        if (!parsed) continue;
+        const closing = Boolean(parsed[1]);
+        const name = parsed[2].toLowerCase();
+        if (closing) {
+            const entry = stack[stack.length - 1];
+            const wasSuppressed = suppressed();
+            if (entry?.name === name) {
+                stack.pop();
+                if (entry.suppress) suppressionDepth--;
+                if (!wasSuppressed && HTML_BLOCK_TAGS.has(name)) appendFormattedBreak(output);
+            }
+            continue;
+        }
+
+        const parentSuppressed = suppressed();
+        let suppress = parentSuppressed || HTML_SUPPRESSED_TAGS.has(name);
+        if (!suppress && name === "a") {
+            const href = htmlAnchorHref(tag);
+            const matrixUserId = href ? matrixMentionUserIdFromHref(href) : undefined;
+            const identity = matrixUserId ? identities.get(matrixUserId) : undefined;
+            if (identity) {
+                let index = projectedIdentityIndexes.get(identity.matrixUserId);
+                if (index == null) {
+                    projectedIdentities.push(identity);
+                    index = projectedIdentities.length - 1;
+                    projectedIdentityIndexes.set(identity.matrixUserId, index);
+                }
+                output.push(formattedMentionPlaceholder(index));
+                projectedUserIds.add(identity.matrixUserId);
+                suppress = true;
+            }
+        }
+        if (!parentSuppressed && name === "br") appendFormattedBreak(output);
+        const selfClosing = /\/\s*>$/u.test(tag) || HTML_VOID_TAGS.has(name);
+        if (!selfClosing) {
+            // Standard Matrix custom HTML is shallow. Reject pathological or
+            // malformed nesting rather than doing unbounded renderer work.
+            if (stack.length >= 256) return undefined;
+            stack.push({ name, suppress });
+            if (suppress) suppressionDepth++;
+        }
+    }
+
+    if (stack.length || !projectedUserIds.size) return undefined;
+    let body = output.join("")
+        .replace(/\r/gu, "")
+        .replace(/[ \t]+\n/gu, "\n")
+        .replace(/\n{3,}/gu, "\n\n")
+        .trim()
+        // Neutralize only after all HTML chunks have joined; otherwise inert
+        // tags could split an unauthorized Discord token across chunks.
+        .replace(DISCORD_USER_MENTION_PATTERN, "@$1");
+    for (let index = 0; index < projectedIdentities.length; index++) {
+        body = body.replaceAll(
+            formattedMentionPlaceholder(index),
+            `<@${projectedIdentities[index].localUserId}>`
+        );
+    }
+    body = body.slice(0, 65_536);
+    return body ? { body, projectedUserIds } : undefined;
 }
 
 function portableUriSpans(body: string): Array<{ start: number; end: number; }> {
@@ -132,7 +318,8 @@ export function projectInboundMatrixMentions(
     body: string,
     mentionedUserIds: readonly string[],
     resolveMatrixUserId: (matrixUserId: string) => MatrixInboundMentionIdentity | undefined,
-    resolveLegacySyntheticUserId: (syntheticUserId: string) => MatrixInboundMentionIdentity | undefined
+    resolveLegacySyntheticUserId: (syntheticUserId: string) => MatrixInboundMentionIdentity | undefined,
+    formattedBody?: string
 ): MatrixInboundMentionProjection {
     const identities = new Map<string, MatrixInboundMentionIdentity>();
     const intentionalUserIds = new Set(mentionedUserIds.slice(0, MAX_MATRIX_MESSAGE_MENTIONS));
@@ -144,14 +331,21 @@ export function projectInboundMatrixMentions(
         return `<@${identity.localUserId}>`;
     });
 
-    const intentionalIdentities = [...new Set(mentionedUserIds)]
+    const resolvedIntentionalIdentities = [...new Set(mentionedUserIds)]
         .slice(0, MAX_MATRIX_MESSAGE_MENTIONS)
         .map(resolveMatrixUserId)
         .filter((identity): identity is MatrixInboundMentionIdentity => Boolean(identity))
         // Replace longer Matrix IDs first so a valid prefix cannot consume a
         // more specific identity which follows it.
         .sort((left, right) => right.matrixUserId.length - left.matrixUserId.length);
-    for (const identity of intentionalIdentities) {
+    const intentionalIdentitiesById = new Map(
+        resolvedIntentionalIdentities.map(identity => [identity.matrixUserId, identity])
+    );
+    const formattedProjection = formattedBody
+        ? projectFormattedMatrixMentions(formattedBody, intentionalIdentitiesById)
+        : undefined;
+    if (formattedProjection) projectedBody = formattedProjection.body;
+    for (const identity of resolvedIntentionalIdentities) {
         identities.set(identity.matrixUserId, identity);
         projectedBody = replaceExactMatrixUserId(
             projectedBody,

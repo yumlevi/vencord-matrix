@@ -78,6 +78,13 @@ import {
 import { openMatrixGroupChatCreate } from "./groupCreate";
 import { openMatrixGroupInvite } from "./groupInvite";
 import { openMatrixInvitePeople } from "./invite";
+import {
+    MATRIX_EDITED_REACTION_UPDATE_PATCH,
+    MATRIX_PARTIAL_REACTION_UPDATE_PATCH,
+    patchEditedMatrixReactionUpdate,
+    patchPartialMatrixReactionUpdate,
+    selectProjectedMessageReactions,
+} from "./reactionProjection";
 import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
 import { openMatrixSpaceChildModal } from "./spaceCreate";
@@ -1007,6 +1014,16 @@ function onMatrixSearchShortcut(event: KeyboardEvent) {
     else openMatrixSearch(channelId);
 }
 
+/**
+ * Discord's MESSAGE_UPDATE converter intentionally preserves its existing
+ * reaction array. Matrix reaction deltas are authoritative aggregates, so the
+ * synthetic channel must accept the incoming array while ordinary Discord
+ * channels retain the stock merge rule.
+ */
+function matrixMessageUpdateReactions(channelId: string, existing: unknown, incoming: unknown) {
+    return selectProjectedMessageReactions(isMatrixChannelId(channelId), existing, incoming);
+}
+
 export default definePlugin({
     name: "MatrixBridge",
     description: "Brings Matrix rooms, spaces, and direct messages into Discord.",
@@ -1026,6 +1043,23 @@ export default definePlugin({
     },
 
     patches: [
+        {
+            // Discord preserves reactions across ordinary MESSAGE_UPDATE
+            // payloads, including a separate edited-message fast path. Matrix
+            // sends an authoritative aggregate through that same action, so
+            // select it only for an already-projected synthetic channel.
+            find: "premiumGroupInviteId:",
+            replacement: [
+                {
+                    match: MATRIX_EDITED_REACTION_UPDATE_PATCH,
+                    replace: patchEditedMatrixReactionUpdate,
+                },
+                {
+                    match: MATRIX_PARTIAL_REACTION_UPDATE_PATCH,
+                    replace: patchPartialMatrixReactionUpdate,
+                },
+            ],
+        },
         {
             // Add a separate provider-backed group-chat action beside Discord's
             // stock Create Message action. The stock component and callback are
@@ -1479,4 +1513,5 @@ export default definePlugin({
     removeMatrixReaction,
     matrixTyping,
     matrixReceipt,
+    matrixMessageUpdateReactions,
 });

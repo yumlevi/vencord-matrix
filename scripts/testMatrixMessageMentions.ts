@@ -61,6 +61,67 @@ const semanticOnly = projectInboundMatrixMentions(
 assert.equal(semanticOnly.body, "A display name without an MXID token");
 assert.deepEqual(semanticOnly.localUserIds, ["444"]);
 
+const elementMention = projectInboundMatrixMentions(
+    "Hello Alice!",
+    ["@self:example.test"],
+    userId => identities.get(userId),
+    () => undefined,
+    "Hello <a href='https://matrix.to/#/@self:example.test'>Alice</a>!"
+);
+assert.equal(elementMention.body, "Hello <@444>!");
+assert.deepEqual(elementMention.localUserIds, ["444"]);
+
+const matrixUriMention = projectInboundMatrixMentions(
+    "Hello Definitely not Friend & Self",
+    ["@self:example.test", "@friend:example.test"],
+    userId => identities.get(userId),
+    () => undefined,
+    "<mx-reply><a href='https://matrix.to/#/@self:example.test'>quoted</a></mx-reply>"
+        + "<p>Hello <a href='matrix:u/friend:example.test?via=example.test'>Definitely not Friend</a> "
+        + "&amp; <a href='https://matrix.to/#/%40self%3Aexample.test'>Self</a></p>"
+        + "<script>&lt;@999&gt;</script>"
+);
+assert.equal(matrixUriMention.body, "Hello <@555> & <@444>");
+assert.deepEqual(matrixUriMention.localUserIds, ["555", "444"]);
+
+const unauthorizedFormattedAnchor = projectInboundMatrixMentions(
+    "Hello Alice!",
+    [],
+    userId => identities.get(userId),
+    () => undefined,
+    "Hello <a href='https://matrix.to/#/@self:example.test'>Alice</a>!"
+);
+assert.equal(unauthorizedFormattedAnchor.body, "Hello Alice!");
+assert.deepEqual(unauthorizedFormattedAnchor.localUserIds, []);
+
+const splitDiscordToken = projectInboundMatrixMentions(
+    "Authorized @123",
+    ["@self:example.test"],
+    userId => identities.get(userId),
+    () => undefined,
+    "<a href='https://matrix.to/#/@self:example.test'>Authorized</a> &lt;<b></b>@123&gt;"
+);
+assert.equal(splitDiscordToken.body, "<@444> @123");
+assert.deepEqual(splitDiscordToken.localUserIds, ["444"]);
+
+const pathologicalFormattedBodies = [
+    `${"<b>".repeat(257)}<a href='https://matrix.to/#/@self:example.test'>Self</a>${"</b>".repeat(257)}`,
+    "<".repeat(65_536),
+    `${"plain ".repeat(10_000)}<a href='unterminated`,
+];
+const pathologicalStart = performance.now();
+for (const formattedBody of pathologicalFormattedBodies) {
+    const projection = projectInboundMatrixMentions(
+        "Safe fallback",
+        ["@self:example.test"],
+        userId => identities.get(userId),
+        () => undefined,
+        formattedBody
+    );
+    assert.equal(projection.body, "Safe fallback");
+}
+assert.ok(performance.now() - pathologicalStart < 2_000, "formatted mention parsing must remain bounded");
+
 const boundarySafe = projectInboundMatrixMentions(
     "https://example.test/@self:example.test/path "
         + "https://example.test/#@self:example.test "
@@ -96,9 +157,11 @@ const bridge = readFileSync(new URL("../src/plugins/matrixBridge/bridge.ts", imp
 const native = readFileSync(new URL("../src/plugins/matrixBridge/native.ts", import.meta.url), "utf8");
 assert.match(backend, /content\["m\.mentions"\]\s*=\s*\{ user_ids: mentionedUserIds \}/u);
 assert.match(backend, /message\.mentionedUserIds = mentionedUserIds/u);
+assert.match(backend, /content\.format === "org\.matrix\.custom\.html"[\s\S]+message\.formattedBody = formattedBody/u);
 assert.match(backend, /"m\.mentions": introducedMentionUserIds\.length \? \{ user_ids: introducedMentionUserIds \} : \{\}/u);
 assert.match(backend, /newContent\["m\.mentions"\] = mentionedUserIds\.length \? \{ user_ids: mentionedUserIds \} : \{\}/u);
 assert.match(bridge, /mentions: projectedMentions\.users/u);
+assert.match(bridge, /message\.formattedBody/u);
 assert.match(bridge, /projectOutboundMatrixMentions\(withoutSelfMention,/u);
 assert.match(native, /message\.mentionedUserIds = raw\.mentionedUserIds\.map\(protocolUserId\)/u);
 
