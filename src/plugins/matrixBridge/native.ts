@@ -24,6 +24,7 @@ import {
     type WebContents
 } from "electron";
 
+import { MAX_MATRIX_MESSAGE_MENTIONS } from "./messageMentions";
 import {
     MATRIX_SECURE_VIEW_BOOTSTRAP,
     MATRIX_SECURE_VIEW_EVENT,
@@ -501,6 +502,18 @@ function validateUserId(value: unknown): string {
         throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix user ID is invalid.");
     }
     return userId;
+}
+
+function validateMentionUserIds(value: unknown): string[] | undefined {
+    if (value == null) return undefined;
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_MATRIX_MESSAGE_MENTIONS) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix message mentions are invalid.");
+    }
+    const userIds = value.map(validateUserId);
+    if (new Set(userIds).size !== userIds.length) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Matrix message mentions contain duplicates.");
+    }
+    return userIds;
 }
 
 function validateUsername(value: unknown): string {
@@ -1109,6 +1122,17 @@ function validateProtocolMessage(value: unknown, expectedRoomId?: string): Matri
             throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix message sender name was invalid.");
         }
         message.senderName = senderName;
+    }
+    if (raw.mentionedUserIds != null) {
+        if (!Array.isArray(raw.mentionedUserIds)
+            || raw.mentionedUserIds.length < 1
+            || raw.mentionedUserIds.length > MAX_MATRIX_MESSAGE_MENTIONS) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix message mentions response was invalid.");
+        }
+        message.mentionedUserIds = raw.mentionedUserIds.map(protocolUserId);
+        if (new Set(message.mentionedUserIds).size !== message.mentionedUserIds.length) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix message mentions response contained duplicates.");
+        }
     }
     if (raw.sticker != null) {
         if (raw.sticker !== true) {
@@ -7513,13 +7537,20 @@ async function searchMessages(
     return validateMessageSearchResponse(result, validated);
 }
 
-async function sendText(_: IpcMainInvokeEvent, roomId: string, body: string, replyEventId?: string): Promise<MatrixActionResult> {
+async function sendText(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    body: string,
+    replyEventId?: string,
+    mentionedUserIds?: string[]
+): Promise<MatrixActionResult> {
     await requireStarted();
     return await callWorker<MatrixActionResult>({
         type: "sendText",
         roomId: validateRoomId(roomId),
         body: validateString(body, "body", 65_536),
-        replyEventId: replyEventId == null ? undefined : validateEventId(replyEventId)
+        replyEventId: replyEventId == null ? undefined : validateEventId(replyEventId),
+        mentionedUserIds: validateMentionUserIds(mentionedUserIds)
     });
 }
 
@@ -7570,13 +7601,20 @@ async function sendAttachment(
     }
 }
 
-async function edit(_: IpcMainInvokeEvent, roomId: string, eventId: string, body: string): Promise<MatrixActionResult> {
+async function edit(
+    _: IpcMainInvokeEvent,
+    roomId: string,
+    eventId: string,
+    body: string,
+    mentionedUserIds?: string[]
+): Promise<MatrixActionResult> {
     await requireStarted();
     return await callWorker<MatrixActionResult>({
         type: "edit",
         roomId: validateRoomId(roomId),
         eventId: validateEventId(eventId),
-        body: validateString(body, "body", 65_536)
+        body: validateString(body, "body", 65_536),
+        mentionedUserIds: validateMentionUserIds(mentionedUserIds)
     });
 }
 

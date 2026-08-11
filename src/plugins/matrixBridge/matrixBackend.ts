@@ -31,7 +31,16 @@ import {
 } from "matrix-js-sdk";
 
 import { isDefinitiveCreateRoomRejection } from "./createSpaceChildError";
-import { isCurrentMatrixTimelineGeneration, isMainMatrixTimelineReset } from "./historyTimeline";
+import {
+    createMatrixLiveDecryptionTracker,
+    isCurrentMatrixTimelineGeneration,
+    isMainMatrixTimelineReset
+} from "./historyTimeline";
+import {
+    introducedMatrixMentionUserIds,
+    materializeOutboundMatrixMentions,
+    MAX_MATRIX_MESSAGE_MENTIONS
+} from "./messageMentions";
 import { searchMatrixSpaceGraph } from "./spaceSearchGraph";
 import type {
     MatrixActionResult,
@@ -324,6 +333,7 @@ const groupChatDirectoryCandidates = new Map<string, number>();
 const groupChatExactLookupTimestamps: number[] = [];
 const reactionMapCache = new WeakMap<Room, Map<string, MatrixReactionDTO[]>>();
 const isolatedDecryptionEvents = new WeakSet<MatrixEvent>();
+const liveDecryptionEvents = createMatrixLiveDecryptionTracker<MatrixEvent>();
 const activeMediaReadControllers = new Set<AbortController>();
 
 function resolvedSpaceAccessRequestKey(roomId: string, userId: string): string {
@@ -1631,6 +1641,54 @@ function safeMessageBody(value: unknown): string {
         : "";
 }
 
+function normalizedMessageMentionUserIds(room: Room, content: Record<string, any>): string[] | undefined {
+    const mentions = content["m.mentions"];
+    if (!mentions || typeof mentions !== "object" || Array.isArray(mentions)
+        || !Array.isArray(mentions.user_ids) || mentions.user_ids.length < 1) {
+        return undefined;
+    }
+    const userIds: string[] = [];
+    const seen = new Set<string>();
+    for (const value of mentions.user_ids.slice(0, MAX_MATRIX_MESSAGE_MENTIONS)) {
+        const userId = optionalUserId(value);
+        const membership = userId ? room.getMember(userId)?.membership : undefined;
+        if (!userId || seen.has(userId) || (membership !== "join" && membership !== "invite")) continue;
+        seen.add(userId);
+        userIds.push(userId);
+    }
+    return userIds.length ? userIds : undefined;
+}
+
+function validateOutgoingMentionContent(
+    room: Room,
+    value: unknown,
+    placeholderBody: string
+): { body: string; userIds: string[]; } {
+    if (value == null) {
+        const body = materializeOutboundMatrixMentions(placeholderBody, []);
+        if (body == null) fail("MATRIX_INVALID_ARGUMENT", "The Matrix message mention placeholders are invalid.");
+        return { body, userIds: [] };
+    }
+    if (!Array.isArray(value) || value.length < 1 || value.length > MAX_MATRIX_MESSAGE_MENTIONS) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix message mentions are invalid.");
+    }
+    const userIds = value.map(validateUserId);
+    if (new Set(userIds).size !== userIds.length) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix message mentions contain duplicates.");
+    }
+    for (const userId of userIds) {
+        const membership = room.getMember(userId)?.membership;
+        if (userId === activeCredentials?.userId || (membership !== "join" && membership !== "invite")) {
+            fail("MATRIX_INVALID_ARGUMENT", "A Matrix message mention does not match a current room member.");
+        }
+    }
+    const materializedBody = materializeOutboundMatrixMentions(placeholderBody, userIds);
+    if (materializedBody == null) {
+        fail("MATRIX_INVALID_ARGUMENT", "The Matrix message mention placeholders are invalid.");
+    }
+    return { body: validateString(materializedBody, "body", 65_536), userIds };
+}
+
 function stripPlainReplyFallback(body: string): string {
     let offset = 0;
     let stripped = false;
@@ -1716,6 +1774,8 @@ function normalizeMessage(room: Room, event: MatrixEvent, reactions?: MatrixReac
 
     const senderName = publicRoomText(member?.name, 256);
     if (senderName) message.senderName = senderName;
+    const mentionedUserIds = normalizedMessageMentionUserIds(room, content);
+    if (mentionedUserIds) message.mentionedUserIds = mentionedUserIds;
     if (type === EventType.Sticker) message.sticker = true;
     if (event.replacingEvent()) message.edited = true;
     if (replyToEventId) message.replyToEventId = replyToEventId;
@@ -2563,13 +2623,34 @@ function emitReactions(room: Room, eventId: string): void {
     emit({ type: "reaction", roomId: room.roomId, eventId, reactions });
 }
 
+function convergeReactions(room: Room, eventId: string): void {
+    invalidateReactionMap(room);
+    try { emitReactions(room, eventId); } catch { }
+}
+
 function handleTimelineEvent(event: MatrixEvent, room: Room | undefined, removed = false): void {
-    if (!room || room.getMyMembership() !== "join") return;
+    if (!room || room.getMyMembership() !== "join") {
+        liveDecryptionEvents.discard(event);
+        return;
+    }
     const eventId = optionalTimelineEventId(room, event);
-    if (!eventId) return;
+    if (!eventId) {
+        liveDecryptionEvents.discard(event);
+        return;
+    }
 
     if (removed || event.status === "cancelled") {
+        liveDecryptionEvents.discard(event);
         emit({ type: "redact", roomId: room.roomId, eventId });
+        return;
+    }
+
+    // Event mapping starts decryption asynchronously. Remember the live slot
+    // before inspecting its decrypted type/relation so Decrypted can insert it
+    // rather than treating it like detached history or an update-only retry.
+    if (event.getWireType() === EventType.RoomMessageEncrypted
+        && event.getType() === EventType.RoomMessageEncrypted) {
+        liveDecryptionEvents.mark(event);
         return;
     }
 
@@ -2652,10 +2733,29 @@ function attachClientListeners(client: MatrixClient): void {
     }));
     client.on(RoomEvent.LocalEchoUpdated, (event, room) => guarded(() => handleTimelineEvent(event, room)));
     client.on(MatrixEventEvent.Decrypted, event => guarded(() => {
-        if (isolatedDecryptionEvents.has(event)) return;
+        const disposition = liveDecryptionEvents.consume(event, isolatedDecryptionEvents.has(event));
+        const recoveredLiveFailure = !event.isDecryptionFailure()
+            && liveDecryptionEvents.consumeFailure(event);
+        if (disposition === "isolated" && !recoveredLiveFailure) return;
         const room = client.getRoom(event.getRoomId());
         if (!room || room.getMyMembership() !== "join") return;
+        if (disposition === "live") {
+            isolatedDecryptionEvents.delete(event);
+            // Re-run the complete live-event path so encrypted reactions and
+            // replacements converge alongside ordinary messages/placeholders.
+            if (event.isDecryptionFailure()) liveDecryptionEvents.markFailure(event);
+            handleTimelineEvent(event, room);
+            return;
+        }
         const message = normalizeMessage(room, event, buildReactionMap(room).get(event.getId() ?? ""));
+        if (recoveredLiveFailure && !message) {
+            // A failed live relation temporarily occupied its own message slot.
+            // Remove that placeholder, then apply the revealed relation once.
+            const eventId = optionalTimelineEventId(room, event);
+            if (eventId) emit({ type: "redact", roomId: room.roomId, eventId });
+            handleTimelineEvent(event, room);
+            return;
+        }
         if (!message) return;
         // Decryption changes an existing placeholder. Model it as update-only;
         // an older event discovered by search must never be appended as live.
@@ -6630,8 +6730,14 @@ async function logout(): Promise<void> {
 
 async function sendText(command: Extract<MatrixWorkerCommand, { type: "sendText"; }>): Promise<MatrixActionResult> {
     const room = getRoom(command.roomId);
-    const body = validateString(command.body, "body", 65_536);
+    const placeholderBody = validateString(command.body, "body", 65_536);
+    const { body, userIds: mentionedUserIds } = validateOutgoingMentionContent(
+        room,
+        command.mentionedUserIds,
+        placeholderBody
+    );
     const content: Record<string, any> = { msgtype: MsgType.Text, body };
+    if (mentionedUserIds.length) content["m.mentions"] = { user_ids: mentionedUserIds };
     if (command.replyEventId != null) {
         content["m.relates_to"] = { "m.in_reply_to": { event_id: validateEventId(command.replyEventId) } };
     }
@@ -7082,7 +7188,12 @@ function restoreFailedRedaction(room: Room, redaction: MatrixEvent, target: Matr
 async function edit(command: Extract<MatrixWorkerCommand, { type: "edit"; }>): Promise<MatrixActionResult> {
     const room = getRoom(command.roomId);
     const eventId = validateEventId(command.eventId);
-    const body = validateString(command.body, "body", 65_536);
+    const placeholderBody = validateString(command.body, "body", 65_536);
+    const { body, userIds: mentionedUserIds } = validateOutgoingMentionContent(
+        room,
+        command.mentionedUserIds,
+        placeholderBody
+    );
     const target = findRoomEvent(room, eventId);
     if (!target) fail("MATRIX_EVENT_NOT_LOADED", "Load this Matrix message before editing it.");
     try {
@@ -7102,6 +7213,9 @@ async function edit(command: Extract<MatrixWorkerCommand, { type: "edit"; }>): P
         fail("MATRIX_EDIT_UNSUPPORTED", "This Matrix message type cannot be edited safely.");
     }
     const newContent: Record<string, unknown> = { msgtype, body };
+    newContent["m.mentions"] = mentionedUserIds.length ? { user_ids: mentionedUserIds } : {};
+    const previousMentionUserIds = normalizedMessageMentionUserIds(room, targetContent) ?? [];
+    const introducedMentionUserIds = introducedMatrixMentionUserIds(previousMentionUserIds, mentionedUserIds);
     const targetRelation = relationContent(target);
     const replyEventId = optionalEventId(targetRelation?.["m.in_reply_to"]?.event_id);
     if (replyEventId) newContent["m.relates_to"] = { "m.in_reply_to": { event_id: replyEventId } };
@@ -7111,6 +7225,7 @@ async function edit(command: Extract<MatrixWorkerCommand, { type: "edit"; }>): P
         const response = await matrixClient!.sendMessage(room.roomId, {
             msgtype,
             body: `* ${body}`,
+            "m.mentions": introducedMentionUserIds.length ? { user_ids: introducedMentionUserIds } : {},
             "m.new_content": newContent,
             "m.relates_to": { rel_type: RelationType.Replace, event_id: eventId }
         } as any, transactionId);
@@ -7195,7 +7310,7 @@ async function react(command: Extract<MatrixWorkerCommand, { type: "react"; }>):
                 throw error;
             }
         }
-        invalidateReactionMap(room);
+        convergeReactions(room, eventId);
         return redactionId ? { eventId: redactionId } : {};
     }
 
@@ -7209,13 +7324,17 @@ async function react(command: Extract<MatrixWorkerCommand, { type: "react"; }>):
             && relation.key === key;
     });
     const existingEventId = optionalEventId(existingOwnReaction?.getId());
-    if (existingEventId) return { eventId: existingEventId };
+    if (existingEventId) {
+        convergeReactions(room, eventId);
+        return { eventId: existingEventId };
+    }
 
     const transactionId = mutationTransactionId();
     try {
         const response = await matrixClient!.sendEvent(room.roomId, EventType.Reaction, {
             "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key }
         }, transactionId);
+        convergeReactions(room, eventId);
         return { eventId: response.event_id };
     } catch (error) {
         const failedReaction = cancelFailedMutation(room, transactionId, event => {
@@ -7226,8 +7345,7 @@ async function react(command: Extract<MatrixWorkerCommand, { type: "react"; }>):
                 && relation.key === key;
         });
         if (failedReaction) {
-            invalidateReactionMap(room);
-            emitReactions(room, eventId);
+            convergeReactions(room, eventId);
         }
         throw error;
     }

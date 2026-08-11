@@ -12,6 +12,7 @@ import { findByCodeLazy, findByProps } from "@webpack";
 import { ChannelStore, closeModal, FluxDispatcher, GuildStore, MessageActions, MessageStore, NavigationRouter, PermissionsBits, ReadStateStore, RestAPI, SelectedChannelStore, SelectedGuildStore, showToast, Toasts, UserStore } from "@webpack/common";
 
 import { matrixErrorCode } from "./errorCode";
+import { projectInboundMatrixMentions, projectOutboundMatrixMentions } from "./messageMentions";
 import type {
     MatrixSecureViewBounds,
     MatrixSecureViewControlState,
@@ -142,6 +143,7 @@ export interface MatrixMessageDto {
     senderName?: string;
     timestamp: number;
     body: string;
+    mentionedUserIds?: string[];
     sticker?: true;
     edited?: boolean;
     editedAt?: number;
@@ -1099,6 +1101,75 @@ function projectMatrixContent(body: string) {
     return body.replace(/https?:\/\/[^\s<>"']+/giu, candidate => projectSocialUrl(candidate));
 }
 
+function mentionableMatrixMember(injected: InjectedRoom, matrixUserId: string): MatrixMemberDto | undefined {
+    if (matrixUserId === injected.selfMatrixId) {
+        return findMember(injected.room, matrixUserId);
+    }
+    const member = injected.room.members?.find(candidate => candidate.userId === matrixUserId);
+    return member && (member.membership == null || member.membership === "join" || member.membership === "invite")
+        ? member
+        : undefined;
+}
+
+function inboundMessageMentions(message: MatrixMessageDto, injected: InjectedRoom) {
+    const usersByMatrixId = new Map<string, ReturnType<typeof rawCurrentUser>>();
+    const resolveMatrixUserId = (matrixUserId: string) => {
+        const member = mentionableMatrixMember(injected, matrixUserId);
+        if (!member) return undefined;
+        const user = matrixUserId === injected.selfMatrixId ? rawCurrentUser() : rawMatrixUser(member);
+        usersByMatrixId.set(matrixUserId, user);
+        return {
+            matrixUserId,
+            localUserId: user.id,
+            displayText: cleanDisplayText(user.display_name ?? user.global_name ?? user.username, matrixUserId, 100),
+        };
+    };
+    const projection = projectInboundMatrixMentions(
+        message.body ?? "",
+        message.mentionedUserIds ?? [],
+        resolveMatrixUserId,
+        syntheticUserId => {
+            if (injected.selfMatrixId
+                && stableSyntheticId("user", injected.selfMatrixId) === syntheticUserId) {
+                return resolveMatrixUserId(injected.selfMatrixId);
+            }
+            const matrixUserId = matrixUserIdsBySyntheticId.get(syntheticUserId);
+            return matrixUserId && stableSyntheticId("user", matrixUserId) === syntheticUserId
+                ? resolveMatrixUserId(matrixUserId)
+                : undefined;
+        }
+    );
+    return {
+        body: projection.body,
+        users: projection.matrixUserIds
+            .map(matrixUserId => usersByMatrixId.get(matrixUserId))
+            .filter((user): user is ReturnType<typeof rawCurrentUser> => Boolean(user)),
+    };
+}
+
+function outboundMessageMentions(injected: InjectedRoom, body: string) {
+    const currentDiscordUserId = rawCurrentUser().id;
+    const currentUser = rawCurrentUser();
+    const selfPattern = new RegExp(`<@!?${currentDiscordUserId}>`, "gu");
+    const withoutSelfMention = body.replace(
+        selfPattern,
+        `@${cleanDisplayText(currentUser.display_name ?? currentUser.username, "me", 100)}`
+    );
+    return projectOutboundMatrixMentions(withoutSelfMention, syntheticUserId => {
+        const mappedUserId = matrixUserIdsBySyntheticId.get(syntheticUserId);
+        if (mappedUserId && mappedUserId !== injected.selfMatrixId
+            && stableSyntheticId("user", mappedUserId) === syntheticUserId
+            && mentionableMatrixMember(injected, mappedUserId)) {
+            return mappedUserId;
+        }
+        const member = injected.room.members?.find(candidate =>
+            candidate.userId !== injected.selfMatrixId
+            && stableSyntheticId("user", candidate.userId) === syntheticUserId
+            && (candidate.membership == null || candidate.membership === "join" || candidate.membership === "invite"));
+        return member?.userId;
+    });
+}
+
 function safePreviewEmbedUrl(candidate: string) {
     if (!candidate || candidate.length > 2_048 || /[\u0000-\u001f\u007f]/u.test(candidate)) return undefined;
     try {
@@ -1548,7 +1619,8 @@ function rawMessage(projected: ProjectedTimelineMessage, injected: InjectedRoom,
     const filenameOnlyBody = !message.sticker
         && actionAttachments.some(attachment =>
             message.body === (attachment.fileName ?? attachment.name));
-    const projectedBody = projectMatrixContent(message.body ?? "");
+    const projectedMentions = inboundMessageMentions(message, injected);
+    const projectedBody = projectMatrixContent(projectedMentions.body);
     const visibleBody = filenameOnlyBody ? "" : projectedBody;
     const attachmentFallback = (message.attachments ?? [])
         .slice(0, 10)
@@ -1581,7 +1653,7 @@ function rawMessage(projected: ProjectedTimelineMessage, injected: InjectedRoom,
             : null,
         tts: false,
         mention_everyone: false,
-        mentions: [],
+        mentions: projectedMentions.users,
         mention_roles: [],
         attachments: resolvedAttachments
             .filter(({ resolved }) => resolved.url && /^(?:https?:|blob:|data:)/.test(resolved.url))
@@ -5209,8 +5281,14 @@ export async function sendMatrixMessage(channelId: string, body: string, replyMe
     if (!injected) return false;
     const targetReplyEventId = replyEventId(injected, replyMessageId);
     if (targetReplyEventId === null) return false;
+    const projected = outboundMessageMentions(injected, body);
     try {
-        await Native.sendText(injected.room.roomId, body, targetReplyEventId);
+        await Native.sendText(
+            injected.room.roomId,
+            projected.body,
+            targetReplyEventId,
+            projected.userIds.length ? projected.userIds : undefined
+        );
         return true;
     } catch (error) {
         reportFailure("send", error);
@@ -5271,8 +5349,14 @@ export async function editMatrixMessage(channelId: string, messageId: string, bo
         return false;
     }
     if (!validRemoteEventId(target.target.editEventId)) return false;
+    const projected = outboundMessageMentions(target.injected, body);
     try {
-        await Native.edit(target.injected.room.roomId, target.target.editEventId, body);
+        await Native.edit(
+            target.injected.room.roomId,
+            target.target.editEventId,
+            projected.body,
+            projected.userIds.length ? projected.userIds : undefined
+        );
         return true;
     } catch (error) {
         reportFailure("edit", error);
