@@ -56,6 +56,8 @@ const MATRIX_ROUTE_KEY = "MatrixBridge_lastRoute";
 // older lower-priority blobs are still evicted before this limit is crossed.
 const MAX_HYDRATED_MEDIA_ITEM_BYTES = 96 * 1024 * 1024;
 const MAX_HYDRATED_MEDIA_BYTES = 128 * 1024 * 1024;
+const MAX_VIDEO_POSTER_EDGE = 960;
+const VIDEO_POSTER_LOAD_TIMEOUT_MS = 5_000;
 const PROJECTED_X_HOSTS = new Set([
     "x.com",
     "www.x.com",
@@ -265,6 +267,8 @@ type MediaCacheState = "queued" | "loading" | "ready" | "unavailable" | "failed"
 interface HydratedMedia {
     attachment: MatrixAttachmentDto;
     objectUrl: string;
+    posterObjectUrl?: string;
+    posterUrl?: string;
     byteLength: number;
 }
 
@@ -273,6 +277,8 @@ interface MediaCacheEntry {
     priority: number;
     attachment?: MatrixAttachmentDto;
     objectUrl?: string;
+    posterObjectUrl?: string;
+    posterUrl?: string;
     byteLength?: number;
     preview?: MatrixUrlPreviewDto;
 }
@@ -1475,9 +1481,164 @@ function rawEmbedMedia(media: MatrixAttachmentDto) {
     };
 }
 
+interface LocalVideoPoster {
+    width?: number;
+    height?: number;
+    objectUrl: string;
+    renderUrl: string;
+    byteLength: number;
+}
+
+function safeLocalVideoDimensions(width: unknown, height: unknown) {
+    return Number.isSafeInteger(width) && Number(width) > 0 && Number(width) <= 16_384
+        && Number.isSafeInteger(height) && Number(height) > 0 && Number(height) <= 16_384
+        && Number(width) * Number(height) <= 100_000_000
+        ? { width: Number(width), height: Number(height) }
+        : undefined;
+}
+
+function videoPosterDimensions(width: number, height: number) {
+    const scale = Math.min(1, MAX_VIDEO_POSTER_EDGE / Math.max(width, height));
+    return {
+        width: Math.max(1, Math.round(width * scale)),
+        height: Math.max(1, Math.round(height * scale)),
+    };
+}
+
+function fallbackVideoPoster(width: number, height: number) {
+    const triangle = [
+        `${Math.round(width * 0.43)},${Math.round(height * 0.32)}`,
+        `${Math.round(width * 0.43)},${Math.round(height * 0.68)}`,
+        `${Math.round(width * 0.68)},${Math.round(height * 0.5)}`,
+    ].join(" ");
+    return new Blob([
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+        `<rect width="${width}" height="${height}" fill="#1e1f22"/>`,
+        `<polygon points="${triangle}" fill="#dbdee1"/>`,
+        "</svg>",
+    ], { type: "image/svg+xml" });
+}
+
+function localVideoPosterFromBlob(
+    blob: Blob,
+    dimensions?: { width: number; height: number; }
+): LocalVideoPoster {
+    const objectUrl = URL.createObjectURL(blob);
+    return {
+        ...dimensions,
+        objectUrl,
+        renderUrl: `${objectUrl}#`,
+        byteLength: blob.size,
+    };
+}
+
+function fallbackLocalVideoPoster(width: number | undefined, height: number | undefined) {
+    const dimensions = safeLocalVideoDimensions(width, height);
+    const posterDimensions = dimensions
+        ? videoPosterDimensions(dimensions.width, dimensions.height)
+        : { width: 640, height: 360 };
+    return localVideoPosterFromBlob(
+        fallbackVideoPoster(posterDimensions.width, posterDimensions.height),
+        dimensions
+    );
+}
+
+async function canvasVideoPoster(
+    video: HTMLVideoElement,
+    width: number,
+    height: number,
+    frameReady: boolean
+) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return fallbackVideoPoster(width, height);
+
+    context.fillStyle = "#1e1f22";
+    context.fillRect(0, 0, width, height);
+    let drewFrame = false;
+    if (frameReady) {
+        try {
+            context.drawImage(video, 0, 0, width, height);
+            drewFrame = true;
+        } catch {
+            // A valid video can still have an unsupported local decoder. The
+            // stable play affordance below remains a usable native poster.
+        }
+    }
+    if (!drewFrame) {
+        context.fillStyle = "#dbdee1";
+        context.beginPath();
+        context.moveTo(Math.round(width * 0.43), Math.round(height * 0.32));
+        context.lineTo(Math.round(width * 0.43), Math.round(height * 0.68));
+        context.lineTo(Math.round(width * 0.68), Math.round(height * 0.5));
+        context.closePath();
+        context.fill();
+    }
+
+    try {
+        const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", 0.82));
+        return blob ?? fallbackVideoPoster(width, height);
+    } catch {
+        return fallbackVideoPoster(width, height);
+    }
+}
+
+async function materializeVideoPoster(
+    videoUrl: string,
+    declaredWidth: number | undefined,
+    declaredHeight: number | undefined
+): Promise<LocalVideoPoster> {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    let frameReady = false;
+    try {
+        await new Promise<void>(resolve => {
+            let settled = false;
+            const finish = (ready: boolean) => {
+                if (settled) return;
+                settled = true;
+                frameReady = ready;
+                clearTimeout(timer);
+                resolve();
+            };
+            video.onloadeddata = () => finish(true);
+            video.onerror = () => finish(false);
+            const timer = setTimeout(
+                () => finish(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA),
+                VIDEO_POSTER_LOAD_TIMEOUT_MS
+            );
+            video.src = videoUrl;
+            video.load();
+        });
+
+        const dimensions = safeLocalVideoDimensions(video.videoWidth, video.videoHeight)
+            ?? safeLocalVideoDimensions(declaredWidth, declaredHeight);
+        const posterDimensions = dimensions
+            ? videoPosterDimensions(dimensions.width, dimensions.height)
+            : { width: 640, height: 360 };
+        const blob = await canvasVideoPoster(video, posterDimensions.width, posterDimensions.height, frameReady);
+        // Discord receives this URL through a Matrix-only poster override, so
+        // it never appends its CDN `?format=webp` transform to the video Blob
+        // itself. The harmless fragment also keeps generic image resize helpers
+        // from treating the poster as a remote CDN URL.
+        return localVideoPosterFromBlob(blob, dimensions);
+    } finally {
+        video.onloadeddata = null;
+        video.onerror = null;
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+    }
+}
+
 async function materializeMedia(
     attachment: MatrixAttachmentDto,
-    result: MatrixMediaDownloadDto
+    result: MatrixMediaDownloadDto,
+    needsLocalVideoPoster = false
 ): Promise<HydratedMedia> {
     const buffer = new ArrayBuffer(result.bytes.byteLength);
     new Uint8Array(buffer).set(result.bytes);
@@ -1497,12 +1658,23 @@ async function materializeMedia(
     }
 
     const objectUrl = URL.createObjectURL(blob);
-    // Discord's image loader appends resize/format query parameters to every
-    // non-CDN URL. A query changes a Blob URL's resource key and fails to load;
-    // putting Discord's generated query after a fragment keeps the Blob URL
-    // itself intact. Discord uses the same convention for local uploads.
-    // A fragment does not change the Blob resource key, but Discord's
-    // LazyImage animation detector still inspects it as a filename hint.
+    let poster: LocalVideoPoster | undefined;
+    if (needsLocalVideoPoster && result.mimeType.toLowerCase().startsWith("video/")) {
+        try {
+            poster = await materializeVideoPoster(objectUrl, width, height);
+            width = poster.width ?? width;
+            height = poster.height ?? height;
+        } catch (error) {
+            logger.warn("Matrix video poster generation failed", error);
+            // Never hand Discord a video Blob as its own image poster. Its
+            // stock poster transform appends a query to Blob URLs, invalidating
+            // them and producing the misleading "image failed to load" state.
+            poster = fallbackLocalVideoPoster(width, height);
+        }
+    }
+    // Discord's generic media helper leaves Blob URLs intact. A fragment does
+    // not change the Blob resource key, while its LazyImage animation detector
+    // still inspects that fragment as a filename hint.
     // Mark sniffed GIF bytes so the stock GIF path, controls, and animation
     // state are used even though object URLs have no real extension.
     const renderUrl = `${objectUrl}${result.mimeType.toLowerCase() === "image/gif" ? "#.gif" : "#"}`;
@@ -1520,20 +1692,26 @@ async function materializeMedia(
             animated: result.animated ?? attachment.animated,
         },
         objectUrl,
-        byteLength: result.bytes.byteLength,
+        posterObjectUrl: poster?.objectUrl,
+        posterUrl: poster?.renderUrl,
+        byteLength: result.bytes.byteLength + (poster?.byteLength ?? 0),
     };
 }
 
 function releaseMediaEntry(entry: MediaCacheEntry) {
     if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
+    if (entry.posterObjectUrl) URL.revokeObjectURL(entry.posterObjectUrl);
     hydratedMediaBytes = Math.max(0, hydratedMediaBytes - (entry.byteLength ?? 0));
     entry.objectUrl = undefined;
+    entry.posterObjectUrl = undefined;
+    entry.posterUrl = undefined;
     entry.attachment = undefined;
     entry.byteLength = undefined;
 }
 
 function discardHydratedMedia(media: HydratedMedia) {
     URL.revokeObjectURL(media.objectUrl);
+    if (media.posterObjectUrl) URL.revokeObjectURL(media.posterObjectUrl);
 }
 
 function makeRoomForHydratedMedia(byteLength: number, priority: number) {
@@ -1612,6 +1790,8 @@ async function runMediaJob(job: MediaJob, entry: MediaCacheEntry) {
     entry.state = "ready";
     entry.attachment = media.attachment;
     entry.objectUrl = media.objectUrl;
+    entry.posterObjectUrl = media.posterObjectUrl;
+    entry.posterUrl = media.posterUrl;
     entry.byteLength = media.byteLength;
     hydratedMediaBytes += media.byteLength;
     scheduleMediaSnapshotRefresh();
@@ -1660,7 +1840,8 @@ function mediaCandidates(room: MatrixRoomDto): MediaCandidate[] {
             const key = attachmentMediaKey(message, attachment, 0);
             addCandidate(key, async () => materializeMedia(
                 attachment,
-                await Native.downloadMedia(message.roomId, message.eventId, 0) as MatrixMediaDownloadDto
+                await Native.downloadMedia(message.roomId, message.eventId, 0) as MatrixMediaDownloadDto,
+                true
             ));
         } else if (!message.attachments?.length) {
             const key = previewMediaKey(message);
@@ -1728,8 +1909,10 @@ function prepareRoomMedia(room: MatrixRoomDto | undefined) {
     wantedMediaKeys = new Set(candidates.map(candidate => candidate.key));
     mediaQueue = mediaQueue.filter(job => wantedMediaKeys.has(job.key));
 
+    let projectionNeedsRefresh = false;
     for (const [key, entry] of mediaCache) {
         if (wantedMediaKeys.has(key)) continue;
+        projectionNeedsRefresh ||= entry.state === "ready" && Boolean(entry.attachment);
         releaseMediaEntry(entry);
         mediaCache.delete(key);
     }
@@ -1740,9 +1923,14 @@ function prepareRoomMedia(room: MatrixRoomDto | undefined) {
             current.priority = candidate.priority;
             continue;
         }
+        projectionNeedsRefresh = true;
         mediaCache.set(candidate.key, { state: "queued", priority: candidate.priority });
         mediaQueue.push({ key: candidate.key, generation: mediaGeneration, load: candidate.load });
     }
+    // Discord retains parsed attachment records independently from this cache.
+    // Rebuild the active bounded timeline both when a Blob is retired and when
+    // an earlier visit left a stale row whose replacement is only now queued.
+    if (projectionNeedsRefresh) scheduleMediaSnapshotRefresh();
     pumpMediaQueue();
 }
 
@@ -3713,9 +3901,25 @@ export function isMatrixMediaUrl(value: unknown) {
     if (typeof value !== "string") return false;
     for (const entry of mediaCache.values()) {
         if (entry.state !== "ready" || !entry.attachment) continue;
-        if (entry.attachment.url === value || entry.attachment.proxyUrl === value) return true;
+        if (entry.attachment.url === value || entry.attachment.proxyUrl === value || entry.posterUrl === value) return true;
     }
     return false;
+}
+
+/**
+ * Discord's attachment player derives a poster by adding `?format=webp` to
+ * proxy_url. That is valid for Discord's CDN but invalidates an exact Blob URL.
+ * The renderer patch calls this only at the poster boundary; the video source
+ * remains the original locally-owned Blob.
+ */
+export function getMatrixVideoPosterUrl(value: unknown) {
+    if (typeof value !== "string") return undefined;
+    for (const entry of mediaCache.values()) {
+        if (entry.state !== "ready" || !entry.posterUrl
+            || !entry.attachment?.mimeType?.toLowerCase().startsWith("video/")) continue;
+        if (entry.attachment.url === value || entry.attachment.proxyUrl === value) return entry.posterUrl;
+    }
+    return undefined;
 }
 
 function containsSyntheticId(value: unknown, depth = 0): boolean {

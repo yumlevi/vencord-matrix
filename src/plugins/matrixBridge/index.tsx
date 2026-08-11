@@ -51,6 +51,7 @@ import {
     getMatrixInviteContext,
     getMatrixSendSessionToken,
     getMatrixSpaceCreateContext,
+    getMatrixVideoPosterUrl,
     hasMatrixRecipients,
     installReadStateProjection,
     installRestGuard,
@@ -89,6 +90,7 @@ import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
 import { openMatrixSpaceChildModal } from "./spaceCreate";
 import type { MatrixAttachmentGroupDTO, MatrixPowerLevelPermissionDTO } from "./types";
+import { MATRIX_VIDEO_POSTER_PATCH, MATRIX_VIDEO_POSTER_REPLACEMENT } from "./videoPosterPatch";
 
 const settings = definePluginSettings({
     encryptedRoomProviderPreviews: {
@@ -1093,6 +1095,18 @@ export default definePlugin({
             },
         },
         {
+            // Discord's CDN proxy can derive a still poster from a video by
+            // appending ?format=webp. Matrix videos are renderer-local Blobs,
+            // where that query changes the resource key and fails. Substitute
+            // only our separately generated poster while leaving the player
+            // source and every normal Discord attachment untouched.
+            find: "disableArrowKeySeek:!0",
+            replacement: {
+                match: MATRIX_VIDEO_POSTER_PATCH,
+                replace: MATRIX_VIDEO_POSTER_REPLACEMENT,
+            },
+        },
+        {
             find: '"MessageManager"',
             replacement: {
                 match: /forceFetch:\i,isPreload:.+?}=(\i);(?=.+?getChannel\((\i)\))/,
@@ -1514,6 +1528,7 @@ export default definePlugin({
     isMatrixChannelId,
     isMatrixGuildId,
     isMatrixMediaUrl,
+    getMatrixVideoPosterUrl,
     hasMatrixRecipients,
     openMatrixPrivateChannel,
     renderMatrixGroupChatHeaderButton,

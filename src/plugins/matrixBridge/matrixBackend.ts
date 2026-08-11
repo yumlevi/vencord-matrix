@@ -119,6 +119,7 @@ import type {
     MatrixUrlPreviewDTO,
     MatrixUrlPreviewMediaDTO
 } from "./types";
+import { sniffVideoContainerMetadata } from "./videoContainerMetadata";
 import type {
     MatrixCredentialUpdate,
     MatrixJoinedRoomIdsResult,
@@ -1601,30 +1602,8 @@ function sniffedMedia(bytes: Uint8Array, _declared?: string, _server?: string): 
 
     const declared = normalizedMimeType(_declared);
     const server = normalizedMimeType(_server);
-    const mp4Brands = new Set(["avc1", "dash", "iso2", "iso3", "iso4", "iso5", "iso6", "isom", "M4V ", "mp41", "mp42"]);
-    const mp4AudioBrands = new Set(["M4A ", "M4B ", "F4A ", "F4B "]);
-    if (bytes.byteLength >= 16 && String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp") {
-        const boxSize = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
-        if (boxSize >= 16 && boxSize <= Math.min(bytes.byteLength, 4_096) && boxSize % 4 === 0) {
-            let audio = false;
-            let video = false;
-            for (let offset = 8; offset + 4 <= boxSize; offset += 4) {
-                if (offset === 12) continue; // minor_version is not a brand
-                const brand = String.fromCharCode(...bytes.subarray(offset, offset + 4));
-                audio ||= mp4AudioBrands.has(brand);
-                video ||= mp4Brands.has(brand);
-            }
-            if (audio) return { mimeType: "audio/mp4" };
-            if (video) return { mimeType: "video/mp4" };
-        }
-    }
-
-    const webmHeader = bytes.byteLength >= 16
-        && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3;
-    if (webmHeader && (declared === "video/webm" || server === "video/webm")) {
-        const headerText = new TextDecoder("ascii").decode(bytes.subarray(0, Math.min(bytes.byteLength, 4_096)));
-        if (headerText.includes("webm")) return { mimeType: "video/webm" };
-    }
+    const videoContainer = sniffVideoContainerMetadata(bytes, declared, server);
+    if (videoContainer) return videoContainer;
 
     if (isMp3(bytes)) return { mimeType: "audio/mpeg" };
     if (isOggAudio(bytes)) return { mimeType: "audio/ogg" };
@@ -1701,6 +1680,7 @@ function safeDownloadedName(name: string, mimeType: string): string {
                 : mimeType === "image/webp" ? ".webp"
                     : mimeType === "video/mp4" ? ".mp4"
                         : mimeType === "video/webm" ? ".webm"
+                            : mimeType === "video/quicktime" ? ".mov"
                             : mimeType === "audio/mpeg" ? ".mp3"
                                 : mimeType === "audio/ogg" ? ".ogg"
                                     : mimeType === "audio/wav" ? ".wav"
