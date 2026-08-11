@@ -62,6 +62,8 @@ import type {
 export const MATRIX_WORKER_ORIGIN = "https://matrix-worker.invalid";
 export const MATRIX_WORKER_COMMAND = "VencordMatrixBridge:command";
 export const MATRIX_WORKER_FETCH_KLIPY_PREVIEW = "VencordMatrixBridge:fetchKlipyPreview";
+export const MATRIX_WORKER_FETCH_TENOR_PREVIEW = "VencordMatrixBridge:fetchTenorPreview";
+export const MATRIX_WORKER_FETCH_X_STATUS = "VencordMatrixBridge:fetchXStatus";
 export const MATRIX_WORKER_MESSAGE = "VencordMatrixBridge:message";
 export const MATRIX_WORKER_SAVE_CREDENTIALS = "VencordMatrixBridge:saveCredentials";
 
@@ -131,8 +133,9 @@ export type MatrixWorkerCommand =
     | { type: "suggestedSpaceChannelPlan"; spaceId: string; }
     | { type: "joinSuggestedSpaceChannels"; request: MatrixJoinSuggestedSpaceChannelsRequest; }
     | { type: "openDirectMessage"; spaceId: string; userId: string; }
-    | { type: "downloadMedia"; roomId: string; eventId: string; attachmentIndex: number; }
-    | { type: "urlPreview"; roomId: string; eventId: string; }
+    | { type: "providerPreviewPolicy"; allowDirectMedia: boolean; }
+    | { type: "downloadMedia"; roomId: string; eventId: string; attachmentIndex: number; allowDirectMedia: boolean; }
+    | { type: "urlPreview"; roomId: string; eventId: string; allowDirectMedia: boolean; }
     | { type: "sendText"; roomId: string; body: string; replyEventId?: string; mentionedUserIds?: string[]; }
     | { type: "sendSticker"; roomId: string; sticker: MatrixStickerSendRequest; }
     | { type: "sendAttachment"; roomId: string; attachment: MatrixAttachmentSendRequest; }
@@ -221,6 +224,8 @@ export interface MatrixWorkerHost {
     ready(): void;
     saveCredentials(credentials: MatrixCredentialUpdate): Promise<void>;
     fetchKlipyPreview(url: string): Promise<string | undefined>;
+    fetchTenorPreview(url: string): Promise<string | undefined>;
+    fetchXStatus(url: string): Promise<string | undefined>;
 }
 
 declare global {

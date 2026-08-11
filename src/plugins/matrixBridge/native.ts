@@ -9,6 +9,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
+import { RendererSettings } from "@main/settings";
 import { DATA_DIR } from "@main/utils/constants";
 import {
     app,
@@ -128,6 +129,8 @@ import type {
 import {
     MATRIX_WORKER_COMMAND,
     MATRIX_WORKER_FETCH_KLIPY_PREVIEW,
+    MATRIX_WORKER_FETCH_TENOR_PREVIEW,
+    MATRIX_WORKER_FETCH_X_STATUS,
     MATRIX_WORKER_MESSAGE,
     MATRIX_WORKER_ORIGIN,
     MATRIX_WORKER_SAVE_CREDENTIALS,
@@ -210,9 +213,10 @@ const MAX_IMAGE_PIXELS = 33_554_432;
 const ATTACHMENT_GROUP_ID_PATTERN = /^vcgrp_[0-9a-f]{64}$/u;
 const SPACE_CHILD_CREATION_MARKER_PATTERN = /^vccreate_[0-9a-f]{64}$/u;
 const GROUP_CHAT_CREATION_MARKER_PATTERN = /^vcgroup_[0-9a-f]{64}$/u;
-const MAX_KLIPY_PREVIEW_HTML_BYTES = 512 * 1024;
-const KLIPY_PREVIEW_TIMEOUT_MS = 15_000;
-const KLIPY_PREVIEW_USER_AGENT = "Vencord-MatrixBridge/1.0 Discordbot/2.0";
+const MAX_PROVIDER_PREVIEW_DOCUMENT_BYTES = 512 * 1024;
+const PROVIDER_PREVIEW_TIMEOUT_MS = 15_000;
+const PROVIDER_PREVIEW_USER_AGENT = "Vencord-MatrixBridge/1.0 Discordbot/2.0";
+const activeProviderPreviewRequests = new Set<Electron.ClientRequest>();
 const ACCOUNT_CUT_MAX_ATTEMPTS = 3;
 
 const SECURE_VIEW_CSP = [
@@ -2041,22 +2045,63 @@ function validateKlipyShareUrl(value: unknown): string {
     return url.href;
 }
 
+function validateFxTwitterStatusUrl(value: unknown): string {
+    const input = validateString(value, "FxTwitter status URL", 2_048);
+    let url: URL;
+    try {
+        url = new URL(input);
+    } catch {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The FxTwitter status URL is invalid.");
+    }
+    if (url.protocol !== "https:" || url.hostname !== "api.fxtwitter.com"
+        || url.username || url.password || url.port || url.search || url.hash
+        || url.href !== input
+        || !/^\/2\/status\/\d{2,20}$/u.test(url.pathname)) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The FxTwitter status URL is invalid.");
+    }
+    return url.href;
+}
+
+function validateTenorShareUrl(value: unknown): string {
+    const input = validateString(value, "Tenor preview URL", 2_048);
+    let url: URL;
+    try {
+        url = new URL(input);
+    } catch {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Tenor preview URL is invalid.");
+    }
+    if (url.protocol !== "https:" || (url.hostname !== "tenor.com" && url.hostname !== "www.tenor.com")
+        || url.username || url.password || url.port || url.search || url.hash
+        || url.href !== input
+        || !/^\/view\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,238}[A-Za-z0-9])?-gif-[1-9][0-9]{0,19}$/u.test(url.pathname)) {
+        throw bridgeError("MATRIX_INVALID_ARGUMENT", "The Tenor preview URL is invalid.");
+    }
+    url.hostname = "tenor.com";
+    return url.href;
+}
+
+function encryptedRoomProviderPreviewsEnabled(): boolean {
+    const settings = RendererSettings.store.plugins?.MatrixBridge;
+    return settings?.enabled !== false && settings?.encryptedRoomProviderPreviews !== false;
+}
+
 function responseHeader(headers: Record<string, string | string[]>, name: string): string | undefined {
     const value = headers[name.toLowerCase()];
     return Array.isArray(value) ? value[0] : value;
 }
 
-function requestKlipyPreview(url: string): Promise<string | undefined> {
+function requestProviderPreview(url: string, format: "html" | "json"): Promise<string | undefined> {
     return new Promise(resolve => {
         let settled = false;
+        let request: Electron.ClientRequest | undefined;
         const finish = (value?: string) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            if (request) activeProviderPreviewRequests.delete(request);
             resolve(value);
         };
 
-        let request: Electron.ClientRequest;
         try {
             request = net.request({
                 method: "GET",
@@ -2071,8 +2116,9 @@ function requestKlipyPreview(url: string): Promise<string | undefined> {
             });
             // ClientRequest permits User-Agent while fetch treats it as a forbidden
             // header and silently substitutes Electron's default in some releases.
-            request.setHeader("Accept", "text/html");
-            request.setHeader("User-Agent", KLIPY_PREVIEW_USER_AGENT);
+            request.setHeader("Accept", format === "json" ? "application/json" : "text/html");
+            request.setHeader("User-Agent", PROVIDER_PREVIEW_USER_AGENT);
+            activeProviderPreviewRequests.add(request);
         } catch {
             settled = true;
             resolve(undefined);
@@ -2080,11 +2126,11 @@ function requestKlipyPreview(url: string): Promise<string | undefined> {
         }
 
         const timer = setTimeout(() => {
-            request.abort();
+            request?.abort();
             finish();
-        }, KLIPY_PREVIEW_TIMEOUT_MS);
+        }, PROVIDER_PREVIEW_TIMEOUT_MS);
         request.on("redirect", () => {
-            request.abort();
+            request?.abort();
             finish();
         });
         request.on("error", () => finish());
@@ -2094,11 +2140,12 @@ function requestKlipyPreview(url: string): Promise<string | undefined> {
                 .trim()
                 .toLowerCase();
             const contentLength = responseHeader(response.headers, "content-length");
-            if (response.statusCode !== 200 || contentType !== "text/html"
+            const expectedContentType = format === "json" ? "application/json" : "text/html";
+            if (response.statusCode !== 200 || contentType !== expectedContentType
                 || (contentLength && /^\d+$/u.test(contentLength)
                     && Number.isSafeInteger(Number(contentLength))
-                    && Number(contentLength) > MAX_KLIPY_PREVIEW_HTML_BYTES)) {
-                request.abort();
+                    && Number(contentLength) > MAX_PROVIDER_PREVIEW_DOCUMENT_BYTES)) {
+                request?.abort();
                 finish();
                 return;
             }
@@ -2120,8 +2167,8 @@ function requestKlipyPreview(url: string): Promise<string | undefined> {
             response.on("data", chunk => {
                 if (settled) return;
                 length += chunk.byteLength;
-                if (length > MAX_KLIPY_PREVIEW_HTML_BYTES) {
-                    request.abort();
+                if (length > MAX_PROVIDER_PREVIEW_DOCUMENT_BYTES) {
+                    request?.abort();
                     finish();
                     return;
                 }
@@ -2959,7 +3006,8 @@ function secureViewSecurityState(): MatrixSecureViewSecurityState {
         isolated: true,
         transport: "private-ipc",
         backendConnected: hasLiveWorker(),
-        persistentE2EE: true
+        persistentE2EE: true,
+        encryptedRoomProviderPreviews: encryptedRoomProviderPreviewsEnabled()
     };
 }
 
@@ -4069,7 +4117,8 @@ ipcMain.handle(MATRIX_WORKER_SAVE_CREDENTIALS, async (event, update: MatrixCrede
 });
 
 ipcMain.handle(MATRIX_WORKER_FETCH_KLIPY_PREVIEW, async (event, input: unknown) => {
-    if (!workerWindow || event.sender !== workerWindow.webContents) return undefined;
+    if (!workerWindow || event.sender !== workerWindow.webContents
+        || !encryptedRoomProviderPreviewsEnabled()) return undefined;
 
     let url: string;
     try {
@@ -4078,7 +4127,38 @@ ipcMain.handle(MATRIX_WORKER_FETCH_KLIPY_PREVIEW, async (event, input: unknown) 
         return undefined;
     }
 
-    return await requestKlipyPreview(url);
+    if (!encryptedRoomProviderPreviewsEnabled()) return undefined;
+    return await requestProviderPreview(url, "html");
+});
+
+ipcMain.handle(MATRIX_WORKER_FETCH_TENOR_PREVIEW, async (event, input: unknown) => {
+    if (!workerWindow || event.sender !== workerWindow.webContents
+        || !encryptedRoomProviderPreviewsEnabled()) return undefined;
+
+    let url: string;
+    try {
+        url = validateTenorShareUrl(input);
+    } catch {
+        return undefined;
+    }
+
+    if (!encryptedRoomProviderPreviewsEnabled()) return undefined;
+    return await requestProviderPreview(url, "html");
+});
+
+ipcMain.handle(MATRIX_WORKER_FETCH_X_STATUS, async (event, input: unknown) => {
+    if (!workerWindow || event.sender !== workerWindow.webContents
+        || !encryptedRoomProviderPreviewsEnabled()) return undefined;
+
+    let url: string;
+    try {
+        url = validateFxTwitterStatusUrl(input);
+    } catch {
+        return undefined;
+    }
+
+    if (!encryptedRoomProviderPreviewsEnabled()) return undefined;
+    return await requestProviderPreview(url, "json");
 });
 
 async function ensureWorker(): Promise<void> {
@@ -7253,7 +7333,8 @@ async function downloadMedia(
         type: "downloadMedia",
         roomId: validateRoomId(roomId),
         eventId: validateEventId(eventId),
-        attachmentIndex
+        attachmentIndex,
+        allowDirectMedia: encryptedRoomProviderPreviewsEnabled()
     });
     const maximumBytes = attachmentIndex === 1
         ? MAX_PREVIEW_VIDEO_DOWNLOAD_BYTES
@@ -7354,7 +7435,8 @@ async function urlPreview(
     const result = await callWorker<MatrixUrlPreviewDTO | undefined>({
         type: "urlPreview",
         roomId: validateRoomId(roomId),
-        eventId: validateEventId(eventId)
+        eventId: validateEventId(eventId),
+        allowDirectMedia: encryptedRoomProviderPreviewsEnabled()
     });
     if (result == null) return undefined;
     if (typeof result !== "object" || typeof result.url !== "string" || result.url.length > 2_048) {
@@ -8650,6 +8732,45 @@ export async function secureViewDispose(event: IpcMainInvokeEvent): Promise<void
     if (state) disposeSecureViewState(state);
 }
 
+async function setEncryptedRoomProviderPreviews(
+    _: IpcMainInvokeEvent,
+    enabled: boolean
+): Promise<void> {
+    if (typeof enabled !== "boolean" || enabled !== encryptedRoomProviderPreviewsEnabled()) {
+        throw bridgeError(
+            "MATRIX_INVALID_ARGUMENT",
+            "The provider-preview policy did not match the authoritative Matrix Bridge setting."
+        );
+    }
+    await applyProviderPreviewPolicy(enabled);
+}
+
+async function applyProviderPreviewPolicy(enabled: boolean): Promise<void> {
+    if (!enabled) {
+        for (const request of activeProviderPreviewRequests) request.abort();
+        activeProviderPreviewRequests.clear();
+    }
+    if (hasLiveWorker()) {
+        await callWorker({ type: "providerPreviewPolicy", allowDirectMedia: enabled });
+    }
+    broadcastSecureViewEvent({ type: "security", security: secureViewSecurityState() });
+}
+
+function onProviderPreviewSettingChanged(): void {
+    const enabled = encryptedRoomProviderPreviewsEnabled();
+    void applyProviderPreviewPolicy(enabled).catch(() => {
+        // A stopped worker needs no cache revocation. The next request carries
+        // the current authoritative bit, while secure views still learn it now.
+        broadcastSecureViewEvent({ type: "security", security: secureViewSecurityState() });
+    });
+}
+
+RendererSettings.addChangeListener("plugins.MatrixBridge.enabled", onProviderPreviewSettingChanged);
+RendererSettings.addChangeListener(
+    "plugins.MatrixBridge.encryptedRoomProviderPreviews",
+    onProviderPreviewSettingChanged
+);
+
 // Discord-native mode deliberately receives normalized Matrix DTOs while the
 // access token, crypto stores, SDK client, and homeserver pagination tokens
 // remain confined to main/worker processes. Strict isolated-view mode keeps
@@ -8701,6 +8822,7 @@ export {
     sendAttachment,
     sendSticker,
     sendText,
+    setEncryptedRoomProviderPreviews,
     snapshot,
     spaceChildren,
     start,

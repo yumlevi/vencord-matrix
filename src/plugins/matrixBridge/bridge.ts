@@ -51,14 +51,6 @@ const MATRIX_ROUTE_KEY = "MatrixBridge_lastRoute";
 // older lower-priority blobs are still evicted before this limit is crossed.
 const MAX_HYDRATED_MEDIA_ITEM_BYTES = 96 * 1024 * 1024;
 const MAX_HYDRATED_MEDIA_BYTES = 128 * 1024 * 1024;
-const PROJECTED_SOCIAL_HOSTS = new Set([
-    "x.com",
-    "www.x.com",
-    "mobile.x.com",
-    "twitter.com",
-    "www.twitter.com",
-    "mobile.twitter.com",
-]);
 
 const createChannelRecordFromServer = findByCodeLazy(".GUILD_TEXT]", "fromServer)");
 
@@ -1071,37 +1063,6 @@ function previewUrlToken(body: string) {
     return body.match(/https?:\/\/[^\s<>"']+/iu)?.[0];
 }
 
-function projectSocialUrl(candidate: string) {
-    try {
-        const url = new URL(candidate);
-        if (!PROJECTED_SOCIAL_HOSTS.has(url.hostname.toLowerCase())
-            || (url.protocol !== "http:" && url.protocol !== "https:")
-            || url.username || url.password) {
-            return candidate;
-        }
-
-        const authorityStart = candidate.indexOf("://") + 3;
-        const authorityTail = candidate.slice(authorityStart);
-        const separator = authorityTail.search(/[/?#]/u);
-        const authorityEnd = separator === -1 ? candidate.length : authorityStart + separator;
-        const rawAuthority = candidate.slice(authorityStart, authorityEnd);
-        // Comparing the raw authority also rejects credentials and explicit
-        // non-default ports which URL parsing may otherwise normalize away.
-        const hostname = url.hostname.toLowerCase();
-        const allowedAuthorities = url.protocol === "https:"
-            ? [hostname, `${hostname}:443`]
-            : [hostname, `${hostname}:80`];
-        if (!allowedAuthorities.includes(rawAuthority.toLowerCase())) return candidate;
-        return `https://girlcockx.com${candidate.slice(authorityEnd)}`;
-    } catch {
-        return candidate;
-    }
-}
-
-function projectMatrixContent(body: string) {
-    return body.replace(/https?:\/\/[^\s<>"']+/giu, candidate => projectSocialUrl(candidate));
-}
-
 function mentionableMatrixMember(injected: InjectedRoom, matrixUserId: string): MatrixMemberDto | undefined {
     if (matrixUserId === injected.selfMatrixId) {
         return findMember(injected.room, matrixUserId);
@@ -1388,6 +1349,11 @@ function mediaCandidates(room: MatrixRoomDto): MediaCandidate[] {
     };
 
     for (const message of messages) {
+        // Media commands are tied to the authoritative Matrix event. Local
+        // echoes use ~room:transaction IDs which the native boundary correctly
+        // rejects; the remote echo will enqueue the same media under its
+        // canonical $ event ID.
+        if (!message.eventId.startsWith("$")) continue;
         const attachment = message.attachments?.[0];
         if (attachment?.downloadable) {
             const key = attachmentMediaKey(message, attachment, 0);
@@ -1489,6 +1455,25 @@ function clearMediaHydration() {
     hydratedMediaBytes = 0;
 }
 
+export async function setEncryptedRoomProviderPreviewsPolicy(enabled: boolean) {
+    // Apply the native egress policy before rebuilding any preview jobs. This
+    // keeps a preference transition fail-closed and makes both the Discord
+    // projection and the isolated secure view use the same consent state.
+    try {
+        await Native.setEncryptedRoomProviderPreviews(enabled);
+    } finally {
+        // Clearing is also required when worker synchronization fails: the
+        // main setting still gates every subsequent native request, and stale
+        // blobs/null-cache entries must not misrepresent that effective state.
+        clearMediaHydration();
+        const active = activeMatrixChannelId ? roomsByChannel.get(activeMatrixChannelId) : undefined;
+        if (active) {
+            prepareRoomMedia(active.room);
+            reinjectRoomTimelines(active.room.roomId);
+        }
+    }
+}
+
 function resolvedAttachment(message: MatrixMessageDto, attachment: MatrixAttachmentDto, index: number) {
     const entry = mediaCache.get(attachmentMediaKey(message, attachment, index));
     return entry?.state === "ready" && entry.attachment ? entry.attachment : attachment;
@@ -1564,7 +1549,7 @@ function rawStickerImage(image: MatrixAttachmentDto) {
 }
 
 function stickerBodyFallback(body: string) {
-    return projectMatrixContent(body)
+    return body
         .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
         .trim()
         .slice(0, STICKER_BODY_FALLBACK_MAX)
@@ -1622,7 +1607,7 @@ function rawMessage(projected: ProjectedTimelineMessage, injected: InjectedRoom,
         && actionAttachments.some(attachment =>
             message.body === (attachment.fileName ?? attachment.name));
     const projectedMentions = inboundMessageMentions(message, injected);
-    const projectedBody = projectMatrixContent(projectedMentions.body);
+    const projectedBody = projectedMentions.body;
     const visibleBody = filenameOnlyBody ? "" : projectedBody;
     const attachmentFallback = (message.attachments ?? [])
         .slice(0, 10)

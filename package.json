@@ -31,7 +31,7 @@
         "lint-styles": "stylelint \"src/**/*.css\" --ignore-pattern src/userplugins",
         "lint:fix": "pnpm lint --fix",
         "test": "pnpm buildStandalone && pnpm testTsc && pnpm test:matrix && pnpm lint && pnpm lint-styles && pnpm generatePluginJson",
-        "test:matrix": "tsx scripts/testMatrixCreateSpaceChildErrors.ts && tsx scripts/testMatrixErrorCode.ts && tsx scripts/testMatrixGroupChat.ts && tsx scripts/testMatrixGroupChatUi.ts && tsx scripts/testMatrixHistoryTimeline.ts && tsx scripts/testMatrixInviteUi.ts && tsx scripts/testMatrixMessageMentions.ts && tsx scripts/testMatrixReactionProjection.ts && tsx scripts/testMatrixReauthentication.ts && tsx scripts/testMatrixSpaceAccess.ts && tsx scripts/testMatrixSpaceInvites.ts && tsx scripts/testMatrixSpaceSearchGraph.ts && tsx scripts/testMatrixStartupRecovery.ts",
+        "test:matrix": "tsx scripts/testMatrixCreateSpaceChildErrors.ts && tsx scripts/testMatrixErrorCode.ts && tsx scripts/testMatrixGroupChat.ts && tsx scripts/testMatrixGroupChatUi.ts && tsx scripts/testMatrixHistoryTimeline.ts && tsx scripts/testMatrixInviteUi.ts && tsx scripts/testMatrixMessageMentions.ts && tsx scripts/testMatrixProviderPreviews.ts && tsx scripts/testMatrixReactionProjection.ts && tsx scripts/testMatrixReauthentication.ts && tsx scripts/testMatrixSpaceAccess.ts && tsx scripts/testMatrixSpaceInvites.ts && tsx scripts/testMatrixSpaceSearchGraph.ts && tsx scripts/testMatrixStartupRecovery.ts",
         "testWeb": "pnpm lint && pnpm buildWeb && pnpm testTsc",
         "testTsc": "tsc --noEmit"
     },

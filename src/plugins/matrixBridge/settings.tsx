@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { useSettings as useVencordSettings } from "@api/Settings";
 import { Button } from "@components/Button";
 import { Heading } from "@components/Heading";
 import { Paragraph } from "@components/Paragraph";
@@ -716,6 +717,9 @@ function CreateMatrixServerModal({
 }
 
 export function MatrixSettings() {
+    const matrixBridgeSettings = useVencordSettings([
+        "plugins.MatrixBridge.encryptedRoomProviderPreviews" as any,
+    ]).plugins.MatrixBridge as { encryptedRoomProviderPreviews?: boolean; };
     const [tab, setTab] = useState<SettingsTab>("rooms");
     const [mode, setMode] = useState<AuthMode>("login");
     const [homeserver, setHomeserver] = useState("");
@@ -1923,8 +1927,22 @@ export function MatrixSettings() {
                         Matrix message contents are not intentionally sent through Discord&apos;s message APIs. They are decrypted locally and copied into Discord&apos;s renderer so this UI can display them. Discord&apos;s app code and other installed client plugins can therefore read that plaintext in memory; this bridge cannot make the closed-source renderer cryptographically unable to inspect it. Synthetic Matrix IDs are blocked from Discord&apos;s REST API.
                     </Paragraph>
                     <Paragraph>
-                        GIF and X video cards may load media directly from KLIPY or Twitter&apos;s media CDN when the homeserver cannot proxy it. Those providers can see your IP address and request timing; encrypted-room link previews stay disabled.
+                        Supported encrypted-room GIF, Tenor, and X previews load automatically by default. KLIPY, Tenor, FxTwitter, and their media hosts can see your IP address, the public link, and request timing. You can turn this off below. Other encrypted-room link previews stay disabled. Uploaded attachments are unaffected.
                     </Paragraph>
+                    <Checkbox
+                        value={matrixBridgeSettings.encryptedRoomProviderPreviews !== false}
+                        size={20}
+                        onChange={(_, enabled) => {
+                            matrixBridgeSettings.encryptedRoomProviderPreviews = enabled;
+                        }}
+                    >
+                        <span className="vc-matrix-checkbox-copy">
+                            <strong>Load encrypted-room KLIPY GIF, Tenor, and X previews</strong>
+                            <span>
+                                Automatically contacts KLIPY (klipy.com, static.klipy.com, static2.klipy.com), Tenor (tenor.com, media.tenor.com, media1.tenor.com), FxTwitter (api.fxtwitter.com), or X media hosts (pbs.twimg.com, video.twimg.com). They can see your IP address, the public link, and request timing. Other encrypted-room links remain text only.
+                            </span>
+                        </span>
+                    </Checkbox>
                 </div>
 
                 {!config?.configured ? (

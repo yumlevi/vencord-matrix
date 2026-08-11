@@ -1375,6 +1375,13 @@ function handleHostEvent(event: MatrixSecureViewEvent) {
             if (event.command.type === "openSearch") openSearch();
             break;
         case "security":
+            if (security?.encryptedRoomProviderPreviews
+                !== event.security.encryptedRoomProviderPreviews) {
+                // A prior null preview or hydrated Blob must not survive an
+                // egress-policy transition. Re-rendering will discover the
+                // visible room again under the new authoritative policy.
+                clearMedia();
+            }
             security = event.security;
             scheduleRender();
             break;
@@ -2177,7 +2184,7 @@ function evictMedia() {
 }
 
 function queueMedia(roomId: string, eventId: string, attachmentIndex: number, kind = "attachment", retry = false) {
-    if (!host) return;
+    if (!host || !eventId.startsWith("$")) return;
     const key = mediaKey(roomId, eventId, attachmentIndex, kind);
     disarmViewportTask(`media\0${key}`);
     if (retry) {
@@ -2207,6 +2214,7 @@ function queueMediaAutomatically(
     kind: string,
     estimatedBytes: number | undefined,
 ) {
+    if (!eventId.startsWith("$")) return;
     const key = mediaKey(roomId, eventId, attachmentIndex, kind);
     if (mediaCache.has(key) || mediaTombstones.has(key)) return;
     const nativeCap = kind === "preview-video" ? 96 * 1024 * 1024 : MAX_UPLOAD_BYTES;
@@ -2281,7 +2289,8 @@ function pumpMediaQueue() {
 }
 
 function queuePreview(message: MatrixMessageDTO, force = false) {
-    if (!host || previewCache.has(message.eventId) || previewLoading.has(message.eventId)) return;
+    if (!host || !message.eventId.startsWith("$")
+        || previewCache.has(message.eventId) || previewLoading.has(message.eventId)) return;
     if (!URL_PATTERN.test(message.body)) return;
     if (!force && previewDeferred.has(message.eventId)) return;
     if (!force && autoPreviewRequests >= MAX_AUTO_PREVIEW_REQUESTS) {

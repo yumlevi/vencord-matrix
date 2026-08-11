@@ -199,6 +199,7 @@ export interface MatrixSecureViewSecurityState {
     transport: "private-ipc";
     backendConnected: boolean;
     persistentE2EE: true;
+    encryptedRoomProviderPreviews: boolean;
 }
 
 export interface MatrixSecureViewBootstrap {
