@@ -185,6 +185,12 @@ export interface MatrixSecureViewSaveResult {
     saved: boolean;
 }
 
+export interface MatrixSecureViewRoomKeyImportResult {
+    canceled: boolean;
+    importedSessions: number;
+    snapshot?: MatrixSnapshot;
+}
+
 /** Account metadata safe to show in the isolated account UI. Tokens are excluded. */
 export interface MatrixSecureViewAccountConfig {
     configured: boolean;
@@ -226,6 +232,10 @@ export interface MatrixSecureViewRequestMap {
     login: { input: { login: MatrixLoginRequest; }; output: MatrixSnapshot; };
     register: { input: { registration: MatrixRegistrationRequest; }; output: MatrixSnapshot; };
     logout: { input: {}; output: void; };
+    importRoomKeys: {
+        input: { passphrase: string; };
+        output: MatrixSecureViewRoomKeyImportResult;
+    };
 
     publicRooms: { input: {}; output: MatrixPublicRoomDirectoryDTO; };
     joinRoom: { input: { roomId: string; }; output: MatrixJoinRoomResult; };

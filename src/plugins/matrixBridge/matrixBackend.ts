@@ -37,6 +37,8 @@ import {
     isCurrentMatrixTimelineGeneration,
     isMainMatrixTimelineReset
 } from "./historyTimeline";
+import { convergeImportedRoomKeys } from "./keyImportConvergence";
+import { importEncryptedMegolmKeyExport, MegolmKeyImportError } from "./megolmKeyImport";
 import {
     introducedMatrixMentionUserIds,
     materializeOutboundMatrixMentions,
@@ -123,6 +125,7 @@ import { sniffVideoContainerMetadata } from "./videoContainerMetadata";
 import type {
     MatrixCredentialUpdate,
     MatrixJoinedRoomIdsResult,
+    MatrixRoomKeyImportWorkerResult,
     MatrixSessionCredentials,
     MatrixStoredAccount,
     MatrixWorkerCommand,
@@ -274,6 +277,7 @@ let lastSyncState: SyncState | null = null;
 let clientGeneration = 0;
 let schedulerGeneration = 0;
 let publicDirectoryRefreshGeneration = 0;
+let decryptionRevision = 0;
 
 interface HistoryCursorState {
     generation: number;
@@ -2942,6 +2946,7 @@ function attachClientListeners(client: MatrixClient): void {
     }));
     client.on(RoomEvent.LocalEchoUpdated, (event, room) => guarded(() => handleTimelineEvent(event, room)));
     client.on(MatrixEventEvent.Decrypted, event => guarded(() => {
+        decryptionRevision++;
         const disposition = liveDecryptionEvents.consume(event, isolatedDecryptionEvents.has(event));
         const recoveredLiveFailure = !event.isDecryptionFailure()
             && liveDecryptionEvents.consumeFailure(event);
@@ -6956,6 +6961,76 @@ async function logout(): Promise<void> {
     setStatus("logged_out");
 }
 
+function cachedMegolmDecryptionFailures(client: MatrixClient): MatrixEvent[] {
+    const failures: MatrixEvent[] = [];
+    const seen = new Set<MatrixEvent>();
+    let scannedEvents = 0;
+    let scannedTimelines = 0;
+    for (const room of client.getRooms().slice(0, 10_000)) {
+        for (const timeline of room.getUnfilteredTimelineSet().getTimelines()) {
+            if (++scannedTimelines > 20_000) return failures;
+            for (const event of timeline.getEvents()) {
+                if (++scannedEvents > 100_000) return failures;
+                if (seen.has(event)) continue;
+                seen.add(event);
+                if (event.getWireType() === EventType.RoomMessageEncrypted && event.isDecryptionFailure()) {
+                    failures.push(event);
+                    if (failures.length >= 50_000) return failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
+async function importRoomKeys(
+    command: Extract<MatrixWorkerCommand, { type: "importRoomKeys"; }>
+): Promise<MatrixRoomKeyImportWorkerResult> {
+    try {
+        if (!matrixClient || !activeCredentials) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+        const client = matrixClient;
+        const crypto = client.getCrypto();
+        if (!crypto) fail("MATRIX_CRYPTO_UNAVAILABLE", "Matrix encryption storage is unavailable.");
+        const decryptionBackend = crypto as Parameters<MatrixEvent["attemptDecryption"]>[0];
+        const generation = clientGeneration;
+        const { sessionCount } = await importEncryptedMegolmKeyExport(
+            command.bytes,
+            command.passphrase,
+            async json => {
+                await crypto.importRoomKeysAsJson(json);
+                // The SDK callback already starts these retries. Calling the
+                // same API is safe because MatrixEvent deduplicates concurrent
+                // attempts; gathering them here lets import await even a slow
+                // first Decrypted event before its replacement snapshot.
+                const failures = cachedMegolmDecryptionFailures(client);
+                await convergeImportedRoomKeys(
+                    failures,
+                    event => event.attemptDecryption(decryptionBackend, { isRetry: true }),
+                    () => decryptionRevision
+                );
+                if (generation !== clientGeneration || client !== matrixClient) {
+                    throw new PublicWorkerError("MATRIX_SESSION_CHANGED", "The Matrix account changed during room-key import.");
+                }
+            }
+        );
+        const next = snapshot();
+        emit({ type: "snapshot", snapshot: next });
+        return { importedSessions: sessionCount };
+    } catch (error) {
+        if (error instanceof MegolmKeyImportError) {
+            throw new PublicWorkerError("MATRIX_KEY_IMPORT_FAILED", error.message);
+        }
+        if (error instanceof PublicWorkerError) throw error;
+        throw new PublicWorkerError(
+            "MATRIX_KEY_IMPORT_FAILED",
+            "Matrix could not import the encrypted room keys. The file may be incompatible or damaged."
+        );
+    } finally {
+        command.bytes.fill(0);
+        command.passphrase = "";
+    }
+}
+
 async function sendText(command: Extract<MatrixWorkerCommand, { type: "sendText"; }>): Promise<MatrixActionResult> {
     const room = getRoom(command.roomId);
     const placeholderBody = validateString(command.body, "body", 65_536);
@@ -9103,6 +9178,7 @@ async function handleCommand(
         case "start": return await startAuthenticated(command.account, progress);
         case "suspend": await suspend(); return undefined;
         case "logout": await logout(); return undefined;
+        case "importRoomKeys": return await importRoomKeys(command);
         case "snapshot": return snapshot();
         case "joinedRoomIds": return await exactJoinedRoomIds();
         case "publicRooms": return await publicRooms(command);
@@ -9285,6 +9361,10 @@ function scrubCommand(command: MatrixWorkerCommand): void {
             command.account.accessToken = "";
             if (command.account.refreshToken != null) command.account.refreshToken = "";
             command.account.storageKey = "";
+            break;
+        case "importRoomKeys":
+            command.bytes.fill(0);
+            command.passphrase = "";
             break;
     }
 }

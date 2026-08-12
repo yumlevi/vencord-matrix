@@ -85,6 +85,10 @@ export interface MatrixJoinedRoomIdsResult {
     roomIds: string[];
 }
 
+export interface MatrixRoomKeyImportWorkerResult {
+    importedSessions: number;
+}
+
 export interface MatrixCredentialUpdate extends MatrixSessionCredentials { }
 
 export type MatrixWorkerCommand =
@@ -94,6 +98,7 @@ export type MatrixWorkerCommand =
     | { type: "start"; account: MatrixStoredAccount; }
     | { type: "suspend"; }
     | { type: "logout"; }
+    | { type: "importRoomKeys"; bytes: Uint8Array; passphrase: string; }
     | { type: "snapshot"; }
     | { type: "joinedRoomIds"; }
     | { type: "publicRooms"; }
@@ -167,6 +172,7 @@ export type MatrixWorkerResult =
     | MatrixInviteUserToSpaceResult
     | MatrixInviteUserToGroupChatResult
     | MatrixJoinSuggestedSpaceChannelsResult
+    | MatrixRoomKeyImportWorkerResult
     | MatrixMessageContextDTO
     | MatrixMessageSearchResponse
     | MatrixPublicRoomDirectoryDTO

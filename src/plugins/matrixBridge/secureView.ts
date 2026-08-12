@@ -8,6 +8,7 @@ import type {
     MatrixSecureViewAccountConfig,
     MatrixSecureViewBootstrap,
     MatrixSecureViewEvent,
+    MatrixSecureViewRequest,
     MatrixSecureViewRoute,
     MatrixSecureViewSecurityState,
 } from "./secureViewProtocol";
@@ -262,6 +263,8 @@ let directMessageUserId = "";
 let accountTransition: AccountTransition | undefined;
 let accountRecoveryInFlight = false;
 let accountRecoveryPending = false;
+let roomKeyImportBusy = false;
+let roomKeyImportPassphrase = "";
 let fatalRecoveryBusy = false;
 let lastAppliedMatrixSeq = -1;
 let lastAppliedStatusSeq = -1;
@@ -799,6 +802,8 @@ function clearSensitiveUiState() {
     directMessageSpaceId = "";
     directMessageUserId = "";
     authBusy = false;
+    roomKeyImportBusy = false;
+    roomKeyImportPassphrase = "";
     fatalRecoveryBusy = false;
     Object.assign(authForm, {
         homeserver: "",
@@ -4267,8 +4272,10 @@ function renderDiscoverMain() {
 
 async function logout() {
     if (!host || accountTransition || !window.confirm(
-        "Clearing local Matrix data erases this device's session and abandons any unacknowledged room or server creation receipt. "
-        + "The remote room and invitations may still exist and can no longer be reconciled. Continue?"
+        "This permanently deletes this device's local encryption keys. Old encrypted history may become unreadable unless another "
+        + "trusted device or key backup can restore it. "
+        + "It also abandons any unacknowledged room or server creation receipt. The remote room and invitations may still exist and "
+        + "can no longer be reconciled. Forget this device and continue?"
     )) return;
     const current = route();
     void stopTyping("roomId" in current ? current.roomId : undefined);
@@ -4288,6 +4295,80 @@ async function logout() {
     }
 }
 
+function roomKeyImportCard() {
+    const form = element("form", "matrix-form");
+    const passphrase = input(
+        "password",
+        "roomKeyPassphrase",
+        "Export passphrase",
+        roomKeyImportPassphrase
+    );
+    passphrase.required = true;
+    passphrase.maxLength = 4_096;
+    passphrase.autocomplete = "off";
+    passphrase.dataset.focusKey = "matrix-room-key-passphrase";
+    passphrase.disabled = roomKeyImportBusy;
+    passphrase.addEventListener("input", () => { roomKeyImportPassphrase = passphrase.value.slice(0, 4_096); });
+    const submit = makeButton(
+        roomKeyImportBusy ? "Importing..." : "Choose encrypted export and import",
+        "matrix-button matrix-button-primary",
+        () => form.requestSubmit(),
+        { disabled: roomKeyImportBusy }
+    );
+    submit.type = "submit";
+    form.append(labelledField("Room-key export passphrase", passphrase), submit);
+    form.addEventListener("submit", event => {
+        event.preventDefault();
+        if (!host || roomKeyImportBusy || accountTransition) return;
+        let secret = roomKeyImportPassphrase;
+        if (!secret) {
+            showToast("Enter the passphrase used when the room keys were exported.", "error");
+            return;
+        }
+        const generation = uiGeneration;
+        const expectedAccount = config?.userId ?? null;
+        const request: MatrixSecureViewRequest<"importRoomKeys"> = { type: "importRoomKeys", passphrase: secret };
+        roomKeyImportPassphrase = "";
+        roomKeyImportBusy = true;
+        loadingLabel = "Importing encrypted Matrix room keys...";
+        scheduleRender();
+        void host.request(request).then(result => {
+            if (generation !== uiGeneration || accountTransition) return;
+            if (result.canceled) return;
+            if (!result.snapshot) throw new Error("Matrix did not return a refreshed snapshot after room-key import.");
+            validateSnapshotIdentity(result.snapshot, expectedAccount);
+            if (result.snapshot.seq >= lastAppliedMatrixSeq) {
+                applySnapshot(result.snapshot, expectedAccount);
+                lastAppliedMatrixSeq = result.snapshot.seq;
+            }
+            showToast(
+                `Imported ${result.importedSessions} encrypted room-key session${result.importedSessions === 1 ? "" : "s"}.`,
+                "success"
+            );
+        }).catch(error => {
+            if (generation === uiGeneration && !accountTransition) showToast(errorText(error), "error");
+        }).finally(() => {
+            request.passphrase = "";
+            secret = "";
+            roomKeyImportPassphrase = "";
+            if (generation === uiGeneration) {
+                roomKeyImportBusy = false;
+                loadingLabel = "";
+                scheduleRender();
+            }
+        });
+    });
+    return element("section", "matrix-card matrix-form",
+        textElement("h2", "", "Recover encrypted history"),
+        textElement(
+            "p",
+            "matrix-subtle",
+            "Export encrypted room keys from Element with a passphrase, then import that file here. The plaintext keys stay inside the isolated Matrix backend."
+        ),
+        form
+    );
+}
+
 function renderAccountMain() {
     const main = element("section", "matrix-main");
     main.append(renderHeading("Matrix account", serverLabel(config?.homeserver)));
@@ -4301,13 +4382,14 @@ function renderAccountMain() {
         labelledField("Encryption storage", textElement("div", "", "Persistent, isolated Matrix storage")),
         element("div", "matrix-card-actions",
             makeButton("Refresh", "matrix-button", () => void refresh(true)),
-            makeButton("Sign out", "matrix-button matrix-button-danger", () => void logout()),
+            makeButton("Forget account and keys", "matrix-button matrix-button-danger", () => void logout()),
         ),
     );
     narrow.append(
         textElement("h1", "", "Account & privacy"),
         textElement("p", "matrix-subtle", "Decrypted content is rendered only in this isolated Matrix view. The Discord renderer receives navigation metadata, not message bodies."),
         card,
+        roomKeyImportCard(),
     );
     page.append(narrow);
     main.append(page);

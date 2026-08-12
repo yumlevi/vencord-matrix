@@ -13,6 +13,7 @@ import { ChannelStore, closeModal, FluxDispatcher, GuildStore, MessageActions, M
 
 import { matrixErrorCode } from "./errorCode";
 import { projectInboundMatrixMentions, projectOutboundMatrixMentions } from "./messageMentions";
+import { matrixMessageOrderNeedsReindex } from "./roomMessageOrder";
 import type {
     MatrixSecureViewBounds,
     MatrixSecureViewControlState,
@@ -228,6 +229,7 @@ interface InjectedRoom {
     eventIds: Map<string, string>;
     messageTargets: Map<string, ProjectedMessageTarget>;
     projectedMessagesByEventId: Map<string, ProjectedTimelineMessage>;
+    messageOrderGeneration: number;
     isolatedContext?: boolean;
     contextTargetMessageId?: string;
 }
@@ -331,6 +333,7 @@ const protectedSyntheticIds = new Set<string>();
 const messageIdsByEventId = new Map<string, string>();
 const orderedMessageIdsByRoom = new Map<string, Map<string, string>>();
 const messageIdOwners = new Map<string, string>();
+const messageOrderGenerationsByRoom = new Map<string, number>();
 const provisionalContextEventIdsByRoom = new Map<string, Set<string>>();
 const reservedReplyEventIds = new Set<string>();
 const reservedReplyTargets = new Map<string, { roomId: string; eventId: string; }>();
@@ -495,6 +498,54 @@ function messageSyntheticId(eventId: string, timestamp: number, reserveReply = f
     return rememberMessageId(eventId, candidate.toString());
 }
 
+function reindexRoomMessageIds(
+    roomId: string,
+    ordered: Map<string, string>,
+    sequence: readonly MatrixMessageDto[]
+): Map<string, string> {
+    if (!sequence.length) return ordered;
+
+    const reclaimableOwners = new Set(ordered.keys());
+    const unclaimedBeforeCommit = (candidate: bigint, eventId: string) => {
+        while (candidate > 0n) {
+            const owner = messageIdOwners.get(candidate.toString());
+            if (!owner || owner === eventId || reclaimableOwners.has(owner)) return candidate;
+            candidate--;
+        }
+        throw new Error("Matrix message snowflake range exhausted");
+    };
+    const values: bigint[] = Array(sequence.length);
+    const last = sequence.at(-1)!;
+    let next = unclaimedBeforeCommit(timestampMessageId(last.eventId, last.timestamp), last.eventId) + 1n;
+    for (let offset = sequence.length - 1; offset >= 0; offset--) {
+        const message = sequence[offset];
+        const candidate = timestampMessageId(message.eventId, message.timestamp);
+        const value = unclaimedBeforeCommit(
+            candidate <= next - MESSAGE_ORDER_STRIDE ? candidate : next - MESSAGE_ORDER_STRIDE,
+            message.eventId
+        );
+        if (value <= 0n || value > MAX_SNOWFLAKE) {
+            throw new Error("Matrix message order is outside Discord's snowflake range");
+        }
+        values[offset] = value;
+        next = value;
+    }
+    // Compute and range-check the full plan before changing live aliases.
+    for (const [eventId, id] of ordered) {
+        if (messageIdOwners.get(id) === eventId) messageIdOwners.delete(id);
+        if (messageIdsByEventId.get(eventId) === id) messageIdsByEventId.delete(eventId);
+    }
+    ordered.clear();
+    for (let offset = 0; offset < sequence.length; offset++) {
+        const { eventId } = sequence[offset];
+        const id = values[offset].toString();
+        ordered.set(eventId, id);
+        rememberMessageId(eventId, id);
+    }
+    messageOrderGenerationsByRoom.set(roomId, (messageOrderGenerationsByRoom.get(roomId) ?? 0) + 1);
+    return ordered;
+}
+
 /**
  * Assigns stable session IDs from Matrix's authoritative oldest-first order.
  * Existing rows are immutable anchors. Backfill is placed before the first
@@ -511,6 +562,9 @@ function ensureRoomMessageIds(roomId: string, messages: readonly MatrixMessageDt
         seenEventIds.add(message.eventId);
         sequence.push(message);
     }
+    if (matrixMessageOrderNeedsReindex(ordered, sequence.map(message => message.eventId))) {
+        return reindexRoomMessageIds(roomId, ordered, sequence);
+    }
     for (let cursor = 0; cursor < sequence.length;) {
         if (ordered.has(sequence[cursor].eventId)) {
             cursor++;
@@ -525,7 +579,7 @@ function ensureRoomMessageIds(roomId: string, messages: readonly MatrixMessageDt
         if (left != null && right != null) {
             const available = right - left - 1n;
             if (available < BigInt(count)) {
-                throw new Error(`Matrix message order anchors exhausted for ${roomId}`);
+                return reindexRoomMessageIds(roomId, ordered, sequence);
             }
             const step = (right - left) / BigInt(count + 1);
             for (let offset = 1; offset <= count; offset++) values.push(left + step * BigInt(offset));
@@ -584,7 +638,7 @@ function ensureRoomMessageIds(roomId: string, messages: readonly MatrixMessageDt
                 : right ?? MAX_SNOWFLAKE + 1n;
             const value = unclaimedMessageId(values[offset], eventId, upper);
             if (value <= 0n || value > MAX_SNOWFLAKE) {
-                throw new Error(`Matrix message order is outside Discord's snowflake range for ${roomId}`);
+                throw new Error("Matrix message order is outside Discord's snowflake range");
             }
             const id = value.toString();
             ordered.set(eventId, id);
@@ -595,13 +649,14 @@ function ensureRoomMessageIds(roomId: string, messages: readonly MatrixMessageDt
     let previous = -1n;
     for (const message of sequence) {
         const id = BigInt(ordered.get(message.eventId)!);
-        if (id <= previous) throw new Error(`Matrix timeline order invariant failed for ${roomId}`);
+        if (id <= previous) throw new Error("Matrix timeline order invariant failed");
         previous = id;
     }
     return ordered;
 }
 
 function clearRoomMessageOrder(roomId: string) {
+    messageOrderGenerationsByRoom.delete(roomId);
     const ordered = orderedMessageIdsByRoom.get(roomId);
     if (ordered) {
         for (const [eventId, id] of ordered) {
@@ -2533,6 +2588,7 @@ function injectRoomTimeline(
         eventIds: new Map(),
         messageTargets: new Map(),
         projectedMessagesByEventId: new Map(),
+        messageOrderGeneration: messageOrderGenerationsByRoom.get(room.roomId) ?? 0,
         isolatedContext: previous?.isolatedContext,
         contextTargetMessageId: previous?.contextTargetMessageId,
     };
@@ -2579,17 +2635,38 @@ function injectRoomTimeline(
     return accepted;
 }
 
-function reinjectRoomTimelines(roomId: string) {
+function reinjectRoomTimelines(roomId: string, replacementRoom?: MatrixRoomDto) {
     if (!latestSnapshot) return;
+    for (let pass = 0; pass < 4; pass++) {
+        const generation = messageOrderGenerationsByRoom.get(roomId) ?? 0;
+        const projections = [...roomsByChannel.values()].filter(injected => injected.room.roomId === roomId);
+        for (const injected of projections) {
+            const timelineRoom = injected.isolatedContext ? injected.room : replacementRoom ?? injected.room;
+            injectRoomTimeline(
+                timelineRoom,
+                latestSnapshot,
+                injected.channelId,
+                injected,
+                injected.guildId
+            );
+            syncProjectionUnread(injected.channelId, timelineRoom, injected.guildId);
+        }
+        const settledGeneration = messageOrderGenerationsByRoom.get(roomId) ?? 0;
+        const settledProjections = [...roomsByChannel.values()].filter(injected => injected.room.roomId === roomId);
+        if (settledGeneration === generation
+            && settledProjections.every(injected => injected.messageOrderGeneration === settledGeneration)) return;
+    }
+
+    // Conflicting isolated windows must never livelock the renderer. Collapse
+    // them to the canonical room window after a bounded number of replans.
     const projections = [...roomsByChannel.values()].filter(injected => injected.room.roomId === roomId);
+    const canonical = replacementRoom ?? projections.find(injected => !injected.isolatedContext)?.room ?? projections[0]?.room;
+    if (!canonical) return;
+    clearRoomMessageOrder(roomId);
     for (const injected of projections) {
-        injectRoomTimeline(
-            injected.room,
-            latestSnapshot,
-            injected.channelId,
-            injected,
-            injected.guildId
-        );
+        const previous = { ...injected, isolatedContext: undefined, contextTargetMessageId: undefined };
+        injectRoomTimeline(canonical, latestSnapshot, injected.channelId, previous, injected.guildId);
+        syncProjectionUnread(injected.channelId, canonical, injected.guildId);
     }
 }
 
@@ -2639,6 +2716,7 @@ export function applySnapshot(
         orderedMessageIdsByRoom.clear();
         provisionalContextEventIdsByRoom.clear();
         messageIdOwners.clear();
+        messageOrderGenerationsByRoom.clear();
         matrixUnreadFloorByRoom.clear();
         reservedReplyEventIds.clear();
         reservedReplyTargets.clear();
@@ -2893,7 +2971,13 @@ function updateProjectionRoom(injected: InjectedRoom, room: MatrixRoomDto) {
         messageTargets: new Map(injected.messageTargets),
         projectedMessagesByEventId: new Map(injected.projectedMessagesByEventId),
     };
-    setProjectionIndexes(next, projectedTimelineMessages(roomMessages(room), injected));
+    const projectedMessages = projectedTimelineMessages(roomMessages(room), injected);
+    if (injected.messageOrderGeneration !== (messageOrderGenerationsByRoom.get(room.roomId) ?? 0) && latestSnapshot) {
+        reinjectRoomTimelines(room.roomId, room);
+        const replacement = roomsByChannel.get(injected.channelId) ?? injected;
+        return replacement;
+    }
+    setProjectionIndexes(next, projectedMessages);
     for (const previousMessageId of injected.eventIds.keys()) {
         if (!next.eventIds.has(previousMessageId)) {
             FluxDispatcher.dispatch({ type: "MESSAGE_DELETE", channelId: injected.channelId, id: previousMessageId });
@@ -2922,6 +3006,11 @@ function loadProjectionMessages(
 ) {
     const pageEventIds = new Set(messages.map(message => message.eventId));
     const projectedRoomMessages = projectedTimelineMessages(roomMessages(injected.room), injected);
+    if (injected.messageOrderGeneration !== (messageOrderGenerationsByRoom.get(injected.room.roomId) ?? 0)
+        && latestSnapshot) {
+        reinjectRoomTimelines(injected.room.roomId, injected.room);
+        return;
+    }
     setProjectionIndexes(injected, projectedRoomMessages);
     const projectedMessages = projectedRoomMessages.filter(message =>
         message.target.eventIds.some(eventId => pageEventIds.has(eventId)));
@@ -3606,6 +3695,7 @@ export function stopBridge() {
     mediaFocusEventIdsByRoom.clear();
     messageIdsByEventId.clear();
     orderedMessageIdsByRoom.clear();
+    messageOrderGenerationsByRoom.clear();
     provisionalContextEventIdsByRoom.clear();
     messageIdOwners.clear();
     matrixUnreadFloorByRoom.clear();

@@ -33,7 +33,10 @@ if (typeof generation !== "string" || !/^[a-f0-9]{64}$/u.test(generation)) {
 const host: MatrixSecureViewHost = Object.freeze({
     request<Type extends MatrixSecureViewRequestType>(request: MatrixSecureViewRequest<Type>) {
         const envelope: MatrixSecureViewRequestEnvelope = { generation, request };
-        return ipcRenderer.invoke(MATRIX_SECURE_VIEW_REQUEST, envelope) as Promise<MatrixSecureViewResult<Type>>;
+        const result = ipcRenderer.invoke(MATRIX_SECURE_VIEW_REQUEST, envelope) as Promise<MatrixSecureViewResult<Type>>;
+        return result.finally(() => {
+            if (request.type === "importRoomKeys") request.passphrase = "";
+        });
     },
     onEvent(callback: (event: MatrixSecureViewEvent) => void) {
         const listener = (_ipcEvent: Electron.IpcRendererEvent, envelope: MatrixSecureViewEventEnvelope) => {

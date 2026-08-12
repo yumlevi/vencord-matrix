@@ -6,7 +6,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { RendererSettings } from "@main/settings";
@@ -25,6 +25,11 @@ import {
     type WebContents
 } from "electron";
 
+import {
+    MAX_MEGOLM_KEY_EXPORT_BYTES,
+    MAX_MEGOLM_KEY_EXPORT_SESSIONS,
+    MAX_MEGOLM_KEY_PASSPHRASE_BYTES
+} from "./megolmKeyImport";
 import { MAX_MATRIX_MESSAGE_MENTIONS } from "./messageMentions";
 import {
     MATRIX_SECURE_VIEW_BOOTSTRAP,
@@ -137,6 +142,7 @@ import {
     MATRIX_WORKER_SAVE_CREDENTIALS,
     type MatrixCredentialUpdate,
     type MatrixJoinedRoomIdsResult,
+    type MatrixRoomKeyImportWorkerResult,
     type MatrixSessionCredentials,
     type MatrixStoredAccount,
     type MatrixWorkerCommand,
@@ -7917,6 +7923,14 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
         case "reconcileGroupChatCreate":
             exactObjectKeys(request, "secure view request", ["type"]);
             break;
+        case "importRoomKeys": {
+            exactObjectKeys(request, "secure view request", ["type", "passphrase"]);
+            const passphrase = validateString(request.passphrase, "room-key passphrase", MAX_MEGOLM_KEY_PASSPHRASE_BYTES);
+            if (new TextEncoder().encode(passphrase).byteLength > MAX_MEGOLM_KEY_PASSPHRASE_BYTES) {
+                throw bridgeError("MATRIX_INVALID_ARGUMENT", "The room-key passphrase is too long.");
+            }
+            break;
+        }
         case "navigate":
             exactObjectKeys(request, "secure view request", ["type", "route"]);
             validateSecureViewRoute(request.route);
@@ -8184,6 +8198,9 @@ function clearPrivateRequest(request: MatrixSecureViewRequest): void {
             request.registration.password = "";
             request.registration.registrationToken = "";
             break;
+        case "importRoomKeys":
+            request.passphrase = "";
+            break;
         case "sendText":
             request.body = "";
             break;
@@ -8321,6 +8338,67 @@ function safeSaveDialogName(value: string): string {
     return name;
 }
 
+async function readBoundedRoomKeyExport(filePath: string): Promise<Uint8Array> {
+    let file;
+    try {
+        file = await open(filePath, "r");
+    } catch {
+        throw bridgeError("MATRIX_KEY_IMPORT_FILE_FAILED", "The selected Matrix room-key export could not be opened.");
+    }
+    let bytes: Uint8Array | undefined;
+    try {
+        let stats;
+        try {
+            stats = await file.stat();
+        } catch {
+            throw bridgeError("MATRIX_KEY_IMPORT_FILE_FAILED", "The selected Matrix room-key export could not be read.");
+        }
+        if (!stats.isFile() || !Number.isSafeInteger(stats.size)
+            || stats.size < 1 || stats.size > MAX_MEGOLM_KEY_EXPORT_BYTES) {
+            throw bridgeError(
+                "MATRIX_KEY_IMPORT_FILE_INVALID",
+                "The selected Matrix room-key export is empty or exceeds the 32 MiB safety limit."
+            );
+        }
+        bytes = new Uint8Array(stats.size);
+        let offset = 0;
+        try {
+            while (offset < bytes.length) {
+                const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+                if (bytesRead < 1) {
+                    throw bridgeError("MATRIX_KEY_IMPORT_FILE_INVALID", "The selected Matrix room-key export changed while it was read.");
+                }
+                offset += bytesRead;
+            }
+            const extra = new Uint8Array(1);
+            try {
+                const { bytesRead } = await file.read(extra, 0, 1, offset);
+                if (bytesRead !== 0) {
+                    throw bridgeError("MATRIX_KEY_IMPORT_FILE_INVALID", "The selected Matrix room-key export changed while it was read.");
+                }
+            } finally {
+                extra.fill(0);
+            }
+        } catch (error) {
+            bytes.fill(0);
+            throw error;
+        }
+        return bytes;
+    } finally {
+        await file.close().catch(() => undefined);
+    }
+}
+
+function validateRoomKeyImportWorkerResult(value: unknown): MatrixRoomKeyImportWorkerResult {
+    const result = exactObjectKeys(value, "room-key import result", ["importedSessions"]);
+    if (!Number.isSafeInteger(result.importedSessions)
+        || Number(result.importedSessions) < 1
+        || Number(result.importedSessions) > MAX_MEGOLM_KEY_EXPORT_SESSIONS) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix room-key import result was invalid.");
+    }
+    return { importedSessions: Number(result.importedSessions) };
+}
+
 async function handlePrivateRequest(
     event: IpcMainInvokeEvent,
     state: SecureViewState,
@@ -8348,6 +8426,33 @@ async function handlePrivateRequest(
             await logout(event);
             await refreshConvergenceSnapshot(event, state, false);
             return;
+        }
+        case "importRoomKeys": {
+            requireSecureViewUserGesture(state);
+            const selection = await dialog.showOpenDialog(state.owner, {
+                title: "Import encrypted Matrix room keys",
+                properties: ["openFile", "dontAddToRecent"],
+                filters: [
+                    { name: "Encrypted Matrix room keys", extensions: ["txt", "keys", "bin"] },
+                    { name: "All files", extensions: ["*"] }
+                ]
+            });
+            if (selection.canceled || selection.filePaths.length !== 1 || state.destroyed) {
+                return { canceled: true, importedSessions: 0 };
+            }
+            const bytes = await readBoundedRoomKeyExport(selection.filePaths[0]);
+            try {
+                const imported = validateRoomKeyImportWorkerResult(await callWorker({
+                    type: "importRoomKeys",
+                    bytes,
+                    passphrase: request.passphrase
+                }));
+                const snapshot = await refreshConvergenceSnapshot(event, state);
+                return { canceled: false, importedSessions: imported.importedSessions, snapshot };
+            } finally {
+                bytes.fill(0);
+                request.passphrase = "";
+            }
         }
         case "publicRooms":
             return await publicRooms(event);

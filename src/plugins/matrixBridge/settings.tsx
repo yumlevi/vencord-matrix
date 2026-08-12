@@ -1132,15 +1132,16 @@ export function MatrixSettings() {
         openModal(modalProps => (
             <ConfirmModal
                 {...modalProps}
-                title="Disconnect this account?"
-                confirmText="Disconnect"
+                title="Forget this Matrix device?"
+                confirmText="Forget device"
                 cancelText="Cancel"
                 variant="danger"
                 onConfirm={() => void logout()}
             >
                 <Paragraph>
-                    Clearing local Matrix data erases this device&apos;s session and abandons any unacknowledged room or
-                    server creation receipt. The remote room and invitations may still exist and can no longer be reconciled.
+                    This permanently deletes this device&apos;s local encryption keys. Old encrypted history may become unreadable
+                    unless another trusted device or key backup can restore it. It also abandons any unacknowledged room or server creation receipt.
+                    The remote room and invitations may still exist and can no longer be reconciled.
                 </Paragraph>
             </ConfirmModal>
         ));
