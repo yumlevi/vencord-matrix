@@ -30,6 +30,12 @@ import type {
     MatrixMessageSearchScope,
     MatrixPowerLevelPermissionDTO,
 } from "./types";
+import {
+    MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,
+    MATRIX_VIDEO_RENDER_FRAGMENT,
+    matrixVideoFallbackPoster,
+    matrixVideoObjectUrlBase,
+} from "./videoPosterPatch";
 
 const Native = VencordNative.pluginHelpers.MatrixBridge as PluginNative<typeof import("./native")>;
 const logger = new Logger("MatrixBridge", "#0dbd8b");
@@ -56,8 +62,6 @@ const MATRIX_ROUTE_KEY = "MatrixBridge_lastRoute";
 // older lower-priority blobs are still evicted before this limit is crossed.
 const MAX_HYDRATED_MEDIA_ITEM_BYTES = 96 * 1024 * 1024;
 const MAX_HYDRATED_MEDIA_BYTES = 128 * 1024 * 1024;
-const MAX_VIDEO_POSTER_EDGE = 960;
-const VIDEO_POSTER_LOAD_TIMEOUT_MS = 5_000;
 const PROJECTED_X_HOSTS = new Set([
     "x.com",
     "www.x.com",
@@ -267,7 +271,6 @@ type MediaCacheState = "queued" | "loading" | "ready" | "unavailable" | "failed"
 interface HydratedMedia {
     attachment: MatrixAttachmentDto;
     objectUrl: string;
-    posterObjectUrl?: string;
     posterUrl?: string;
     byteLength: number;
 }
@@ -277,7 +280,6 @@ interface MediaCacheEntry {
     priority: number;
     attachment?: MatrixAttachmentDto;
     objectUrl?: string;
-    posterObjectUrl?: string;
     posterUrl?: string;
     byteLength?: number;
     preview?: MatrixUrlPreviewDto;
@@ -1482,157 +1484,17 @@ function rawEmbedMedia(media: MatrixAttachmentDto) {
 }
 
 interface LocalVideoPoster {
-    width?: number;
-    height?: number;
-    objectUrl: string;
     renderUrl: string;
     byteLength: number;
 }
 
-function safeLocalVideoDimensions(width: unknown, height: unknown) {
-    return Number.isSafeInteger(width) && Number(width) > 0 && Number(width) <= 16_384
-        && Number.isSafeInteger(height) && Number(height) > 0 && Number(height) <= 16_384
-        && Number(width) * Number(height) <= 100_000_000
-        ? { width: Number(width), height: Number(height) }
-        : undefined;
-}
-
-function videoPosterDimensions(width: number, height: number) {
-    const scale = Math.min(1, MAX_VIDEO_POSTER_EDGE / Math.max(width, height));
+function passiveLocalVideoPoster(): LocalVideoPoster {
     return {
-        width: Math.max(1, Math.round(width * scale)),
-        height: Math.max(1, Math.round(height * scale)),
+        renderUrl: MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,
+        // JavaScript strings may occupy two bytes per code unit. Count that
+        // upper bound in the same aggregate budget as the decrypted video.
+        byteLength: MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL.length * 2,
     };
-}
-
-function fallbackVideoPoster(width: number, height: number) {
-    const triangle = [
-        `${Math.round(width * 0.43)},${Math.round(height * 0.32)}`,
-        `${Math.round(width * 0.43)},${Math.round(height * 0.68)}`,
-        `${Math.round(width * 0.68)},${Math.round(height * 0.5)}`,
-    ].join(" ");
-    return new Blob([
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
-        `<rect width="${width}" height="${height}" fill="#1e1f22"/>`,
-        `<polygon points="${triangle}" fill="#dbdee1"/>`,
-        "</svg>",
-    ], { type: "image/svg+xml" });
-}
-
-function localVideoPosterFromBlob(
-    blob: Blob,
-    dimensions?: { width: number; height: number; }
-): LocalVideoPoster {
-    const objectUrl = URL.createObjectURL(blob);
-    return {
-        ...dimensions,
-        objectUrl,
-        renderUrl: `${objectUrl}#`,
-        byteLength: blob.size,
-    };
-}
-
-function fallbackLocalVideoPoster(width: number | undefined, height: number | undefined) {
-    const dimensions = safeLocalVideoDimensions(width, height);
-    const posterDimensions = dimensions
-        ? videoPosterDimensions(dimensions.width, dimensions.height)
-        : { width: 640, height: 360 };
-    return localVideoPosterFromBlob(
-        fallbackVideoPoster(posterDimensions.width, posterDimensions.height),
-        dimensions
-    );
-}
-
-async function canvasVideoPoster(
-    video: HTMLVideoElement,
-    width: number,
-    height: number,
-    frameReady: boolean
-) {
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) return fallbackVideoPoster(width, height);
-
-    context.fillStyle = "#1e1f22";
-    context.fillRect(0, 0, width, height);
-    let drewFrame = false;
-    if (frameReady) {
-        try {
-            context.drawImage(video, 0, 0, width, height);
-            drewFrame = true;
-        } catch {
-            // A valid video can still have an unsupported local decoder. The
-            // stable play affordance below remains a usable native poster.
-        }
-    }
-    if (!drewFrame) {
-        context.fillStyle = "#dbdee1";
-        context.beginPath();
-        context.moveTo(Math.round(width * 0.43), Math.round(height * 0.32));
-        context.lineTo(Math.round(width * 0.43), Math.round(height * 0.68));
-        context.lineTo(Math.round(width * 0.68), Math.round(height * 0.5));
-        context.closePath();
-        context.fill();
-    }
-
-    try {
-        const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", 0.82));
-        return blob ?? fallbackVideoPoster(width, height);
-    } catch {
-        return fallbackVideoPoster(width, height);
-    }
-}
-
-async function materializeVideoPoster(
-    videoUrl: string,
-    declaredWidth: number | undefined,
-    declaredHeight: number | undefined
-): Promise<LocalVideoPoster> {
-    const video = document.createElement("video");
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = "auto";
-    let frameReady = false;
-    try {
-        await new Promise<void>(resolve => {
-            let settled = false;
-            const finish = (ready: boolean) => {
-                if (settled) return;
-                settled = true;
-                frameReady = ready;
-                clearTimeout(timer);
-                resolve();
-            };
-            video.onloadeddata = () => finish(true);
-            video.onerror = () => finish(false);
-            const timer = setTimeout(
-                () => finish(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA),
-                VIDEO_POSTER_LOAD_TIMEOUT_MS
-            );
-            video.src = videoUrl;
-            video.load();
-        });
-
-        const dimensions = safeLocalVideoDimensions(video.videoWidth, video.videoHeight)
-            ?? safeLocalVideoDimensions(declaredWidth, declaredHeight);
-        const posterDimensions = dimensions
-            ? videoPosterDimensions(dimensions.width, dimensions.height)
-            : { width: 640, height: 360 };
-        const blob = await canvasVideoPoster(video, posterDimensions.width, posterDimensions.height, frameReady);
-        // Discord receives this URL through a Matrix-only poster override, so
-        // it never appends its CDN `?format=webp` transform to the video Blob
-        // itself. The harmless fragment also keeps generic image resize helpers
-        // from treating the poster as a remote CDN URL.
-        return localVideoPosterFromBlob(blob, dimensions);
-    } finally {
-        video.onloadeddata = null;
-        video.onerror = null;
-        video.pause();
-        video.removeAttribute("src");
-        video.load();
-    }
 }
 
 async function materializeMedia(
@@ -1658,26 +1520,24 @@ async function materializeMedia(
     }
 
     const objectUrl = URL.createObjectURL(blob);
-    let poster: LocalVideoPoster | undefined;
-    if (needsLocalVideoPoster && result.mimeType.toLowerCase().startsWith("video/")) {
-        try {
-            poster = await materializeVideoPoster(objectUrl, width, height);
-            width = poster.width ?? width;
-            height = poster.height ?? height;
-        } catch (error) {
-            logger.warn("Matrix video poster generation failed", error);
-            // Never hand Discord a video Blob as its own image poster. Its
-            // stock poster transform appends a query to Blob URLs, invalidating
-            // them and producing the misleading "image failed to load" state.
-            poster = fallbackLocalVideoPoster(width, height);
-        }
-    }
+    // The poster is deliberately content-independent. Discord's LazyImage
+    // diagnostics can include imageProps.src, so embedding a decoded private
+    // video frame in a data URL would expose those bytes to telemetry whenever
+    // its tracking controls are disabled or fail open.
+    const poster = needsLocalVideoPoster && result.mimeType.toLowerCase().startsWith("video/")
+        ? passiveLocalVideoPoster()
+        : undefined;
     // Discord's generic media helper leaves Blob URLs intact. A fragment does
-    // not change the Blob resource key, while its LazyImage animation detector
-    // still inspects that fragment as a filename hint.
+    // not change the Blob resource key. Direct videos carry an explicit marker
+    // so the patched poster boundary can fail safe during cache replacement.
     // Mark sniffed GIF bytes so the stock GIF path, controls, and animation
     // state are used even though object URLs have no real extension.
-    const renderUrl = `${objectUrl}${result.mimeType.toLowerCase() === "image/gif" ? "#.gif" : "#"}`;
+    const normalizedMimeType = result.mimeType.toLowerCase();
+    const renderUrl = `${objectUrl}${normalizedMimeType === "image/gif"
+        ? "#.gif"
+        : needsLocalVideoPoster && normalizedMimeType.startsWith("video/")
+            ? MATRIX_VIDEO_RENDER_FRAGMENT
+            : "#"}`;
     return {
         attachment: {
             ...attachment,
@@ -1692,7 +1552,6 @@ async function materializeMedia(
             animated: result.animated ?? attachment.animated,
         },
         objectUrl,
-        posterObjectUrl: poster?.objectUrl,
         posterUrl: poster?.renderUrl,
         byteLength: result.bytes.byteLength + (poster?.byteLength ?? 0),
     };
@@ -1700,10 +1559,8 @@ async function materializeMedia(
 
 function releaseMediaEntry(entry: MediaCacheEntry) {
     if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
-    if (entry.posterObjectUrl) URL.revokeObjectURL(entry.posterObjectUrl);
     hydratedMediaBytes = Math.max(0, hydratedMediaBytes - (entry.byteLength ?? 0));
     entry.objectUrl = undefined;
-    entry.posterObjectUrl = undefined;
     entry.posterUrl = undefined;
     entry.attachment = undefined;
     entry.byteLength = undefined;
@@ -1711,7 +1568,6 @@ function releaseMediaEntry(entry: MediaCacheEntry) {
 
 function discardHydratedMedia(media: HydratedMedia) {
     URL.revokeObjectURL(media.objectUrl);
-    if (media.posterObjectUrl) URL.revokeObjectURL(media.posterObjectUrl);
 }
 
 function makeRoomForHydratedMedia(byteLength: number, priority: number) {
@@ -1790,7 +1646,6 @@ async function runMediaJob(job: MediaJob, entry: MediaCacheEntry) {
     entry.state = "ready";
     entry.attachment = media.attachment;
     entry.objectUrl = media.objectUrl;
-    entry.posterObjectUrl = media.posterObjectUrl;
     entry.posterUrl = media.posterUrl;
     entry.byteLength = media.byteLength;
     hydratedMediaBytes += media.byteLength;
@@ -3913,13 +3768,17 @@ export function isMatrixMediaUrl(value: unknown) {
  * remains the original locally-owned Blob.
  */
 export function getMatrixVideoPosterUrl(value: unknown) {
-    if (typeof value !== "string") return undefined;
+    const objectUrl = matrixVideoObjectUrlBase(value);
+    if (!objectUrl) return undefined;
     for (const entry of mediaCache.values()) {
         if (entry.state !== "ready" || !entry.posterUrl
             || !entry.attachment?.mimeType?.toLowerCase().startsWith("video/")) continue;
-        if (entry.attachment.url === value || entry.attachment.proxyUrl === value) return entry.posterUrl;
+        if (entry.objectUrl === objectUrl) return entry.posterUrl;
     }
-    return undefined;
+    // Discord may retain the attachment object for one render after its cache
+    // entry was retired. Never let that Matrix-marked video fall through to
+    // the stock Blob ?format=webp transform.
+    return matrixVideoFallbackPoster(value);
 }
 
 function containsSyntheticId(value: unknown, depth = 0): boolean {

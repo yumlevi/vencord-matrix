@@ -9,7 +9,17 @@ import { readFileSync } from "node:fs";
 
 import { canonicalizeMatch } from "../src/utils/patches";
 import { sniffVideoContainerMetadata } from "../src/plugins/matrixBridge/videoContainerMetadata";
-import { MATRIX_VIDEO_POSTER_PATCH, MATRIX_VIDEO_POSTER_REPLACEMENT } from "../src/plugins/matrixBridge/videoPosterPatch";
+import {
+    isMarkedMatrixVideoUrl,
+    MATRIX_INLINE_VIDEO_POSTER_PATCH,
+    MATRIX_INLINE_VIDEO_POSTER_REPLACEMENT,
+    MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,
+    MATRIX_VIDEO_POSTER_PATCH,
+    MATRIX_VIDEO_POSTER_REPLACEMENT,
+    MATRIX_VIDEO_RENDER_FRAGMENT,
+    matrixVideoFallbackPoster,
+    matrixVideoObjectUrlBase,
+} from "../src/plugins/matrixBridge/videoPosterPatch";
 
 function bytes(...parts: Array<Uint8Array | number[]>): Uint8Array {
     const length = parts.reduce((total, part) => total + part.length, 0);
@@ -180,7 +190,7 @@ assert.notEqual(blobResourceKey(transformedPoster.toString()), blobResourceKey(v
 // Keep this factory-shaped fixture aligned with Discord's current minified
 // media renderer. The production patch substitutes only the poster expression;
 // proxy_url remains the player source.
-const currentDiscordVideoFactory = 'if("VIDEO"===M&&F&&null!=v){let e=p.poster??O(v);if(null==e)return null;return player({src:k,poster:e,disableArrowKeySeek:!0})';
+const currentDiscordVideoFactory = 'if("VIDEO"===M&&F&&null!=v){let e=p.poster??O(v);if(null==e)return null;return player({src:k,poster:e,disableArrowKeySeek:!0})}';
 const currentFactoryPoster = canonicalizeMatch(MATRIX_VIDEO_POSTER_PATCH);
 assert.equal(currentDiscordVideoFactory.match(currentFactoryPoster)?.length, 7,
     "the narrow poster patch must match Discord's current video factory exactly once");
@@ -191,26 +201,88 @@ const patchedFactory = currentDiscordVideoFactory.replace(
 assert.match(patchedFactory, /src:k,poster:e/u, "the player source and poster arguments must remain distinct");
 assert.match(patchedFactory, /getMatrixVideoPosterUrl\(v\)\?\?p\.poster\?\?O\(v\)/u,
     "only an owned Matrix poster may override Discord's CDN poster derivation");
+assert.doesNotThrow(() => new Function(patchedFactory),
+    "the media-viewer replacement must remain valid JavaScript");
+
+// The normal chat timeline uses a separate attachment/mosaic projection before
+// the media-viewer factory above. This was the live path that still generated
+// blob:?format=webp and the delayed LazyImage failure.
+const currentDiscordInlineFactory = 'let _=isVideo,E=isThumbnail,A=n??i;if(_){let e=f.A.toURLSafe(n);if(null==e)return null;e.searchParams.append("format","webp"),A=e.toString()}return{type:"attachment",src:A,contentScanVersion:u,alt:r,isVideo:_,isThumbnail:E,srcUnfurledMediaItem:x}';
+const currentInlinePoster = canonicalizeMatch(MATRIX_INLINE_VIDEO_POSTER_PATCH);
+assert.equal(currentDiscordInlineFactory.match(currentInlinePoster)?.length, 6,
+    "the inline poster patch must match Discord's current mosaic projection exactly once");
+const patchedInlineFactory = currentDiscordInlineFactory.replace(
+    currentInlinePoster,
+    MATRIX_INLINE_VIDEO_POSTER_REPLACEMENT
+);
+assert.match(patchedInlineFactory, /getMatrixVideoPosterUrl\(n\)[\s\S]*A=e[\s\S]*toURLSafe\(n\)[\s\S]*searchParams\.append\("format","webp"\)/u,
+    "inline Matrix videos must use the safe poster while Discord videos retain the stock transform");
+assert.doesNotThrow(() => new Function(patchedInlineFactory),
+    "the inline mosaic replacement must remain valid JavaScript");
 assert.match(index, /find: "disableArrowKeySeek:!0"[\s\S]*match: MATRIX_VIDEO_POSTER_PATCH,[\s\S]*replace: MATRIX_VIDEO_POSTER_REPLACEMENT,/u,
     "the production patch must target the current video factory and preserve its stock fallback");
+assert.match(index, /find: "srcUnfurledMediaItem:"[\s\S]*match: MATRIX_INLINE_VIDEO_POSTER_PATCH,[\s\S]*replace: MATRIX_INLINE_VIDEO_POSTER_REPLACEMENT,/u,
+    "the production patch must also cover the normal inline attachment timeline");
 
-assert.match(bridge, /const MAX_VIDEO_POSTER_EDGE = 960;[\s\S]*const VIDEO_POSTER_LOAD_TIMEOUT_MS = 5_000;/u,
-    "first-frame decode and poster allocation must remain bounded");
-assert.match(bridge, /result\.mimeType\.toLowerCase\(\)\.startsWith\("video\/"\)[\s\S]*materializeVideoPoster\(objectUrl, width, height\)/u,
-    "only sniffed video bytes may enter the local poster decoder");
+assert.match(bridge, /function passiveLocalVideoPoster\(\): LocalVideoPoster \{[\s\S]*renderUrl: MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,[\s\S]*byteLength: MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL\.length \* 2,/u,
+    "every local video poster must be the fixed, content-independent passive image");
+assert.match(bridge, /const poster = needsLocalVideoPoster && result\.mimeType\.toLowerCase\(\)\.startsWith\("video\/"\)[\s\S]*\? passiveLocalVideoPoster\(\)[\s\S]*: undefined;/u,
+    "only sniffed direct videos may allocate the fixed passive poster");
+assert.doesNotMatch(bridge, /materializeVideoPoster|canvasVideoPoster|boundedVideoPosterDataUrl|FileReader|readAsDataURL|drawImage|\.toBlob\(|data:image\/jpeg/u,
+    "poster construction must never decode or embed a private video frame");
 assert.match(bridge, /Native\.downloadMedia\(message\.roomId, message\.eventId, 0\) as MatrixMediaDownloadDto,\s*true\s*\)/u,
     "direct uploaded media must explicitly request a local video poster");
 assert.doesNotMatch(bridge, /video\.downloadIndex\) as MatrixMediaDownloadDto,\s*true/u,
-    "provider videos already have an explicit preview image and must not decode a redundant poster");
-assert.match(bridge, /Matrix video poster generation failed[\s\S]*poster = fallbackLocalVideoPoster\(width, height\)/u,
-    "poster decode failure must use a valid local image instead of the video Blob");
-assert.match(bridge, /entry\.objectUrl = media\.objectUrl;[\s\S]*entry\.posterObjectUrl = media\.posterObjectUrl;[\s\S]*entry\.posterUrl = media\.posterUrl;/u,
-    "the video and its separately owned poster must enter the cache atomically");
-assert.match(bridge, /if \(entry\.objectUrl\) URL\.revokeObjectURL\(entry\.objectUrl\);[\s\S]*if \(entry\.posterObjectUrl\) URL\.revokeObjectURL\(entry\.posterObjectUrl\);/u,
-    "cache release must revoke both local resources");
+    "provider videos already have an explicit preview image and must not allocate a redundant poster");
+assert.match(bridge, /byteLength: MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL\.length \* 2/u,
+    "poster accounting must include the worst-case JavaScript string storage");
+assert.match(bridge, /entry\.objectUrl = media\.objectUrl;[\s\S]*entry\.posterUrl = media\.posterUrl;/u,
+    "the video and its non-revocable data poster must enter the cache atomically");
+assert.doesNotMatch(bridge, /posterObjectUrl/u,
+    "a poster must never regain an independently revocable Blob lifecycle");
+assert.match(bridge, /if \(entry\.objectUrl\) URL\.revokeObjectURL\(entry\.objectUrl\);[\s\S]*hydratedMediaBytes = Math\.max\(0, hydratedMediaBytes - \(entry\.byteLength \?\? 0\)\);[\s\S]*entry\.posterUrl = undefined;/u,
+    "cache release must account for the poster string without trying to revoke it");
 assert.match(bridge, /projectionNeedsRefresh \|\|= entry\.state === "ready"[\s\S]*projectionNeedsRefresh = true;[\s\S]*if \(projectionNeedsRefresh\) scheduleMediaSnapshotRefresh\(\);/u,
     "eviction and revisit hydration must promptly remove stale Blob URLs from Discord's retained message rows");
-assert.match(bridge, /export function getMatrixVideoPosterUrl[\s\S]*entry\.state !== "ready"[\s\S]*attachment\?\.mimeType\?\.toLowerCase\(\)\.startsWith\("video\/"\)[\s\S]*entry\.attachment\.url === value \|\| entry\.attachment\.proxyUrl === value/u,
-    "poster substitution must be limited to ready, cache-owned Matrix videos");
+assert.match(bridge, /export function getMatrixVideoPosterUrl[\s\S]*matrixVideoObjectUrlBase\(value\)[\s\S]*entry\.objectUrl === objectUrl[\s\S]*return matrixVideoFallbackPoster\(value\);/u,
+    "poster substitution must normalize owned object URLs and fail safe for a marked retained row");
+assert.match(bridge, /needsLocalVideoPoster && normalizedMimeType\.startsWith\("video\/"\)[\s\S]*MATRIX_VIDEO_RENDER_FRAGMENT/u,
+    "only direct hydrated videos may receive the cache-gap marker");
+
+const markedVideoBlob = `${blobResourceKey(videoBlob)}${MATRIX_VIDEO_RENDER_FRAGMENT}`;
+assert.equal(matrixVideoObjectUrlBase(markedVideoBlob), blobResourceKey(videoBlob));
+assert.equal(isMarkedMatrixVideoUrl(markedVideoBlob), true);
+assert.equal(matrixVideoFallbackPoster(markedVideoBlob), MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,
+    "a marked Matrix video must receive a valid poster even after an exact cache lookup misses");
+assert.equal(matrixVideoFallbackPoster(`${blobResourceKey(videoBlob)}#`), undefined,
+    "an unmarked Blob must retain Discord's normal behavior");
+
+// Discord build 591432's ImageLoaderUtils exits before adding format/size
+// queries for data:image. Model that exact branch as an executable contract.
+const currentDiscordImageLoader = (src: string) => src.startsWith("data:image")
+    ? src
+    : `${src}?format=webp`;
+assert.equal(
+    currentDiscordImageLoader(MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL),
+    MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL,
+    "Discord must not rewrite the passive fallback image"
+);
+
+// Its LazyImage component also does not reset ERROR when only src changes.
+// A revoked Blob poster therefore stays broken, while a self-contained data
+// image remains usable by both the retained row and its replacement mount.
+type LazyImageState = "LOADING" | "READY" | "ERROR";
+const currentDiscordLazyImagePropUpdate = (state: LazyImageState, _nextSrc: string): LazyImageState => state;
+assert.equal(currentDiscordLazyImagePropUpdate("ERROR", MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL), "ERROR");
+assert.ok(MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL.startsWith("data:image/png;base64,"));
+const fallbackPosterPayload = MATRIX_VIDEO_FALLBACK_POSTER_DATA_URL.slice("data:image/png;base64,".length);
+const fallbackPosterBytes = Buffer.from(fallbackPosterPayload, "base64");
+assert.equal(fallbackPosterBytes.toString("base64"), fallbackPosterPayload,
+    "the passive fallback must contain canonical base64");
+assert.deepEqual([...fallbackPosterBytes.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    "the passive fallback must contain a real PNG signature");
+assert.equal(fallbackPosterBytes.toString("ascii", 12, 16), "IHDR");
+assert.equal(fallbackPosterBytes.readUInt32BE(16), 1);
+assert.equal(fallbackPosterBytes.readUInt32BE(20), 1);
 
 console.log("Matrix uploaded-video fixture passed.");

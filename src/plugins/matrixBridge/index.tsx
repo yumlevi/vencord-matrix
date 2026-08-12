@@ -90,7 +90,12 @@ import { openMatrixSearch } from "./search";
 import { MatrixSettings } from "./settings";
 import { openMatrixSpaceChildModal } from "./spaceCreate";
 import type { MatrixAttachmentGroupDTO, MatrixPowerLevelPermissionDTO } from "./types";
-import { MATRIX_VIDEO_POSTER_PATCH, MATRIX_VIDEO_POSTER_REPLACEMENT } from "./videoPosterPatch";
+import {
+    MATRIX_INLINE_VIDEO_POSTER_PATCH,
+    MATRIX_INLINE_VIDEO_POSTER_REPLACEMENT,
+    MATRIX_VIDEO_POSTER_PATCH,
+    MATRIX_VIDEO_POSTER_REPLACEMENT,
+} from "./videoPosterPatch";
 
 const settings = definePluginSettings({
     encryptedRoomProviderPreviews: {
@@ -1095,10 +1100,21 @@ export default definePlugin({
             },
         },
         {
+            // Inline attachment mosaics derive their visible video thumbnail
+            // before the media-viewer factory runs. Their stock helper also
+            // appends ?format=webp, so intercept the same Matrix-only poster at
+            // this earlier boundary and retain the normal Discord fallback.
+            find: "srcUnfurledMediaItem:",
+            replacement: {
+                match: MATRIX_INLINE_VIDEO_POSTER_PATCH,
+                replace: MATRIX_INLINE_VIDEO_POSTER_REPLACEMENT,
+            },
+        },
+        {
             // Discord's CDN proxy can derive a still poster from a video by
             // appending ?format=webp. Matrix videos are renderer-local Blobs,
             // where that query changes the resource key and fails. Substitute
-            // only our separately generated poster while leaving the player
+            // only our bounded data:image poster while leaving the player
             // source and every normal Discord attachment untouched.
             find: "disableArrowKeySeek:!0",
             replacement: {
