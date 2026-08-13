@@ -173,6 +173,7 @@ let localRoute: MatrixSecureViewRoute | undefined;
 let overlay: Overlay = null;
 let authMode: AuthMode = "login";
 let authBusy = false;
+let authError = "";
 let settingsPage: "discover" | "account" = "account";
 let fatalMessage: string | undefined;
 let loadingLabel = "Opening the isolated Matrix view...";
@@ -743,6 +744,19 @@ function clearMedia() {
     autoPreviewRequests = 0;
 }
 
+function scrubAuthSecrets() {
+    authForm.password = "";
+    authForm.confirmPassword = "";
+    authForm.registrationToken = "";
+    authForm.accessToken = "";
+}
+
+function restoreAuthIdentity(identity: Pick<AuthFormState, "homeserver" | "username">) {
+    authForm.homeserver = identity.homeserver;
+    authForm.username = identity.username;
+    scrubAuthSecrets();
+}
+
 function clearSensitiveUiState() {
     uiGeneration++;
     searchGeneration++;
@@ -807,17 +821,13 @@ function clearSensitiveUiState() {
     directMessageSpaceId = "";
     directMessageUserId = "";
     authBusy = false;
+    authError = "";
     roomKeyImportBusy = false;
     roomKeyImportPassphrase = "";
     fatalRecoveryBusy = false;
-    Object.assign(authForm, {
-        homeserver: "",
-        username: "",
-        password: "",
-        confirmPassword: "",
-        registrationToken: "",
-        accessToken: "",
-    });
+    authForm.homeserver = "";
+    authForm.username = "";
+    scrubAuthSecrets();
     Object.assign(createSpaceForm, {
         name: "",
         topic: "",
@@ -4488,6 +4498,8 @@ function renderAuth() {
     for (const [mode, label] of authModes) {
         const tab = makeButton(label, "matrix-tab", () => {
             authMode = mode;
+            authError = "";
+            scrubAuthSecrets();
             scheduleRender();
         }, { disabled: authBusy });
         tab.setAttribute("role", "tab");
@@ -4539,20 +4551,35 @@ function renderAuth() {
         token.addEventListener("input", () => { authForm.accessToken = token.value; });
         form.append(labelledField("Access token", token));
     }
-    const submit = makeButton(authBusy ? "Working..." : authMode === "register" ? "Create account" : "Sign in", "matrix-button matrix-button-primary", () => form.requestSubmit(), {
-        disabled: authBusy,
-    });
+    const submit = textElement(
+        "button",
+        "matrix-button matrix-button-primary",
+        authBusy ? "Working..." : authMode === "register" ? "Create account" : "Sign in",
+    );
     submit.type = "submit";
+    submit.disabled = authBusy;
+    if (authError) {
+        const error = textElement("p", "matrix-auth-error", authError);
+        error.setAttribute("role", "alert");
+        form.append(error);
+    }
     form.append(submit);
     form.addEventListener("submit", event => {
         event.preventDefault();
         if (!host || authBusy || accountTransition) return;
         const mode = authMode;
+        const retainedIdentity = {
+            homeserver: authForm.homeserver,
+            username: authForm.username,
+        };
         const server = preservedDevice ? preservedHomeserver : normalizeHomeserver(authForm.homeserver);
         const username = preservedDevice ? preservedUsername : authForm.username.trim();
-        const { password, confirmPassword, registrationToken, accessToken } = authForm;
+        const { password, confirmPassword, accessToken } = authForm;
+        const registrationToken = authForm.registrationToken.trim();
         if (mode === "register" && password !== confirmPassword) {
-            showToast("Passwords do not match.", "error");
+            restoreAuthIdentity(retainedIdentity);
+            authError = "Passwords do not match.";
+            scheduleRender();
             return;
         }
         const transition = beginAccountTransition(mode === "register" ? "register" : "login",
@@ -4575,16 +4602,24 @@ function renderAuth() {
             if (!accountId) throw new Error("Matrix did not return the signed-in account.");
             if (await requestTransitionBootstrap(transition, accountId)) setRoute({ kind: "home" });
         }).catch(async error => {
-            if (accountTransition !== transition) return;
+            if (transition.generation !== uiGeneration) return;
+            const message = errorText(error);
             try {
-                if (await requestTransitionBootstrap(transition)) showToast(errorText(error), "error");
+                await requestTransitionBootstrap(transition);
             } catch {
                 failClosed("Matrix sign-in could not be verified safely.");
+                return;
             }
-        }).finally(() => {
-            authBusy = false;
-            if (accountTransition === transition) loadingLabel = "";
+            if (transition.generation !== uiGeneration) return;
+            restoreAuthIdentity(retainedIdentity);
+            authError = message;
             scheduleRender();
+        }).finally(() => {
+            if (transition.generation === uiGeneration) {
+                authBusy = false;
+                if (accountTransition === transition) loadingLabel = "";
+                scheduleRender();
+            }
         });
     });
     card.append(

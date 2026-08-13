@@ -555,8 +555,11 @@ function validateUsername(value: unknown): string {
 }
 
 function validateRegistrationToken(value: unknown): string {
-    const token = validateString(value, "registrationToken", 64);
-    if (!/^[A-Za-z0-9._~-]+$/.test(token)) {
+    if (typeof value !== "string" || value.length > 256) {
+        throw bridgeError("MATRIX_INVALID_REGISTRATION_TOKEN", "The registration token has an invalid format.");
+    }
+    const token = value.trim();
+    if (!token || token.length > 64 || !/^[A-Za-z0-9._~-]+$/.test(token)) {
         throw bridgeError("MATRIX_INVALID_REGISTRATION_TOKEN", "The registration token has an invalid format.");
     }
     return token;
@@ -3759,8 +3762,32 @@ async function secureViewBootstrap(event: IpcMainInvokeEvent, state: SecureViewS
     ));
 }
 
+function definitiveRegistrationWorkerErrorCode(code: string): boolean {
+    switch (code) {
+        case "MATRIX_ACCOUNT_CREATED_AWAITING_APPROVAL":
+        case "MATRIX_REGISTRATION_LOGIN_MISSING":
+        case "MATRIX_REGISTRATION_TOKEN_REJECTED":
+        case "MATRIX_REGISTRATION_FLOW_UNSUPPORTED":
+        case "MATRIX_REGISTRATION_AMBIGUOUS":
+        case "M_USER_IN_USE":
+        case "MATRIX_INVALID_USERNAME":
+        case "M_EXCLUSIVE":
+        case "M_LIMIT_EXCEEDED":
+        case "M_UNRECOGNIZED":
+        case "MATRIX_INVALID_REGISTRATION_TOKEN":
+            return true;
+        default:
+            return false;
+    }
+}
+
 function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]): Error | undefined {
     switch (commandType) {
+        case "register":
+            return bridgeError(
+                "MATRIX_REGISTRATION_AMBIGUOUS",
+                "Matrix could not confirm whether the account was created. Sign in with that username before trying to register it again."
+            );
         case "configureSpaceAccess":
             return bridgeError(
                 "MATRIX_SPACE_ACCESS_CONFIGURATION_AMBIGUOUS",
@@ -3818,14 +3845,14 @@ function interruptedAccessMutationError(commandType: MatrixWorkerCommand["type"]
 }
 
 function mutationSignalCommandType(commandType: MatrixWorkerCommand["type"]): boolean {
-    return commandType === "createSpace" || commandType === "createSpaceChild" || commandType === "createGroupChat"
+    return commandType === "register" || commandType === "createSpace" || commandType === "createSpaceChild" || commandType === "createGroupChat"
         || commandType === "inviteUserToSpace" || commandType === "inviteUserToGroupChat" || commandType === "acceptInvite"
         || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
         || commandType === "joinRoom" || commandType === "joinRoomAddress";
 }
 
 function accessMutationRequiresDispatchSignal(commandType: MatrixWorkerCommand["type"]): boolean {
-    return commandType === "inviteUserToSpace" || commandType === "inviteUserToGroupChat" || commandType === "acceptInvite"
+    return commandType === "register" || commandType === "inviteUserToSpace" || commandType === "inviteUserToGroupChat" || commandType === "acceptInvite"
         || commandType === "rejectInvite" || commandType === "joinSuggestedSpaceChannels"
         || commandType === "joinRoom" || commandType === "joinRoomAddress" || commandType === "createGroupChat";
 }
@@ -4179,6 +4206,14 @@ function handleWorkerMessage(message: MatrixWorkerMessage): void {
         return;
     }
     const error = bridgeError(message.error.code, message.error.message);
+    if (pending.commandType === "register" && pending.mutationDispatched
+        && !definitiveRegistrationWorkerErrorCode(message.error.code)) {
+        pending.reject(bridgeError(
+            "MATRIX_REGISTRATION_AMBIGUOUS",
+            "Matrix could not confirm whether the account was created. Sign in with that username before trying to register it again."
+        ));
+        return;
+    }
     if (pending.commandType === "createSpace" && pending.mutationDispatched
         && error.name !== "MATRIX_CREATE_SPACE_REJECTED") {
         pending.reject(bridgeError(
@@ -4678,10 +4713,20 @@ async function getConfig(_: IpcMainInvokeEvent): Promise<MatrixBridgeConfig> {
     };
 }
 
+function registrationAuthenticationFailure(accountWasCreated: boolean): MatrixBridgeError | undefined {
+    return accountWasCreated
+        ? {
+            code: "MATRIX_REGISTRATION_AMBIGUOUS",
+            message: "Matrix may have created the account, but returned an unusable session. Sign in with that username before trying to register it again."
+        }
+        : undefined;
+}
+
 async function authenticate(
     command: (storageKey: string) => MatrixWorkerCommand,
     homeserver: string,
-    accountWasCreated: boolean
+    accountWasCreated: boolean,
+    scrubCommand?: (command: MatrixWorkerCommand) => void
 ): Promise<MatrixSnapshot> {
     assertSecureStorage();
     const existing = await readStoredAccountRecord();
@@ -4701,15 +4746,23 @@ async function authenticate(
     const storageKey = randomBytes(32).toString("base64");
     updateStatus("starting");
     let result: MatrixWorkerResult;
+    const workerCommand = command(storageKey);
     try {
-        result = await callWorker(command(storageKey));
+        result = await callWorker(workerCommand);
     } catch (error) {
         updateStatus("error", undefined, errorDTO(error));
         throw error;
+    } finally {
+        scrubCommand?.(workerCommand);
     }
     if (!isAuthenticationResult(result)) {
         terminateWorker(bridgeError("MATRIX_AUTHENTICATION_DISCARDED", "The invalid Matrix session was discarded."));
-        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The isolated Matrix backend returned invalid authentication data.");
+        const registrationFailure = registrationAuthenticationFailure(accountWasCreated);
+        const error = registrationFailure
+            ? bridgeError(registrationFailure.code, registrationFailure.message)
+            : bridgeError("MATRIX_PROTOCOL_ERROR", "The isolated Matrix backend returned invalid authentication data.");
+        updateStatus("error", undefined, errorDTO(error));
+        throw error;
     }
 
     const { credentials } = result;
@@ -4729,8 +4782,12 @@ async function authenticate(
         });
     } catch (error) {
         terminateWorker(bridgeError("MATRIX_AUTHENTICATION_DISCARDED", "The invalid Matrix session was discarded."));
-        updateStatus("error", undefined, errorDTO(error));
-        throw error;
+        const registrationFailure = registrationAuthenticationFailure(accountWasCreated);
+        const safeError = registrationFailure
+            ? bridgeError(registrationFailure.code, registrationFailure.message)
+            : error;
+        updateStatus("error", undefined, errorDTO(safeError));
+        throw safeError;
     }
 
     try {
@@ -5001,11 +5058,24 @@ async function register(_: IpcMainInvokeEvent, input: MatrixRegistrationRequest)
             authenticationInProgress = true;
             try {
                 const registration = validateRegistration(input);
-                return await authenticate(
-                    storageKey => ({ type: "register", registration, storageKey }),
-                    registration.homeserver,
-                    true
-                );
+                input.password = "";
+                input.registrationToken = "";
+                try {
+                    return await authenticate(
+                        storageKey => ({ type: "register", registration: { ...registration }, storageKey }),
+                        registration.homeserver,
+                        true,
+                        command => {
+                            if (command.type === "register") {
+                                command.registration.password = "";
+                                command.registration.registrationToken = "";
+                            }
+                        }
+                    );
+                } finally {
+                    registration.password = "";
+                    registration.registrationToken = "";
+                }
             } finally {
                 authenticationInProgress = false;
             }

@@ -492,8 +492,11 @@ function validateUsername(value: unknown): string {
 }
 
 function validateRegistrationToken(value: unknown): string {
-    const token = validateString(value, "registrationToken", 64);
-    if (!/^[A-Za-z0-9._~-]+$/.test(token)) {
+    if (typeof value !== "string" || value.length > 256) {
+        fail("MATRIX_INVALID_REGISTRATION_TOKEN", "The registration token has an invalid format.");
+    }
+    const token = value.trim();
+    if (!token || token.length > 64 || !/^[A-Za-z0-9._~-]+$/.test(token)) {
         fail("MATRIX_INVALID_REGISTRATION_TOKEN", "The registration token has an invalid format.");
     }
     return token;
@@ -3444,11 +3447,102 @@ function registrationFlow(data: RegistrationAuthData): string[] {
     fail("MATRIX_REGISTRATION_FLOW_UNSUPPORTED", "This homeserver requires an additional registration step that this bridge cannot display.");
 }
 
+const REGISTRATION_AMBIGUOUS_MESSAGE = "Matrix could not confirm whether the account was created. Sign in with that username before trying to register it again.";
+
+function registrationHttpStatus(error: unknown): number | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const { httpStatus } = error as { httpStatus?: unknown; };
+    return typeof httpStatus === "number" && Number.isSafeInteger(httpStatus)
+        && httpStatus >= 100 && httpStatus <= 599
+        ? httpStatus
+        : undefined;
+}
+
+function publicRegistrationError(
+    error: unknown,
+    dispatched: boolean,
+    accountCreated = false
+): PublicWorkerError {
+    if (accountCreated) {
+        return new PublicWorkerError(
+            "MATRIX_REGISTRATION_LOGIN_MISSING",
+            "The account was created, but the homeserver did not return a usable login session."
+        );
+    }
+
+    const { code } = publicError(error);
+    if (dispatched && (registrationHttpStatus(error) ?? 0) >= 500) {
+        return new PublicWorkerError("MATRIX_REGISTRATION_AMBIGUOUS", REGISTRATION_AMBIGUOUS_MESSAGE);
+    }
+    switch (code) {
+        case "MATRIX_ACCOUNT_CREATED_AWAITING_APPROVAL":
+        case "ORG.MATRIX.MSC3866_USER_AWAITING_APPROVAL":
+        case "ORG_MATRIX_MSC3866_USER_AWAITING_APPROVAL":
+        case "ORG_MATRIX_MSC3866_USER_NOT_APPROVED":
+            return new PublicWorkerError(
+                "MATRIX_ACCOUNT_CREATED_AWAITING_APPROVAL",
+                "The account was created, but an administrator must approve it before it can sign in."
+            );
+        case "MATRIX_REGISTRATION_LOGIN_MISSING":
+            return new PublicWorkerError(
+                "MATRIX_REGISTRATION_LOGIN_MISSING",
+                "The account was created, but the homeserver did not return a usable login session."
+            );
+        case "MATRIX_REGISTRATION_TOKEN_REJECTED":
+            return new PublicWorkerError(
+                "MATRIX_REGISTRATION_TOKEN_REJECTED",
+                "The registration token was rejected or has expired."
+            );
+        case "M_FORBIDDEN":
+            return dispatched
+                ? new PublicWorkerError("MATRIX_REGISTRATION_AMBIGUOUS", REGISTRATION_AMBIGUOUS_MESSAGE)
+                : new PublicWorkerError(
+                    "MATRIX_REGISTRATION_FAILED",
+                    "The homeserver rejected account registration."
+                );
+        case "MATRIX_REGISTRATION_FLOW_UNSUPPORTED":
+            return new PublicWorkerError(
+                "MATRIX_REGISTRATION_FLOW_UNSUPPORTED",
+                "This homeserver requires an additional registration step that this bridge cannot display."
+            );
+        case "MATRIX_REGISTRATION_FAILED":
+            return dispatched
+                ? new PublicWorkerError("MATRIX_REGISTRATION_AMBIGUOUS", REGISTRATION_AMBIGUOUS_MESSAGE)
+                : new PublicWorkerError(
+                    "MATRIX_REGISTRATION_FAILED",
+                    "The homeserver did not complete account registration."
+                );
+        case "M_USER_IN_USE":
+            return new PublicWorkerError("M_USER_IN_USE", "That username is already taken.");
+        case "M_INVALID_USERNAME":
+        case "MATRIX_INVALID_USERNAME":
+            return new PublicWorkerError("MATRIX_INVALID_USERNAME", "The homeserver rejected that username.");
+        case "M_EXCLUSIVE":
+            return new PublicWorkerError("M_EXCLUSIVE", "That username is reserved on this homeserver.");
+        case "M_LIMIT_EXCEEDED":
+            return new PublicWorkerError("M_LIMIT_EXCEEDED", "The Matrix homeserver is rate limiting account registration.");
+        case "M_UNRECOGNIZED":
+            return new PublicWorkerError("M_UNRECOGNIZED", "The Matrix homeserver does not support token registration.");
+        case "MATRIX_INVALID_REGISTRATION_TOKEN":
+            return new PublicWorkerError(
+                "MATRIX_INVALID_REGISTRATION_TOKEN",
+                "The registration token has an invalid format."
+            );
+        case "MATRIX_REGISTRATION_AMBIGUOUS":
+            return new PublicWorkerError("MATRIX_REGISTRATION_AMBIGUOUS", REGISTRATION_AMBIGUOUS_MESSAGE);
+    }
+
+    return dispatched
+        ? new PublicWorkerError("MATRIX_REGISTRATION_AMBIGUOUS", REGISTRATION_AMBIGUOUS_MESSAGE)
+        : new PublicWorkerError("MATRIX_REGISTRATION_FAILED", "Account registration could not be started.");
+}
+
 async function registerWithToken(
     client: MatrixClient,
     username: string,
     password: string,
-    registrationToken: string
+    registrationToken: string,
+    mutationDispatched: () => void
 ) {
     const body = {
         username,
@@ -3461,6 +3555,7 @@ async function registerWithToken(
     let stage: string | undefined;
     let flow: string[] | undefined;
     let completed = new Set<string>();
+    let mutationReported = false;
 
     for (let attempt = 0; attempt < 6; attempt++) {
         const submittedStage = stage;
@@ -3468,6 +3563,10 @@ async function registerWithToken(
         if (auth && session) auth.session = session;
         if (auth && REGISTRATION_TOKEN_STAGES.has(stage!)) auth.token = registrationToken;
         try {
+            if (!mutationReported) {
+                mutationDispatched();
+                mutationReported = true;
+            }
             return await client.registerRequest({ ...body, ...(auth ? { auth: auth as any } : {}) });
         } catch (error) {
             const data = registrationAuthData(error);
@@ -3508,7 +3607,10 @@ async function registerWithToken(
     fail("MATRIX_REGISTRATION_FAILED", "The homeserver did not finish account registration.");
 }
 
-async function registerAccount(command: Extract<MatrixWorkerCommand, { type: "register"; }>): Promise<MatrixWorkerResult> {
+async function registerAccount(
+    command: Extract<MatrixWorkerCommand, { type: "register"; }>,
+    mutationDispatched: () => void
+): Promise<MatrixWorkerResult> {
     if (matrixClient || activeCredentials) fail("MATRIX_ALREADY_CONFIGURED", "Log out of the current Matrix account before registering.");
     const input = command.registration;
     const homeserver = validateHomeserver(input.homeserver);
@@ -3517,40 +3619,42 @@ async function registerAccount(command: Extract<MatrixWorkerCommand, { type: "re
     const registrationToken = validateRegistrationToken(input.registrationToken);
 
     setStatus("starting");
-    const registrationClient = createClient({
-        baseUrl: homeserver,
-        logger: silentLogger,
-        localTimeoutMs: 30_000,
-        disableVoip: true
-    });
-    let response: Awaited<ReturnType<MatrixClient["registerRequest"]>>;
+    let registrationDispatched = false;
+    let accountCreated = false;
     try {
-        response = await registerWithToken(registrationClient, username, password, registrationToken);
-    } catch (error) {
-        const safeError = publicError(error);
-        if (safeError.code === "ORG.MATRIX.MSC3866_USER_AWAITING_APPROVAL"
-            || safeError.code === "ORG_MATRIX_MSC3866_USER_AWAITING_APPROVAL"
-            || safeError.code === "ORG_MATRIX_MSC3866_USER_NOT_APPROVED") {
-            fail(
-                "MATRIX_ACCOUNT_CREATED_AWAITING_APPROVAL",
-                "The account was created, but an administrator must approve it before it can sign in."
-            );
+        const registrationClient = createClient({
+            baseUrl: homeserver,
+            logger: silentLogger,
+            localTimeoutMs: 30_000,
+            disableVoip: true
+        });
+        const response = await registerWithToken(
+            registrationClient,
+            username,
+            password,
+            registrationToken,
+            () => {
+                mutationDispatched();
+                registrationDispatched = true;
+            }
+        );
+        accountCreated = true;
+        if (!response.access_token || !response.device_id) {
+            fail("MATRIX_REGISTRATION_LOGIN_MISSING", "The account was created, but the homeserver did not return a login session.");
         }
-        throw new PublicWorkerError(safeError.code, safeError.message);
+        const credentials: MatrixSessionCredentials = {
+            homeserver,
+            userId: validateUserId(response.user_id),
+            deviceId: validateString(response.device_id, "deviceId", 512),
+            accessToken: validateString(response.access_token, "accessToken", 65_536),
+            refreshToken: response.refresh_token == null
+                ? undefined
+                : validateString(response.refresh_token, "refreshToken", 65_536)
+        };
+        return { credentials };
+    } catch (error) {
+        throw publicRegistrationError(error, registrationDispatched, accountCreated);
     }
-    if (!response.access_token || !response.device_id) {
-        fail("MATRIX_REGISTRATION_LOGIN_MISSING", "The account was created, but the homeserver did not return a login session.");
-    }
-    const credentials: MatrixSessionCredentials = {
-        homeserver,
-        userId: validateUserId(response.user_id),
-        deviceId: validateString(response.device_id, "deviceId", 512),
-        accessToken: validateString(response.access_token, "accessToken", 65_536),
-        refreshToken: response.refresh_token == null
-            ? undefined
-            : validateString(response.refresh_token, "refreshToken", 65_536)
-    };
-    return { credentials };
 }
 
 async function publicRooms(
@@ -9230,7 +9334,7 @@ async function handleCommand(
     switch (command.type) {
         case "login": return await login(command);
         case "reauthenticate": return await reauthenticate(command);
-        case "register": return await registerAccount(command);
+        case "register": return await registerAccount(command, mutationDispatched);
         case "start": return await startAuthenticated(command.account, progress);
         case "suspend": await suspend(); return undefined;
         case "signOut": await signOut(command); return undefined;
@@ -9373,7 +9477,7 @@ function lifecycleCommand(command: MatrixWorkerCommand): boolean {
 }
 
 function mutationSignalCommand(command: MatrixWorkerCommand): boolean {
-    return command.type === "createSpace" || command.type === "createSpaceChild" || command.type === "createGroupChat"
+    return command.type === "register" || command.type === "createSpace" || command.type === "createSpaceChild" || command.type === "createGroupChat"
         || command.type === "inviteUserToSpace" || command.type === "inviteUserToGroupChat" || command.type === "acceptInvite"
         || command.type === "rejectInvite" || command.type === "joinSuggestedSpaceChannels"
         || command.type === "joinRoom" || command.type === "joinRoomAddress";

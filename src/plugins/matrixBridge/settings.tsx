@@ -777,6 +777,7 @@ export function MatrixSettings() {
     const [dmMembersLoading, setDmMembersLoading] = useState(false);
     const [dmMembersError, setDmMembersError] = useState("");
     const directoryRequest = useRef(0);
+    const operationBusy = useRef(false);
 
     function setNotice(value: string) {
         setNoticeText(value);
@@ -957,6 +958,8 @@ export function MatrixSettings() {
     }, [accountActionRequired, dmSpaceId]);
 
     async function run(action: () => Promise<void>) {
+        if (operationBusy.current) return;
+        operationBusy.current = true;
         setBusy(true);
         setError("");
         setNotice("");
@@ -965,8 +968,12 @@ export function MatrixSettings() {
         } catch (caught) {
             setError(errorMessage(caught));
         } finally {
-            await reload();
-            setBusy(false);
+            try {
+                await reload();
+            } finally {
+                setBusy(false);
+                operationBusy.current = false;
+            }
         }
     }
 
@@ -997,12 +1004,15 @@ export function MatrixSettings() {
 
     async function finishAuthentication(action: () => Promise<unknown>) {
         await run(async () => {
-            await action();
-            clearSecrets();
-            await restartBridge();
-            await loadRooms(true);
-            setTab("rooms");
-            setNotice("Matrix is connected.");
+            try {
+                await action();
+                await restartBridge();
+                await loadRooms(true);
+                setTab("rooms");
+                setNotice("Matrix is connected.");
+            } finally {
+                clearSecrets();
+            }
         });
     }
 
@@ -1074,7 +1084,8 @@ export function MatrixSettings() {
     }
 
     async function registerAccount() {
-        if (!homeserver.trim() || !username.trim() || !password || !registrationToken) {
+        const trimmedRegistrationToken = registrationToken.trim();
+        if (!homeserver.trim() || !username.trim() || !password || !trimmedRegistrationToken) {
             setError("Homeserver, username, password, and registration token are required.");
             return;
         }
@@ -1087,7 +1098,7 @@ export function MatrixSettings() {
             homeserver: normalizedHomeserver(homeserver),
             username: username.trim(),
             password,
-            registrationToken,
+            registrationToken: trimmedRegistrationToken,
         }));
     }
 
@@ -1992,7 +2003,7 @@ export function MatrixSettings() {
                 </div>
 
                 {!config?.configured ? (
-                    <div className="vc-matrix-card vc-matrix-auth-card">
+                    <div className="vc-matrix-card vc-matrix-auth-card" aria-busy={busy}>
                         {preservedDevice && (
                             <div>
                                 <Heading tag="h4">Signed out — local keys preserved</Heading>
@@ -2098,8 +2109,15 @@ export function MatrixSettings() {
                             variant="positive"
                             onClick={() => void (mode === "register" ? registerAccount() : login())}
                         >
-                            {mode === "register" ? "Create account" : "Sign in"}
+                            {busy
+                                ? mode === "register" ? "Creating account..." : "Signing in..."
+                                : mode === "register" ? "Create account" : "Sign in"}
                         </Button>
+                        {error && (
+                            <Paragraph className="vc-matrix-auth-error" role="alert" style={{ color: "var(--text-danger)" }}>
+                                {error}
+                            </Paragraph>
+                        )}
                         <Button
                             disabled={busy}
                             variant="secondary"
@@ -2174,6 +2192,11 @@ export function MatrixSettings() {
                                 >
                                     {busy ? "Reconnecting..." : "Reconnect account"}
                                 </Button>
+                                {error && (
+                                    <Paragraph className="vc-matrix-auth-error" role="alert" style={{ color: "var(--text-danger)" }}>
+                                        {error}
+                                    </Paragraph>
+                                )}
                             </div>
                         )}
 

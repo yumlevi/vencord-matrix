@@ -30,11 +30,38 @@ if (typeof generation !== "string" || !/^[a-f0-9]{64}$/u.test(generation)) {
     throw new Error("Matrix secure view generation is missing or invalid.");
 }
 
+function cloneAuthenticationRequest(request: MatrixSecureViewRequest): MatrixSecureViewRequest {
+    switch (request.type) {
+        case "login":
+            return { ...request, login: { ...request.login } };
+        case "register":
+            return { ...request, registration: { ...request.registration } };
+        default:
+            return request;
+    }
+}
+
+function scrubClonedAuthenticationRequest(request: MatrixSecureViewRequest): void {
+    switch (request.type) {
+        case "login":
+            if (request.login.method === "password") request.login.password = "";
+            else request.login.accessToken = "";
+            break;
+        case "register":
+            request.registration.password = "";
+            request.registration.registrationToken = "";
+            break;
+    }
+}
+
 const host: MatrixSecureViewHost = Object.freeze({
     request<Type extends MatrixSecureViewRequestType>(request: MatrixSecureViewRequest<Type>) {
-        const envelope: MatrixSecureViewRequestEnvelope = { generation, request };
+        const clonedRequest = cloneAuthenticationRequest(request);
+        const envelope: MatrixSecureViewRequestEnvelope = { generation, request: clonedRequest };
         const result = ipcRenderer.invoke(MATRIX_SECURE_VIEW_REQUEST, envelope) as Promise<MatrixSecureViewResult<Type>>;
         return result.finally(() => {
+            scrubClonedAuthenticationRequest(clonedRequest);
+            scrubClonedAuthenticationRequest(request);
             if (request.type === "importRoomKeys") request.passphrase = "";
         });
     },

@@ -1201,6 +1201,12 @@ audio.matrix-media {
     margin-top: 20px;
 }
 
+.matrix-auth-error {
+    margin: 0;
+    color: var(--matrix-danger);
+    line-height: 20px;
+}
+
 .matrix-auth-card .matrix-button-primary {
     width: 100%;
     min-height: 40px;
