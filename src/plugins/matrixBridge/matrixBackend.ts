@@ -29,6 +29,16 @@ import {
     SyncState,
     Visibility
 } from "matrix-js-sdk";
+import {
+    type CryptoApi,
+    type ShowSasCallbacks,
+    VerificationPhase,
+    type VerificationRequest,
+    VerificationRequestEvent,
+    type Verifier,
+    VerifierEvent
+} from "matrix-js-sdk/lib/crypto-api";
+import { VerificationMethod } from "matrix-js-sdk/lib/types";
 
 import { isDefinitiveCreateRoomRejection } from "./createSpaceChildError";
 import { matrixServerUnavailableHttpStatus } from "./errorCode";
@@ -66,6 +76,9 @@ import type {
     MatrixCreateSpacePartialResult,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
+    MatrixDeviceVerificationFlowDTO,
+    MatrixDeviceVerificationSasDTO,
+    MatrixDeviceVerificationStatusDTO,
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateDTO,
     MatrixGroupChatCandidateMembership,
@@ -280,6 +293,37 @@ let clientGeneration = 0;
 let schedulerGeneration = 0;
 let publicDirectoryRefreshGeneration = 0;
 let decryptionRevision = 0;
+
+interface ActiveDeviceVerification {
+    readonly verificationId: string;
+    readonly generation: number;
+    readonly client: MatrixClient;
+    readonly userId: string;
+    readonly deviceId: string;
+    readonly transactionId: string;
+    readonly request: VerificationRequest;
+    readonly expiresAt?: number;
+    readonly onRequestChange: () => void;
+    phase: MatrixDeviceVerificationFlowDTO["phase"];
+    otherDeviceId?: string;
+    cancellationCode?: string;
+    cancelledByMe?: boolean;
+    error?: MatrixBridgeError;
+    verifier?: Verifier;
+    onShowSas?: (callbacks: ShowSasCallbacks) => void;
+    sasCallbacks?: ShowSasCallbacks;
+    startingSas: boolean;
+    verifyStarted: boolean;
+    confirming: boolean;
+    cancellationRequestedByMe: boolean;
+    disposed: boolean;
+    reconcileTail: Promise<void>;
+}
+
+let activeDeviceVerification: ActiveDeviceVerification | undefined;
+let deviceVerificationCrossSigningAvailable = false;
+let deviceVerificationCrossSigningCheckedAt = 0;
+const DEVICE_VERIFICATION_CROSS_SIGNING_REFRESH_MS = 30_000;
 
 interface HistoryCursorState {
     generation: number;
@@ -871,6 +915,547 @@ function safeListener(callback: () => void): void {
     } catch {
         setStatus("error", { code: "MATRIX_EVENT_ERROR", message: "A Matrix event could not be normalized safely." });
     }
+}
+
+const DEVICE_VERIFICATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const DEVICE_VERIFICATION_TRANSACTION_MAX_LENGTH = 512;
+const DEVICE_VERIFICATION_TIMEOUT_MAX_MS = 24 * 60 * 60_000;
+
+function currentDeviceCryptoContext(): {
+    client: MatrixClient;
+    cryptoApi: CryptoApi;
+    userId: string;
+    deviceId: string;
+} {
+    const client = matrixClient;
+    const credentials = activeCredentials;
+    if (!client || !credentials) fail("MATRIX_NOT_STARTED", "The Matrix backend is not started.");
+    if (client.getUserId() !== credentials.userId || client.getDeviceId() !== credentials.deviceId) {
+        fail("MATRIX_SESSION_CHANGED", "The Matrix account changed while device verification was active.");
+    }
+    const cryptoApi = client.getCrypto();
+    if (!cryptoApi) fail("MATRIX_CRYPTO_UNAVAILABLE", "Matrix encryption storage is unavailable.");
+    return {
+        client,
+        cryptoApi,
+        userId: credentials.userId,
+        deviceId: credentials.deviceId
+    };
+}
+
+function activeDeviceVerificationIsCurrent(flow: ActiveDeviceVerification): boolean {
+    return !flow.disposed
+        && activeDeviceVerification === flow
+        && matrixClient === flow.client
+        && clientGeneration === flow.generation
+        && activeCredentials?.userId === flow.userId
+        && activeCredentials.deviceId === flow.deviceId;
+}
+
+function validateDeviceVerificationId(value: unknown): string {
+    if (typeof value !== "string" || !DEVICE_VERIFICATION_ID_PATTERN.test(value)) {
+        fail("MATRIX_INVALID_ARGUMENT", "The device verification ID is invalid.");
+    }
+    return value;
+}
+
+function requireActiveDeviceVerification(value: unknown): ActiveDeviceVerification {
+    const verificationId = validateDeviceVerificationId(value);
+    const flow = activeDeviceVerification;
+    if (!flow || flow.verificationId !== verificationId || !activeDeviceVerificationIsCurrent(flow)) {
+        fail("MATRIX_DEVICE_VERIFICATION_NOT_FOUND", "That Matrix device verification is no longer active.");
+    }
+    assertDeviceVerificationBinding(flow);
+    return flow;
+}
+
+function validVerificationTransactionId(value: unknown): value is string {
+    return typeof value === "string"
+        && value.length > 0
+        && value.length <= DEVICE_VERIFICATION_TRANSACTION_MAX_LENGTH
+        && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validVerificationDeviceId(value: unknown): value is string {
+    return typeof value === "string"
+        && value.length > 0
+        && value.length <= 512
+        && !/[\s\u0000-\u001f\u007f]/u.test(value);
+}
+
+function assertDeviceVerificationBinding(flow: ActiveDeviceVerification): void {
+    if (!activeDeviceVerificationIsCurrent(flow)) throw sessionChangedError();
+    const context = currentDeviceCryptoContext();
+    if (context.client !== flow.client || context.userId !== flow.userId || context.deviceId !== flow.deviceId
+        || !validVerificationTransactionId(flow.request.transactionId)
+        || flow.request.transactionId !== flow.transactionId
+        || flow.request.roomId !== undefined
+        || !flow.request.isSelfVerification
+        || flow.request.otherUserId !== flow.userId) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Matrix rejected an inconsistent current-device verification flow."
+        );
+    }
+    const { otherDeviceId } = flow.request;
+    if (otherDeviceId !== undefined) {
+        if (!validVerificationDeviceId(otherDeviceId) || otherDeviceId === flow.deviceId
+            || flow.otherDeviceId !== undefined && flow.otherDeviceId !== otherDeviceId) {
+            throw new PublicWorkerError(
+                "MATRIX_DEVICE_VERIFICATION_INVALID",
+                "Matrix changed the device bound to the active verification."
+            );
+        }
+        flow.otherDeviceId = otherDeviceId;
+    } else if (flow.otherDeviceId !== undefined) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Matrix removed the device bound to the active verification."
+        );
+    }
+    if (flow.request.chosenMethod !== null && flow.request.chosenMethod !== VerificationMethod.Sas) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "The other Matrix device selected an unsupported verification method."
+        );
+    }
+    if (flow.verifier && flow.verifier.userId !== flow.userId) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Matrix bound the verifier to an unexpected account."
+        );
+    }
+}
+
+function sanitizedVerificationFailure(): MatrixBridgeError {
+    return {
+        code: "MATRIX_DEVICE_VERIFICATION_FAILED",
+        message: "Matrix device verification could not continue safely."
+    };
+}
+
+function releaseDeviceVerificationSecrets(flow: ActiveDeviceVerification): void {
+    if (flow.verifier && flow.onShowSas) {
+        flow.verifier.off(VerifierEvent.ShowSas, flow.onShowSas);
+    }
+    flow.onShowSas = undefined;
+    flow.sasCallbacks = undefined;
+}
+
+function releaseDeviceVerificationListeners(flow: ActiveDeviceVerification): void {
+    flow.request.off(VerificationRequestEvent.Change, flow.onRequestChange);
+    releaseDeviceVerificationSecrets(flow);
+}
+
+function disposeActiveDeviceVerification(): void {
+    const flow = activeDeviceVerification;
+    activeDeviceVerification = undefined;
+    if (!flow) return;
+    flow.disposed = true;
+    releaseDeviceVerificationListeners(flow);
+    flow.verifier = undefined;
+}
+
+function failDeviceVerification(flow: ActiveDeviceVerification): void {
+    if (!activeDeviceVerificationIsCurrent(flow)
+        || flow.phase === "done" || flow.phase === "cancelled") return;
+    flow.phase = "failed";
+    flow.error = sanitizedVerificationFailure();
+    flow.startingSas = false;
+    flow.confirming = false;
+    releaseDeviceVerificationListeners(flow);
+}
+
+function normalizedDeviceVerificationSas(callbacks: ShowSasCallbacks): Omit<MatrixDeviceVerificationSasDTO, "verificationId"> {
+    if (!callbacks || typeof callbacks.confirm !== "function" || typeof callbacks.mismatch !== "function"
+        || typeof callbacks.cancel !== "function" || !callbacks.sas || typeof callbacks.sas !== "object") {
+        throw new Error("Invalid SAS callbacks");
+    }
+    let decimal: [number, number, number] | undefined;
+    if (callbacks.sas.decimal !== undefined) {
+        if (!Array.isArray(callbacks.sas.decimal) || callbacks.sas.decimal.length !== 3
+            || !callbacks.sas.decimal.every(value => Number.isSafeInteger(value) && value >= 1_000 && value <= 9_191)) {
+            throw new Error("Invalid decimal SAS");
+        }
+        decimal = [callbacks.sas.decimal[0], callbacks.sas.decimal[1], callbacks.sas.decimal[2]];
+    }
+    let emoji: MatrixDeviceVerificationSasDTO["emoji"];
+    if (callbacks.sas.emoji !== undefined) {
+        if (!Array.isArray(callbacks.sas.emoji) || callbacks.sas.emoji.length !== 7) {
+            throw new Error("Invalid emoji SAS");
+        }
+        emoji = callbacks.sas.emoji.map(entry => {
+            if (!Array.isArray(entry) || entry.length !== 2
+                || typeof entry[0] !== "string" || entry[0].length < 1 || entry[0].length > 16
+                || typeof entry[1] !== "string" || entry[1].length < 1 || entry[1].length > 64
+                || /[\u0000-\u001f\u007f]/u.test(entry[0]) || /[\u0000-\u001f\u007f]/u.test(entry[1])) {
+                throw new Error("Invalid emoji SAS");
+            }
+            return { emoji: entry[0], name: entry[1] };
+        });
+    }
+    if (!decimal && !emoji) throw new Error("Missing SAS");
+    return { ...(emoji ? { emoji } : {}), ...(decimal ? { decimal } : {}) };
+}
+
+function rememberDeviceVerificationSas(flow: ActiveDeviceVerification, callbacks: ShowSasCallbacks): void {
+    assertDeviceVerificationBinding(flow);
+    normalizedDeviceVerificationSas(callbacks);
+    if (flow.sasCallbacks && flow.sasCallbacks !== callbacks) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Matrix replaced the active short authentication string."
+        );
+    }
+    flow.sasCallbacks = callbacks;
+    if (!flow.confirming) flow.phase = "sas";
+}
+
+function queueDeviceVerificationReconcile(flow: ActiveDeviceVerification): Promise<void> {
+    const operation = flow.reconcileTail.then(async () => {
+        if (activeDeviceVerificationIsCurrent(flow)
+            && flow.phase !== "failed" && flow.phase !== "done" && flow.phase !== "cancelled") {
+            await reconcileDeviceVerification(flow);
+        }
+    });
+    flow.reconcileTail = operation.catch(() => failDeviceVerification(flow));
+    return flow.reconcileTail;
+}
+
+function attachDeviceVerifier(flow: ActiveDeviceVerification, verifier: Verifier): void {
+    assertDeviceVerificationBinding(flow);
+    if (flow.verifier && flow.verifier !== verifier) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Matrix replaced the active device verifier."
+        );
+    }
+    if (!flow.verifier) flow.verifier = verifier;
+    if (!flow.onShowSas) {
+        const onShowSas = (callbacks: ShowSasCallbacks): void => {
+            if (!activeDeviceVerificationIsCurrent(flow)) return;
+            try {
+                rememberDeviceVerificationSas(flow, callbacks);
+            } catch {
+                failDeviceVerification(flow);
+            }
+        };
+        flow.onShowSas = onShowSas;
+        verifier.on(VerifierEvent.ShowSas, onShowSas);
+    }
+    if (!flow.verifyStarted) {
+        flow.verifyStarted = true;
+        const completion = verifier.verify();
+        void completion.then(
+            () => queueDeviceVerificationReconcile(flow),
+            () => queueDeviceVerificationReconcile(flow).then(() => {
+                if (activeDeviceVerificationIsCurrent(flow)
+                    && flow.phase !== "cancelled" && flow.phase !== "done" && flow.phase !== "failed") {
+                    failDeviceVerification(flow);
+                }
+            })
+        );
+    }
+    // `show_sas` may have fired while verify() synchronously advanced Rust.
+    const existingCallbacks = verifier.getShowSasCallbacks();
+    if (existingCallbacks) rememberDeviceVerificationSas(flow, existingCallbacks);
+    if (!flow.sasCallbacks && !flow.confirming) flow.phase = "verifying";
+}
+
+async function refreshedCurrentDeviceTrust(refreshCrossSigning: boolean): Promise<{
+    verified: boolean;
+    crossSigningVerified: boolean;
+    localVerified: boolean;
+    signedByOwner: boolean;
+    crossSigningAvailable: boolean;
+}> {
+    const before = currentDeviceCryptoContext();
+    if (refreshCrossSigning) deviceVerificationCrossSigningCheckedAt = Date.now();
+    const deviceStatusPromise = before.cryptoApi.getDeviceVerificationStatus(before.userId, before.deviceId);
+    const crossSigningPromise = refreshCrossSigning
+        ? before.cryptoApi.userHasCrossSigningKeys(before.userId, true)
+        : Promise.resolve(deviceVerificationCrossSigningAvailable);
+    const [deviceStatus, crossSigningAvailable] = await Promise.all([deviceStatusPromise, crossSigningPromise]);
+    const after = currentDeviceCryptoContext();
+    if (after.client !== before.client || after.userId !== before.userId || after.deviceId !== before.deviceId) {
+        throw sessionChangedError();
+    }
+    if (refreshCrossSigning) deviceVerificationCrossSigningAvailable = crossSigningAvailable;
+    return {
+        verified: deviceStatus?.isVerified() === true,
+        crossSigningVerified: deviceStatus?.crossSigningVerified === true,
+        localVerified: deviceStatus?.localVerified === true,
+        signedByOwner: deviceStatus?.signedByOwner === true,
+        crossSigningAvailable
+    };
+}
+
+function deviceVerificationFlowDTO(flow: ActiveDeviceVerification): MatrixDeviceVerificationFlowDTO {
+    assertDeviceVerificationBinding(flow);
+    return {
+        verificationId: flow.verificationId,
+        phase: flow.phase,
+        ...(flow.otherDeviceId ? { otherDeviceId: flow.otherDeviceId } : {}),
+        ...(flow.expiresAt == null ? {} : { expiresAt: flow.expiresAt }),
+        ...(flow.cancellationCode ? { cancellationCode: flow.cancellationCode } : {}),
+        ...(flow.cancelledByMe == null ? {} : { cancelledByMe: flow.cancelledByMe }),
+        ...(flow.error ? { error: { ...flow.error } } : {})
+    };
+}
+
+async function currentDeviceVerificationStatus(
+    refreshCrossSigning = false
+): Promise<MatrixDeviceVerificationStatusDTO> {
+    const context = currentDeviceCryptoContext();
+    const trust = await refreshedCurrentDeviceTrust(refreshCrossSigning);
+    const flow = activeDeviceVerification;
+    return {
+        deviceId: context.deviceId,
+        ...trust,
+        ...(flow && activeDeviceVerificationIsCurrent(flow)
+            ? { verification: deviceVerificationFlowDTO(flow) }
+            : {})
+    };
+}
+
+async function polledCurrentDeviceVerificationStatus(): Promise<MatrixDeviceVerificationStatusDTO> {
+    return await currentDeviceVerificationStatus(
+        Date.now() - deviceVerificationCrossSigningCheckedAt >= DEVICE_VERIFICATION_CROSS_SIGNING_REFRESH_MS
+    );
+}
+
+async function reconcileDeviceVerification(flow: ActiveDeviceVerification): Promise<void> {
+    if (flow.phase === "failed" || flow.phase === "done" || flow.phase === "cancelled") return;
+    assertDeviceVerificationBinding(flow);
+    const { phase, pending } = flow.request;
+    if (phase !== VerificationPhase.Done && phase !== VerificationPhase.Cancelled && !pending) {
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_INVALID",
+            "Another device answered the verification request first."
+        );
+    }
+    switch (phase) {
+        case VerificationPhase.Requested:
+            if (!flow.startingSas && !flow.confirming) flow.phase = "requested";
+            return;
+        case VerificationPhase.Ready: {
+            if (!flow.otherDeviceId || !flow.request.otherPartySupportsMethod(VerificationMethod.Sas)) {
+                throw new PublicWorkerError(
+                    "MATRIX_DEVICE_VERIFICATION_UNSUPPORTED",
+                    "The other Matrix device cannot use emoji verification."
+                );
+            }
+            if (flow.startingSas || flow.verifier) return;
+            flow.phase = "ready";
+            flow.startingSas = true;
+            try {
+                const verifier = await flow.request.startVerification(VerificationMethod.Sas);
+                assertDeviceVerificationBinding(flow);
+                attachDeviceVerifier(flow, verifier);
+            } finally {
+                flow.startingSas = false;
+            }
+            return;
+        }
+        case VerificationPhase.Started: {
+            if (!flow.otherDeviceId || flow.request.chosenMethod !== VerificationMethod.Sas) {
+                throw new PublicWorkerError(
+                    "MATRIX_DEVICE_VERIFICATION_INVALID",
+                    "Matrix started verification with an unexpected device or method."
+                );
+            }
+            const { verifier } = flow.request;
+            if (!verifier) {
+                throw new PublicWorkerError(
+                    "MATRIX_DEVICE_VERIFICATION_INVALID",
+                    "Matrix started verification without a verifier."
+                );
+            }
+            attachDeviceVerifier(flow, verifier);
+            return;
+        }
+        case VerificationPhase.Cancelled: {
+            const { cancellationCode } = flow.request;
+            flow.cancellationCode = typeof cancellationCode === "string"
+                && cancellationCode.length <= 128 && /^m\.[a-z0-9._-]+$/u.test(cancellationCode)
+                ? cancellationCode
+                : "m.unknown";
+            flow.cancelledByMe = flow.cancellationRequestedByMe ? true : undefined;
+            flow.phase = "cancelled";
+            flow.confirming = false;
+            releaseDeviceVerificationListeners(flow);
+            return;
+        }
+        case VerificationPhase.Done: {
+            const trust = await refreshedCurrentDeviceTrust(false);
+            assertDeviceVerificationBinding(flow);
+            flow.confirming = false;
+            if (trust.verified) {
+                flow.phase = "done";
+                flow.error = undefined;
+            } else {
+                flow.phase = "failed";
+                flow.error = {
+                    code: "MATRIX_DEVICE_VERIFICATION_NOT_TRUSTED",
+                    message: "Matrix completed the comparison, but this device is not trusted."
+                };
+            }
+            releaseDeviceVerificationListeners(flow);
+            return;
+        }
+        default:
+            throw new PublicWorkerError(
+                "MATRIX_DEVICE_VERIFICATION_INVALID",
+                "Matrix returned an unknown device verification phase."
+            );
+    }
+}
+
+async function requestOwnDeviceVerification(): Promise<MatrixDeviceVerificationStatusDTO> {
+    const context = currentDeviceCryptoContext();
+    let initialTrust: Awaited<ReturnType<typeof refreshedCurrentDeviceTrust>>;
+    try {
+        // This is an explicit user action, so refresh the public identity even
+        // when a recent passive status read cached an unavailable result.
+        initialTrust = await refreshedCurrentDeviceTrust(true);
+    } catch {
+        fail(
+            "MATRIX_DEVICE_VERIFICATION_PRECHECK_FAILED",
+            "Matrix could not refresh this device's cross-signing status."
+        );
+    }
+    if (initialTrust.verified) return await currentDeviceVerificationStatus(false);
+    if (!initialTrust.crossSigningAvailable) {
+        fail(
+            "MATRIX_CROSS_SIGNING_UNAVAILABLE",
+            "Set up cross-signing in another Matrix client before verifying this device."
+        );
+    }
+    const existing = activeDeviceVerification;
+    if (existing && activeDeviceVerificationIsCurrent(existing)
+        && existing.phase !== "done" && existing.phase !== "cancelled" && existing.phase !== "failed") {
+        return await currentDeviceVerificationStatus(false);
+    }
+    disposeActiveDeviceVerification();
+
+    let request: VerificationRequest;
+    try {
+        request = await context.cryptoApi.requestOwnUserVerification();
+    } catch {
+        fail(
+            "MATRIX_DEVICE_VERIFICATION_REQUEST_FAILED",
+            "Matrix could not send a verification request to your other devices."
+        );
+    }
+    const { transactionId, timeout } = request;
+    if (!validVerificationTransactionId(transactionId)) {
+        fail("MATRIX_DEVICE_VERIFICATION_INVALID", "Matrix returned an invalid device verification transaction.");
+    }
+    const expiresAt = typeof timeout === "number" && Number.isFinite(timeout)
+        && timeout >= 0 && timeout <= DEVICE_VERIFICATION_TIMEOUT_MAX_MS
+        ? Math.min(Number.MAX_SAFE_INTEGER, Date.now() + Math.ceil(timeout))
+        : undefined;
+    const flow: ActiveDeviceVerification = {
+        verificationId: globalThis.crypto.randomUUID(),
+        generation: clientGeneration,
+        client: context.client,
+        userId: context.userId,
+        deviceId: context.deviceId,
+        transactionId,
+        request,
+        expiresAt,
+        onRequestChange: () => {
+            if (activeDeviceVerificationIsCurrent(flow)) void queueDeviceVerificationReconcile(flow);
+        },
+        phase: "requested",
+        startingSas: false,
+        verifyStarted: false,
+        confirming: false,
+        cancellationRequestedByMe: false,
+        disposed: false,
+        reconcileTail: Promise.resolve()
+    };
+    activeDeviceVerification = flow;
+    try {
+        assertDeviceVerificationBinding(flow);
+        request.on(VerificationRequestEvent.Change, flow.onRequestChange);
+        await queueDeviceVerificationReconcile(flow);
+        if (flow.phase === "failed") {
+            throw new PublicWorkerError(flow.error!.code, flow.error!.message);
+        }
+    } catch (error) {
+        disposeActiveDeviceVerification();
+        if (error instanceof PublicWorkerError) throw error;
+        throw new PublicWorkerError(
+            "MATRIX_DEVICE_VERIFICATION_REQUEST_FAILED",
+            "Matrix could not start a safe current-device verification."
+        );
+    }
+    return await currentDeviceVerificationStatus(false);
+}
+
+function currentDeviceVerificationSas(verificationId: unknown): MatrixDeviceVerificationSasDTO {
+    const flow = requireActiveDeviceVerification(verificationId);
+    if (!flow.sasCallbacks || (flow.phase !== "sas" && flow.phase !== "confirming")) {
+        fail("MATRIX_DEVICE_VERIFICATION_NOT_READY", "The short authentication string is not ready yet.");
+    }
+    return {
+        verificationId: flow.verificationId,
+        ...normalizedDeviceVerificationSas(flow.sasCallbacks)
+    };
+}
+
+async function confirmDeviceVerification(verificationId: unknown): Promise<MatrixDeviceVerificationStatusDTO> {
+    const flow = requireActiveDeviceVerification(verificationId);
+    if (flow.phase !== "sas" || !flow.sasCallbacks || flow.confirming) {
+        fail("MATRIX_DEVICE_VERIFICATION_NOT_READY", "This device verification cannot be confirmed now.");
+    }
+    flow.confirming = true;
+    flow.phase = "confirming";
+    try {
+        await flow.sasCallbacks.confirm();
+        assertDeviceVerificationBinding(flow);
+    } catch {
+        failDeviceVerification(flow);
+        fail("MATRIX_DEVICE_VERIFICATION_CONFIRM_FAILED", "Matrix could not confirm the device comparison safely.");
+    }
+    void queueDeviceVerificationReconcile(flow);
+    return await currentDeviceVerificationStatus(false);
+}
+
+async function mismatchDeviceVerification(verificationId: unknown): Promise<MatrixDeviceVerificationStatusDTO> {
+    const flow = requireActiveDeviceVerification(verificationId);
+    if (flow.phase !== "sas" || !flow.sasCallbacks || flow.confirming) {
+        fail("MATRIX_DEVICE_VERIFICATION_NOT_READY", "This device verification cannot report a mismatch now.");
+    }
+    flow.confirming = true;
+    flow.phase = "confirming";
+    flow.cancellationRequestedByMe = true;
+    try {
+        flow.sasCallbacks.mismatch();
+    } catch {
+        failDeviceVerification(flow);
+        fail("MATRIX_DEVICE_VERIFICATION_MISMATCH_FAILED", "Matrix could not report the device mismatch safely.");
+    }
+    assertDeviceVerificationBinding(flow);
+    void queueDeviceVerificationReconcile(flow);
+    return await currentDeviceVerificationStatus(false);
+}
+
+async function cancelDeviceVerification(verificationId: unknown): Promise<MatrixDeviceVerificationStatusDTO> {
+    const flow = requireActiveDeviceVerification(verificationId);
+    if (flow.phase === "done" || flow.phase === "cancelled") {
+        return await currentDeviceVerificationStatus(false);
+    }
+    flow.cancellationRequestedByMe = true;
+    try {
+        await flow.request.cancel();
+        assertDeviceVerificationBinding(flow);
+    } catch {
+        fail("MATRIX_DEVICE_VERIFICATION_CANCEL_FAILED", "Matrix could not cancel device verification safely.");
+    }
+    await queueDeviceVerificationReconcile(flow);
+    return await currentDeviceVerificationStatus(false);
 }
 
 function decodeStorageKey(value: string): Uint8Array<ArrayBuffer> {
@@ -3082,6 +3667,9 @@ function attachClientListeners(client: MatrixClient): void {
 
 async function disposeClient(clearStores: boolean): Promise<void> {
     clientGeneration++;
+    disposeActiveDeviceVerification();
+    deviceVerificationCrossSigningAvailable = false;
+    deviceVerificationCrossSigningCheckedAt = 0;
     disposeSpaceAccessMemberHydrations();
     historyCursors.clear();
     searchCursors.clear();
@@ -3234,6 +3822,7 @@ async function startAuthenticated(
         tokenRefreshFunction: account.refreshToken ? refreshTokens : undefined,
         store,
         timelineSupport: true,
+        verificationMethods: [VerificationMethod.Sas],
         logger: startupLogger,
         localTimeoutMs: 30_000,
         disableVoip: true
@@ -9340,6 +9929,12 @@ async function handleCommand(
         case "signOut": await signOut(command); return undefined;
         case "logout": await logout(); return undefined;
         case "importRoomKeys": return await importRoomKeys(command);
+        case "deviceVerificationStatus": return await polledCurrentDeviceVerificationStatus();
+        case "requestOwnDeviceVerification": return await requestOwnDeviceVerification();
+        case "deviceVerificationSas": return currentDeviceVerificationSas(command.verificationId);
+        case "confirmDeviceVerification": return await confirmDeviceVerification(command.verificationId);
+        case "mismatchDeviceVerification": return await mismatchDeviceVerification(command.verificationId);
+        case "cancelDeviceVerification": return await cancelDeviceVerification(command.verificationId);
         case "snapshot": return snapshot();
         case "joinedRoomIds": return await exactJoinedRoomIds();
         case "publicRooms": return await publicRooms(command);

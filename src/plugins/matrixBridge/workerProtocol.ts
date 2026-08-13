@@ -18,6 +18,8 @@ import type {
     MatrixCreateSpaceChildResult,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
+    MatrixDeviceVerificationSasDTO,
+    MatrixDeviceVerificationStatusDTO,
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateSearchRequest,
     MatrixGroupChatCandidateSearchResult,
@@ -115,6 +117,12 @@ export type MatrixWorkerCommand =
     | { type: "signOut"; credentials?: MatrixSessionCredentials; }
     | { type: "logout"; }
     | { type: "importRoomKeys"; bytes: Uint8Array; passphrase: string; }
+    | { type: "deviceVerificationStatus"; }
+    | { type: "requestOwnDeviceVerification"; }
+    | { type: "deviceVerificationSas"; verificationId: string; }
+    | { type: "confirmDeviceVerification"; verificationId: string; }
+    | { type: "mismatchDeviceVerification"; verificationId: string; }
+    | { type: "cancelDeviceVerification"; verificationId: string; }
     | { type: "snapshot"; }
     | { type: "joinedRoomIds"; }
     | { type: "publicRooms"; }
@@ -183,6 +191,8 @@ export type MatrixWorkerResult =
     | MatrixRequestSpaceAccessResult
     | MatrixResolveSpaceAccessRequestResult
     | MatrixDirectMessageResult
+    | MatrixDeviceVerificationSasDTO
+    | MatrixDeviceVerificationStatusDTO
     | MatrixMediaDownloadResult
     | MatrixHistoryPageDTO
     | MatrixInviteUserToSpaceResult

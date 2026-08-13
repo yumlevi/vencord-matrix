@@ -80,6 +80,8 @@ import type {
     MatrixCreateSpacePartialCode,
     MatrixCreateSpaceRequest,
     MatrixCreateSpaceResult,
+    MatrixDeviceVerificationSasDTO,
+    MatrixDeviceVerificationStatusDTO,
     MatrixDirectMessageResult,
     MatrixGroupChatCandidateDTO,
     MatrixGroupChatCandidateSearchRequest,
@@ -356,6 +358,16 @@ interface MatrixAccountBinding {
     storageKey: string;
 }
 
+interface NativeDeviceVerification {
+    owner: BrowserWindow;
+    ownerContents: WebContents;
+    worker: BrowserWindow;
+    binding: MatrixAccountBinding;
+    lifecycleRevision: number;
+    verificationId?: string;
+    dialogOpen: boolean;
+}
+
 interface StartupFailureLatch {
     binding: MatrixAccountBinding;
     error: MatrixBridgeError;
@@ -403,6 +415,7 @@ let createSpaceInFlight = false;
 let createSpaceChildInFlight = false;
 let createGroupChatInFlight = false;
 let activeWorkerBinding: MatrixAccountBinding | null = null;
+let activeDeviceVerification: NativeDeviceVerification | null = null;
 let startupFailureLatch: StartupFailureLatch | null = null;
 let accountBoundOperations = 0;
 let privateAccountRequests = 0;
@@ -4548,6 +4561,186 @@ function isAuthenticationResult(result: MatrixWorkerResult): result is { credent
     return Boolean(result && typeof result === "object" && "credentials" in result);
 }
 
+const DEVICE_VERIFICATION_PHASES = new Set([
+    "requested",
+    "ready",
+    "verifying",
+    "sas",
+    "confirming",
+    "done",
+    "cancelled",
+    "failed"
+] as const);
+const DEVICE_VERIFICATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function protocolVerificationId(value: unknown): string {
+    const verificationId = protocolText(value, "device-verification ID", 36);
+    if (!DEVICE_VERIFICATION_ID_PATTERN.test(verificationId)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification response was invalid.");
+    }
+    return verificationId;
+}
+
+function protocolVerificationError(value: unknown): MatrixBridgeError {
+    const raw = protocolObjectKeys(
+        value,
+        "device-verification error",
+        ["code", "message", "causeCode"],
+        ["code", "message"]
+    );
+    const code = protocolText(raw.code, "device-verification error code", 128);
+    if (!MATRIX_ERROR_CODE_PATTERN.test(code)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification error was invalid.");
+    }
+    const causeCode = raw.causeCode == null
+        ? undefined
+        : protocolText(raw.causeCode, "device-verification cause code", 128);
+    if (causeCode != null && !MATRIX_ERROR_CODE_PATTERN.test(causeCode)) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification error was invalid.");
+    }
+    return {
+        code,
+        message: protocolText(raw.message, "device-verification error message", 300),
+        ...(causeCode == null ? {} : { causeCode })
+    };
+}
+
+function validateProtocolDeviceVerificationStatus(value: unknown): MatrixDeviceVerificationStatusDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "device-verification status",
+        [
+            "deviceId",
+            "verified",
+            "crossSigningVerified",
+            "localVerified",
+            "signedByOwner",
+            "crossSigningAvailable",
+            "verification"
+        ],
+        [
+            "deviceId",
+            "verified",
+            "crossSigningVerified",
+            "localVerified",
+            "signedByOwner",
+            "crossSigningAvailable"
+        ]
+    );
+    for (const key of [
+        "verified",
+        "crossSigningVerified",
+        "localVerified",
+        "signedByOwner",
+        "crossSigningAvailable"
+    ] as const) {
+        if (typeof raw[key] !== "boolean") {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification status was invalid.");
+        }
+    }
+
+    let verification: MatrixDeviceVerificationStatusDTO["verification"];
+    if (raw.verification != null) {
+        const flow = protocolObjectKeys(
+            raw.verification,
+            "device-verification flow",
+            [
+                "verificationId",
+                "phase",
+                "otherDeviceId",
+                "expiresAt",
+                "cancellationCode",
+                "cancelledByMe",
+                "error"
+            ],
+            ["verificationId", "phase"]
+        );
+        const phase = protocolText(flow.phase, "device-verification phase", 16);
+        if (!DEVICE_VERIFICATION_PHASES.has(phase as never)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification phase was invalid.");
+        }
+        const expiresAt = flow.expiresAt == null ? undefined : Number(flow.expiresAt);
+        if (expiresAt != null && (!Number.isSafeInteger(expiresAt) || expiresAt < 0)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification expiry was invalid.");
+        }
+        if (flow.cancelledByMe != null && typeof flow.cancelledByMe !== "boolean") {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification cancellation was invalid.");
+        }
+        verification = {
+            verificationId: protocolVerificationId(flow.verificationId),
+            phase: phase as NonNullable<MatrixDeviceVerificationStatusDTO["verification"]>["phase"],
+            ...(flow.otherDeviceId == null
+                ? {}
+                : { otherDeviceId: protocolText(flow.otherDeviceId, "peer device ID", 512) }),
+            ...(expiresAt == null ? {} : { expiresAt }),
+            ...(flow.cancellationCode == null
+                ? {}
+                : { cancellationCode: protocolText(flow.cancellationCode, "cancellation code", 128) }),
+            ...(flow.cancelledByMe == null ? {} : { cancelledByMe: flow.cancelledByMe }),
+            ...(flow.error == null ? {} : { error: protocolVerificationError(flow.error) })
+        };
+        if (phase === "done" && raw.verified !== true) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "Matrix reported verification completion without device trust.");
+        }
+    }
+
+    return {
+        deviceId: protocolText(raw.deviceId, "device ID", 512),
+        verified: raw.verified as boolean,
+        crossSigningVerified: raw.crossSigningVerified as boolean,
+        localVerified: raw.localVerified as boolean,
+        signedByOwner: raw.signedByOwner as boolean,
+        crossSigningAvailable: raw.crossSigningAvailable as boolean,
+        ...(verification == null ? {} : { verification })
+    };
+}
+
+function validateProtocolDeviceVerificationSas(
+    value: unknown,
+    verificationId: string
+): MatrixDeviceVerificationSasDTO {
+    const raw = protocolObjectKeys(
+        value,
+        "device-verification comparison",
+        ["verificationId", "emoji", "decimal"],
+        ["verificationId"]
+    );
+    if (protocolVerificationId(raw.verificationId) !== verificationId) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix device-verification comparison changed flows.");
+    }
+
+    let emoji: MatrixDeviceVerificationSasDTO["emoji"];
+    if (raw.emoji != null) {
+        if (!Array.isArray(raw.emoji) || raw.emoji.length !== 7) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix emoji comparison was invalid.");
+        }
+        emoji = raw.emoji.map(value => {
+            const item = protocolObjectKeys(value, "device-verification emoji", ["emoji", "name"]);
+            return {
+                emoji: protocolText(item.emoji, "device-verification emoji", 16),
+                name: protocolText(item.name, "device-verification emoji name", 64)
+            };
+        });
+    }
+
+    let decimal: MatrixDeviceVerificationSasDTO["decimal"];
+    if (raw.decimal != null) {
+        if (!Array.isArray(raw.decimal) || raw.decimal.length !== 3
+            || raw.decimal.some(value => !Number.isSafeInteger(value) || value < 1_000 || value > 9_191)) {
+            throw bridgeError("MATRIX_PROTOCOL_ERROR", "The Matrix number comparison was invalid.");
+        }
+        decimal = [Number(raw.decimal[0]), Number(raw.decimal[1]), Number(raw.decimal[2])];
+    }
+    if (emoji == null && decimal == null) {
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "Matrix did not provide a device-verification comparison.");
+    }
+    return {
+        verificationId,
+        ...(emoji == null ? {} : { emoji }),
+        ...(decimal == null ? {} : { decimal })
+    };
+}
+
 async function requireStarted(): Promise<void> {
     // Secure-view account requests are already counted by
     // beginPrivateAccountRequest(). Let a healthy request finish on that exact
@@ -4711,6 +4904,195 @@ async function getConfig(_: IpcMainInvokeEvent): Promise<MatrixBridgeConfig> {
         deviceId: account.deviceId,
         persistentE2EE: true
     };
+}
+
+function deviceVerificationContextCurrent(attempt: NativeDeviceVerification): boolean {
+    return activeDeviceVerification === attempt
+        && accountLifecycleTransitions === 0
+        && accountLifecycleRevision === attempt.lifecycleRevision
+        && workerWindow === attempt.worker
+        && !attempt.worker.isDestroyed()
+        && !attempt.owner.isDestroyed()
+        && !attempt.ownerContents.isDestroyed()
+        && sameAccountBinding(activeWorkerBinding, attempt.binding);
+}
+
+function requireDeviceVerificationContext(attempt: NativeDeviceVerification): void {
+    if (!deviceVerificationContextCurrent(attempt)) {
+        throw bridgeError(
+            "MATRIX_VERIFICATION_SESSION_CHANGED",
+            "The Matrix account or verification backend changed. Start verification again."
+        );
+    }
+}
+
+function deviceVerificationTerminal(status: MatrixDeviceVerificationStatusDTO): boolean {
+    const phase = status.verification?.phase;
+    return phase === "done" || phase === "cancelled" || phase === "failed";
+}
+
+async function getDeviceVerification(_: IpcMainInvokeEvent): Promise<MatrixDeviceVerificationStatusDTO> {
+    await requireStarted();
+    return validateProtocolDeviceVerificationStatus(
+        await callWorker({ type: "deviceVerificationStatus" })
+    );
+}
+
+function deviceVerificationDialogDetail(sas: MatrixDeviceVerificationSasDTO): string {
+    const sections = [
+        "Compare this code with the code shown by your other trusted Matrix device."
+    ];
+    if (sas.emoji) {
+        sections.push(sas.emoji.map(item => `${item.emoji}  ${item.name}`).join("     "));
+    }
+    if (sas.decimal) {
+        sections.push(`Numbers: ${sas.decimal.join("   ")}`);
+    }
+    sections.push("Choose ‘They match’ only when every emoji or every number is exactly the same on both devices.");
+    return sections.join("\n\n");
+}
+
+async function verifyCurrentDevice(event: IpcMainInvokeEvent): Promise<MatrixDeviceVerificationStatusDTO> {
+    if (activeDeviceVerification) {
+        throw bridgeError(
+            "MATRIX_VERIFICATION_IN_PROGRESS",
+            "A Matrix device verification is already in progress."
+        );
+    }
+
+    await requireStarted();
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    const worker = workerWindow;
+    const binding = activeWorkerBinding;
+    if (!owner || owner.isDestroyed() || !worker || worker.isDestroyed() || !binding
+        || accountLifecycleTransitions > 0) {
+        throw bridgeError(
+            "MATRIX_VERIFICATION_UNAVAILABLE",
+            "Matrix device verification is unavailable until the account is connected."
+        );
+    }
+
+    const attempt: NativeDeviceVerification = {
+        owner,
+        ownerContents: event.sender,
+        worker,
+        binding: { ...binding },
+        lifecycleRevision: accountLifecycleRevision,
+        dialogOpen: false
+    };
+    activeDeviceVerification = attempt;
+
+    try {
+        requireDeviceVerificationContext(attempt);
+        let status = validateProtocolDeviceVerificationStatus(
+            await callWorker({ type: "deviceVerificationStatus" })
+        );
+        if (status.verified) return status;
+        const existingPhase = status.verification?.phase;
+        if (!status.verification || existingPhase === "done"
+            || existingPhase === "cancelled" || existingPhase === "failed") {
+            status = validateProtocolDeviceVerificationStatus(
+                await callWorker({ type: "requestOwnDeviceVerification" })
+            );
+        }
+        const verificationId = status.verification?.verificationId;
+        if (!verificationId || deviceVerificationTerminal(status)) return status;
+        attempt.verificationId = verificationId;
+
+        const maximumDeadline = Date.now() + 11 * 60_000;
+        const requestDeadline = status.verification?.expiresAt;
+        const deadline = requestDeadline == null
+            ? maximumDeadline
+            : Math.min(maximumDeadline, Math.max(Date.now() + 1_000, requestDeadline + 5_000));
+
+        while (Date.now() < deadline) {
+            requireDeviceVerificationContext(attempt);
+            status = validateProtocolDeviceVerificationStatus(
+                await callWorker({ type: "deviceVerificationStatus" })
+            );
+            if (status.verification?.verificationId !== verificationId) {
+                throw bridgeError(
+                    "MATRIX_VERIFICATION_SESSION_CHANGED",
+                    "The Matrix verification request changed. Start verification again."
+                );
+            }
+            if (deviceVerificationTerminal(status)) return status;
+
+            if (status.verification.phase === "sas") {
+                const sas = validateProtocolDeviceVerificationSas(
+                    await callWorker({ type: "deviceVerificationSas", verificationId }),
+                    verificationId
+                );
+                requireDeviceVerificationContext(attempt);
+                attempt.dialogOpen = true;
+                let response: number;
+                try {
+                    ({ response } = await dialog.showMessageBox(owner, {
+                        type: "question",
+                        title: "Verify this Matrix device",
+                        message: "Do the Matrix security codes match?",
+                        detail: deviceVerificationDialogDetail(sas),
+                        buttons: ["Cancel", "They don’t match", "They match"],
+                        defaultId: 0,
+                        cancelId: 0,
+                        noLink: true
+                    }));
+                } finally {
+                    attempt.dialogOpen = false;
+                }
+
+                // A lifecycle transition or remote cancellation may finish
+                // while the native comparison dialog is open. Re-query and
+                // re-bind before translating the explicit button into an SDK
+                // action; stale dialog results are always inert.
+                requireDeviceVerificationContext(attempt);
+                status = validateProtocolDeviceVerificationStatus(
+                    await callWorker({ type: "deviceVerificationStatus" })
+                );
+                if (status.verification?.verificationId !== verificationId) {
+                    throw bridgeError(
+                        "MATRIX_VERIFICATION_SESSION_CHANGED",
+                        "The Matrix verification request changed. Start verification again."
+                    );
+                }
+                if (deviceVerificationTerminal(status)) return status;
+                if (status.verification.phase !== "sas") continue;
+
+                const command: MatrixWorkerCommand = response === 2
+                    ? { type: "confirmDeviceVerification", verificationId }
+                    : response === 1
+                        ? { type: "mismatchDeviceVerification", verificationId }
+                        : { type: "cancelDeviceVerification", verificationId };
+                status = validateProtocolDeviceVerificationStatus(await callWorker(command));
+                if (deviceVerificationTerminal(status)) return status;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 400));
+        }
+
+        requireDeviceVerificationContext(attempt);
+        await callWorker({ type: "cancelDeviceVerification", verificationId }).catch(() => undefined);
+        throw bridgeError(
+            "MATRIX_VERIFICATION_TIMEOUT",
+            "Matrix device verification timed out. Start a new verification request."
+        );
+    } finally {
+        if (activeDeviceVerification === attempt) activeDeviceVerification = null;
+    }
+}
+
+async function cancelDeviceVerification(
+    event: IpcMainInvokeEvent
+): Promise<MatrixDeviceVerificationStatusDTO> {
+    const attempt = activeDeviceVerification;
+    if (!attempt || attempt.ownerContents !== event.sender || !attempt.verificationId) {
+        throw bridgeError("MATRIX_VERIFICATION_NOT_ACTIVE", "No Matrix device verification is active.");
+    }
+    requireDeviceVerificationContext(attempt);
+    return validateProtocolDeviceVerificationStatus(await callWorker({
+        type: "cancelDeviceVerification",
+        verificationId: attempt.verificationId
+    }));
 }
 
 function registrationAuthenticationFailure(accountWasCreated: boolean): MatrixBridgeError | undefined {
@@ -9305,6 +9687,7 @@ export {
     acceptInvite,
     acknowledgeGroupChatCreate,
     acknowledgeGroupChatInvite,
+    cancelDeviceVerification,
     cancelPending,
     configureSpaceAccess,
     createGroupChat,
@@ -9313,6 +9696,7 @@ export {
     downloadMedia,
     edit,
     getConfig,
+    getDeviceVerification,
     getSpaceAccess,
     getSpaceAccessRequests,
     getStatus,
@@ -9356,5 +9740,6 @@ export {
     suggestedSpaceChannelPlan,
     suspend,
     typing,
-    urlPreview
+    urlPreview,
+    verifyCurrentDevice
 };

@@ -50,6 +50,7 @@ import {
 import type {
     MatrixConfigureSpaceAccessResult,
     MatrixCreateSpaceResult,
+    MatrixDeviceVerificationStatusDTO,
     MatrixJoinSuggestedSpaceChannelsResult,
     MatrixMemberDTO,
     MatrixPublicRoomDirectoryDTO,
@@ -71,6 +72,16 @@ type MatrixSpaceVisibility = "private" | "public";
 type MatrixSpaceCreationPhase = "idle" | "creating" | "syncing" | "checking";
 type MatrixSpaceAccessDraft = Pick<MatrixSpaceAccessSummaryDTO, "mode"> & { joinName: string; };
 
+type MatrixDeviceVerificationPhase = NonNullable<MatrixDeviceVerificationStatusDTO["verification"]>["phase"] | "idle";
+
+const ACTIVE_DEVICE_VERIFICATION_PHASES = new Set<MatrixDeviceVerificationPhase>([
+    "requested",
+    "ready",
+    "verifying",
+    "sas",
+    "confirming",
+]);
+
 const JOIN_NAME_MAX_LENGTH = 64;
 const JOIN_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
 const MATRIX_ROOM_ADDRESS_PATTERN = /^(?:#[^\s:]+:[^\s]+|![^\s:]+(?::[^\s]+)?)$/u;
@@ -89,6 +100,61 @@ let matrixSpaceCreationNeedsRefresh = false;
 
 function errorMessage(error: unknown) {
     return error instanceof Error ? error.message : String(error);
+}
+
+function deviceVerificationError(status: MatrixDeviceVerificationStatusDTO | undefined) {
+    const value: unknown = status?.verification?.error;
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object" && "message" in value
+        && typeof (value as { message?: unknown; }).message === "string") {
+        return (value as { message: string; }).message;
+    }
+    return status?.verification?.phase === "failed" ? "Matrix could not complete device verification." : "";
+}
+
+function deviceVerificationLabel(status: MatrixDeviceVerificationStatusDTO | undefined) {
+    if (!status) return "Checking device trust";
+    if (status.verified) return "Verified";
+    switch (status.verification?.phase ?? "idle") {
+        case "requested": return "Waiting for another device";
+        case "ready": return "Devices ready";
+        case "verifying": return "Verification in progress";
+        case "sas": return "Security code ready";
+        case "confirming": return "Finishing verification";
+        case "done": return "Verification finished";
+        case "cancelled": return "Verification cancelled";
+        case "failed": return "Verification failed";
+        case "idle": return "Not verified";
+    }
+}
+
+function deviceVerificationExplanation(status: MatrixDeviceVerificationStatusDTO | undefined) {
+    if (!status) return "Checking whether this Matrix device is trusted.";
+    if (status.verified) {
+        return "Matrix has confirmed this device as verified. Its encrypted messages can be trusted by your other verified devices.";
+    }
+    switch (status.verification?.phase ?? "idle") {
+        case "requested":
+            return "The request is waiting for another trusted Matrix device. Open that device and accept the verification request.";
+        case "ready":
+            return "Both devices accepted the request. The native Matrix comparison dialog is preparing the security code.";
+        case "verifying":
+            return "The devices are preparing a secure comparison. Keep both devices open.";
+        case "sas":
+            return "The security code is ready in the native Matrix comparison dialog. It is intentionally never shown in Discord settings.";
+        case "confirming":
+            return "Matrix is confirming the comparison with the other device. Keep both devices open.";
+        case "done":
+            return "The comparison finished, but Matrix has not confirmed this device as verified yet. Refresh before trying again.";
+        case "cancelled":
+            return "Verification was cancelled. No device trust was changed.";
+        case "failed":
+            return "Verification did not complete. Review the error below, then try again.";
+        case "idle":
+            return status.crossSigningAvailable
+                ? "Compare this device with another trusted Matrix device to verify it."
+                : "Cross-signing is not available for this account yet, so Matrix cannot start device verification from this session.";
+    }
 }
 
 async function beforeDeadline<T>(operation: Promise<T>, deadline: number): Promise<T> {
@@ -736,6 +802,11 @@ export function MatrixSettings() {
     const [accessToken, setAccessToken] = useState("");
     const [status, setStatus] = useState<any>();
     const [config, setConfig] = useState<any>();
+    const [deviceVerification, setDeviceVerification] = useState<MatrixDeviceVerificationStatusDTO>();
+    const [deviceVerificationRefreshError, setDeviceVerificationRefreshError] = useState("");
+    const [deviceVerificationActionError, setDeviceVerificationActionError] = useState("");
+    const [deviceVerificationBusy, setDeviceVerificationBusy] = useState(false);
+    const [deviceVerificationCancelBusy, setDeviceVerificationCancelBusy] = useState(false);
     const [rooms, setRooms] = useState<MatrixRoomDTO[]>(snapshotRooms);
     const [publicRooms, setPublicRooms] = useState<MatrixPublicRoomDTO[]>([]);
     const [directoryLoaded, setDirectoryLoaded] = useState(false);
@@ -778,6 +849,12 @@ export function MatrixSettings() {
     const [dmMembersError, setDmMembersError] = useState("");
     const directoryRequest = useRef(0);
     const operationBusy = useRef(false);
+    const deviceVerificationMounted = useRef(true);
+    const deviceVerificationIdentity = useRef("");
+    const deviceVerificationRequest = useRef(0);
+    const deviceVerificationMutation = useRef(0);
+    const deviceVerificationStartInFlight = useRef(false);
+    const deviceVerificationCancelInFlight = useRef(false);
 
     function setNotice(value: string) {
         setNoticeText(value);
@@ -822,6 +899,54 @@ export function MatrixSettings() {
     const accountActionRequired = reauthenticationRequired || sessionResetRequired;
     const preservedDevice = config?.preservedDevice === true;
 
+    function verificationIdentityFor(accountConfig: any) {
+        return accountConfig?.configured && typeof accountConfig.userId === "string"
+            && typeof accountConfig.deviceId === "string"
+            ? `${accountConfig.userId}\0${accountConfig.deviceId}`
+            : "";
+    }
+
+    function bindDeviceVerificationAccount(accountConfig: any) {
+        const identity = verificationIdentityFor(accountConfig);
+        if (deviceVerificationIdentity.current === identity) return identity;
+        deviceVerificationIdentity.current = identity;
+        deviceVerificationRequest.current++;
+        deviceVerificationMutation.current++;
+        deviceVerificationStartInFlight.current = false;
+        deviceVerificationCancelInFlight.current = false;
+        setDeviceVerification(undefined);
+        setDeviceVerificationRefreshError("");
+        setDeviceVerificationActionError("");
+        setDeviceVerificationBusy(false);
+        setDeviceVerificationCancelBusy(false);
+        return identity;
+    }
+
+    async function reloadDeviceVerification(accountConfig: any) {
+        const expectedIdentity = verificationIdentityFor(accountConfig);
+        const expectedDeviceId = accountConfig?.deviceId;
+        if (!expectedIdentity || deviceVerificationIdentity.current !== expectedIdentity) return;
+        const requestId = ++deviceVerificationRequest.current;
+        try {
+            const nextVerification = await Native.getDeviceVerification();
+            if (!deviceVerificationMounted.current
+                || requestId !== deviceVerificationRequest.current
+                || expectedIdentity !== deviceVerificationIdentity.current) return;
+            if (nextVerification.deviceId !== expectedDeviceId) {
+                setDeviceVerificationRefreshError("Matrix returned device trust for a different device. Reconnect this account before verifying it.");
+                return;
+            }
+            setDeviceVerification(nextVerification);
+            setDeviceVerificationRefreshError("");
+        } catch (caught) {
+            if (deviceVerificationMounted.current
+                && requestId === deviceVerificationRequest.current
+                && expectedIdentity === deviceVerificationIdentity.current) {
+                setDeviceVerificationRefreshError(`Device trust could not be refreshed: ${errorMessage(caught)}`);
+            }
+        }
+    }
+
     async function reload() {
         try {
             const [nextStatus, nextConfig] = await Promise.all([
@@ -830,12 +955,16 @@ export function MatrixSettings() {
             ]);
             setStatus(nextStatus);
             setConfig(nextConfig);
+            bindDeviceVerificationAccount(nextConfig);
             if (nextConfig?.homeserver) setHomeserver(nextConfig.homeserver);
             if (nextConfig?.preservedDevice) {
                 const localpart = matrixLocalpart(nextConfig.userId);
                 if (localpart) setUsername(localpart);
             }
             setRooms(snapshotRooms());
+            if (nextConfig?.configured && !matrixAccountActionRequired(nextStatus)) {
+                await reloadDeviceVerification(nextConfig);
+            }
             return { config: nextConfig, status: nextStatus };
         } catch (caught) {
             setError(errorMessage(caught));
@@ -880,6 +1009,7 @@ export function MatrixSettings() {
     }
 
     useEffect(() => {
+        deviceVerificationMounted.current = true;
         void reload().then(result => {
             if (result?.config?.configured && !matrixAccountActionRequired(result.status)) {
                 void loadRooms(true).catch(caught => setError(errorMessage(caught)));
@@ -891,6 +1021,9 @@ export function MatrixSettings() {
         return () => {
             clearInterval(interval);
             directoryRequest.current++;
+            deviceVerificationMounted.current = false;
+            deviceVerificationRequest.current++;
+            deviceVerificationMutation.current++;
         };
     }, []);
 
@@ -992,6 +1125,88 @@ export function MatrixSettings() {
             });
         } finally {
             setRefreshBusy(false);
+        }
+    }
+
+    async function verifyThisDevice() {
+        const expectedIdentity = verificationIdentityFor(config);
+        const expectedDeviceId = config?.deviceId;
+        if (!expectedIdentity || expectedIdentity !== deviceVerificationIdentity.current) {
+            setDeviceVerificationActionError("Reconnect this Matrix account before verifying its device.");
+            return;
+        }
+        if (accountActionRequired) {
+            setDeviceVerificationActionError("Reconnect this Matrix session before verifying its device.");
+            return;
+        }
+        if (!deviceVerification) return;
+        if (deviceVerificationStartInFlight.current
+            || ACTIVE_DEVICE_VERIFICATION_PHASES.has(deviceVerification.verification?.phase ?? "idle")) return;
+
+        const mutationId = ++deviceVerificationMutation.current;
+        deviceVerificationStartInFlight.current = true;
+        setDeviceVerificationBusy(true);
+        setDeviceVerificationActionError("");
+        setDeviceVerificationRefreshError("");
+        try {
+            const result = await Native.verifyCurrentDevice();
+            if (!deviceVerificationMounted.current
+                || mutationId !== deviceVerificationMutation.current
+                || expectedIdentity !== deviceVerificationIdentity.current) return;
+            if (result.deviceId !== expectedDeviceId) {
+                setDeviceVerificationActionError("Matrix completed verification for a different device. Reconnect this account before trying again.");
+                return;
+            }
+            deviceVerificationRequest.current++;
+            setDeviceVerification(result);
+        } catch (caught) {
+            if (deviceVerificationMounted.current
+                && mutationId === deviceVerificationMutation.current
+                && expectedIdentity === deviceVerificationIdentity.current) {
+                setDeviceVerificationActionError(errorMessage(caught));
+            }
+        } finally {
+            if (expectedIdentity === deviceVerificationIdentity.current) {
+                deviceVerificationStartInFlight.current = false;
+                if (deviceVerificationMounted.current) setDeviceVerificationBusy(false);
+            }
+        }
+    }
+
+    async function cancelThisDeviceVerification() {
+        const expectedIdentity = verificationIdentityFor(config);
+        const expectedDeviceId = config?.deviceId;
+        if (!expectedIdentity || expectedIdentity !== deviceVerificationIdentity.current
+            || deviceVerificationCancelInFlight.current) return;
+
+        const mutationId = ++deviceVerificationMutation.current;
+        deviceVerificationCancelInFlight.current = true;
+        setDeviceVerificationCancelBusy(true);
+        setDeviceVerificationActionError("");
+        try {
+            const result = await Native.cancelDeviceVerification();
+            if (!deviceVerificationMounted.current
+                || mutationId !== deviceVerificationMutation.current
+                || expectedIdentity !== deviceVerificationIdentity.current) return;
+            if (result.deviceId !== expectedDeviceId) {
+                setDeviceVerificationActionError("Matrix cancelled verification for a different device. Reconnect this account before trying again.");
+                return;
+            }
+            deviceVerificationRequest.current++;
+            deviceVerificationStartInFlight.current = false;
+            setDeviceVerificationBusy(false);
+            setDeviceVerification(result);
+        } catch (caught) {
+            if (deviceVerificationMounted.current
+                && mutationId === deviceVerificationMutation.current
+                && expectedIdentity === deviceVerificationIdentity.current) {
+                setDeviceVerificationActionError(errorMessage(caught));
+            }
+        } finally {
+            if (expectedIdentity === deviceVerificationIdentity.current) {
+                deviceVerificationCancelInFlight.current = false;
+                if (deviceVerificationMounted.current) setDeviceVerificationCancelBusy(false);
+            }
         }
     }
 
@@ -1104,6 +1319,7 @@ export function MatrixSettings() {
 
     function resetAccountUi() {
         directoryRequest.current++;
+        bindDeviceVerificationAccount(undefined);
         setRooms([]);
         setPublicRooms([]);
         setDirectoryLoaded(false);
@@ -1966,6 +2182,124 @@ export function MatrixSettings() {
 
     const accountServer = matrixServerName(config?.userId);
 
+    function renderDeviceVerification() {
+        const verification = deviceVerification?.verification;
+        const phase = verification?.phase ?? "idle";
+        const active = deviceVerificationBusy || ACTIVE_DEVICE_VERIFICATION_PHASES.has(phase);
+        const statusError = deviceVerificationError(deviceVerification);
+        const visibleError = deviceVerification?.verified
+            ? ""
+            : deviceVerificationActionError || statusError || deviceVerificationRefreshError;
+        const deviceId = deviceVerification?.deviceId ?? config?.deviceId;
+        const expiresAt = verification?.expiresAt;
+        const expiryDate = typeof expiresAt === "number" && Number.isFinite(expiresAt)
+            ? new Date(expiresAt)
+            : undefined;
+        const phaseLabel = deviceVerificationBusy && phase === "idle"
+            ? "Starting verification"
+            : deviceVerificationLabel(deviceVerification);
+        const phaseExplanation = accountActionRequired
+            ? "Reconnect this Matrix session before starting or continuing device verification."
+            : deviceVerificationBusy && phase === "idle"
+                ? "Sending a verification request to your other trusted Matrix devices."
+                : deviceVerificationExplanation(deviceVerification);
+        const retry = phase === "cancelled" || phase === "failed" || phase === "done";
+
+        return (
+            <section
+                className="vc-matrix-card vc-matrix-device-verification-card"
+                aria-labelledby="vc-matrix-device-verification-heading"
+                aria-busy={(deviceVerificationBusy && phase === "idle") || deviceVerificationCancelBusy}
+            >
+                <div className="vc-matrix-device-verification-heading">
+                    <div>
+                        <Heading id="vc-matrix-device-verification-heading" tag="h4">Verify this device</Heading>
+                        <Paragraph>
+                            Compare this session with another trusted Matrix device. Security codes are handled only by a native Matrix comparison dialog and are never rendered here.
+                        </Paragraph>
+                    </div>
+                    <span
+                        className="vc-matrix-device-verification-trust"
+                        data-verified={String(deviceVerification?.verified === true)}
+                    >
+                        {phaseLabel}
+                    </span>
+                </div>
+
+                <div className="vc-matrix-device-verification-identity">
+                    <span>Device ID</span>
+                    <code dir="ltr">{deviceId || "Unavailable"}</code>
+                </div>
+
+                {deviceVerification && (
+                    <div className="vc-matrix-device-verification-details" aria-label="Device trust details">
+                        <span>Cross-signing: {deviceVerification.crossSigningVerified ? "verified" : "not verified"}</span>
+                        <span>Cross-signing setup: {deviceVerification.crossSigningAvailable ? "available" : "unavailable"}</span>
+                        <span>Owner signature: {deviceVerification.signedByOwner ? "present" : "not confirmed"}</span>
+                        <span>Local verification: {deviceVerification.localVerified ? "verified" : "not verified"}</span>
+                    </div>
+                )}
+
+                <div
+                    className="vc-matrix-device-verification-status"
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="true"
+                >
+                    <strong>{phaseLabel}</strong>
+                    <span>{phaseExplanation}</span>
+                    {verification?.otherDeviceId && (
+                        <span>
+                            Other device: <code dir="ltr">{verification.otherDeviceId}</code>
+                        </span>
+                    )}
+                    {expiryDate && active && (
+                        <span>Request expires <time dateTime={expiryDate.toISOString()}>{expiryDate.toLocaleString()}</time>.</span>
+                    )}
+                    {phase === "cancelled" && verification?.cancellationCode && (
+                        <span>
+                            {verification.cancelledByMe === true
+                                ? "Cancelled on this device"
+                                : verification.cancelledByMe === false
+                                    ? "Cancelled by the other device"
+                                    : "Verification cancelled"}
+                            {verification.cancellationCode === "m.timeout" ? " because the request expired." : "."}
+                        </span>
+                    )}
+                </div>
+
+                {visibleError && (
+                    <Paragraph className="vc-matrix-device-verification-error" role="alert">
+                        {visibleError}
+                    </Paragraph>
+                )}
+
+                <div className="vc-matrix-device-verification-actions">
+                    {!deviceVerification?.verified && !active && (
+                        <Button
+                            disabled={deviceVerificationCancelBusy
+                                || accountActionRequired
+                                || !deviceVerification}
+                            variant="positive"
+                            onClick={() => void verifyThisDevice()}
+                        >
+                            {retry ? "Try verification again" : "Verify this device"}
+                        </Button>
+                    )}
+                    {active && (
+                        <Button
+                            disabled={deviceVerificationCancelBusy}
+                            variant="dangerSecondary"
+                            onClick={() => void cancelThisDeviceVerification()}
+                        >
+                            {deviceVerificationCancelBusy ? "Cancelling verification..." : "Cancel verification"}
+                        </Button>
+                    )}
+                </div>
+            </section>
+        );
+    }
+
     function renderAccount() {
         return (
             <div className="vc-matrix-section-stack">
@@ -2143,6 +2477,8 @@ export function MatrixSettings() {
                                 </Button>
                             </div>
                         </div>
+
+                        {renderDeviceVerification()}
 
                         {reauthenticationRequired && (
                             <div className="vc-matrix-card vc-matrix-auth-card">

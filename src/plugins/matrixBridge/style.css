@@ -124,6 +124,88 @@
     gap: 8px;
 }
 
+.vc-matrix-device-verification-card {
+    display: grid;
+    gap: 14px;
+}
+
+.vc-matrix-device-verification-heading {
+    align-items: flex-start;
+    display: flex;
+    gap: 16px;
+    justify-content: space-between;
+}
+
+.vc-matrix-device-verification-heading > div {
+    min-width: 0;
+}
+
+.vc-matrix-device-verification-trust {
+    background: var(--background-modifier-accent);
+    border-radius: 999px;
+    color: var(--text-muted);
+    flex: 0 0 auto;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 9px;
+}
+
+.vc-matrix-device-verification-trust[data-verified="true"] {
+    background: color-mix(in srgb, var(--status-positive) 16%, transparent);
+    color: var(--text-positive);
+}
+
+.vc-matrix-device-verification-identity {
+    display: grid;
+    gap: 4px;
+}
+
+.vc-matrix-device-verification-identity > span {
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.vc-matrix-device-verification-identity code,
+.vc-matrix-device-verification-status code {
+    direction: ltr;
+    font-family: var(--font-code);
+    overflow-wrap: anywhere;
+    unicode-bidi: isolate;
+}
+
+.vc-matrix-device-verification-details {
+    color: var(--text-muted);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: 12px;
+    gap: 6px 14px;
+}
+
+.vc-matrix-device-verification-status {
+    background: var(--background-secondary-alt);
+    border-radius: 8px;
+    display: grid;
+    gap: 4px;
+    padding: 12px;
+}
+
+.vc-matrix-device-verification-status > span {
+    color: var(--text-muted);
+}
+
+.vc-matrix-device-verification-error {
+    color: var(--text-danger);
+    margin: 0;
+}
+
+.vc-matrix-device-verification-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
 .vc-matrix-hierarchy {
     background: var(--background-secondary-alt);
     border-top: 1px solid var(--background-modifier-accent);
@@ -664,6 +746,7 @@
     .vc-matrix-heading-with-actions,
     .vc-matrix-heading-with-control,
     .vc-matrix-account-card,
+    .vc-matrix-device-verification-heading,
     .vc-matrix-room-card,
     .vc-matrix-hierarchy-room {
         align-items: stretch;

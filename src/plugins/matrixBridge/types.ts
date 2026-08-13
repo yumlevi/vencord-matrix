@@ -13,6 +13,52 @@ export interface MatrixBridgeError {
     causeCode?: string;
 }
 
+export type MatrixDeviceVerificationPhase =
+    | "requested"
+    | "ready"
+    | "verifying"
+    | "sas"
+    | "confirming"
+    | "done"
+    | "cancelled"
+    | "failed";
+
+/** Public verification progress. SAS values deliberately never appear here. */
+export interface MatrixDeviceVerificationFlowDTO {
+    /** Worker-opaque capability scoped to the current Matrix client generation. */
+    verificationId: string;
+    phase: MatrixDeviceVerificationPhase;
+    otherDeviceId?: string;
+    expiresAt?: number;
+    cancellationCode?: string;
+    cancelledByMe?: boolean;
+    error?: MatrixBridgeError;
+}
+
+/** Current-device trust plus the single outgoing verification, if any. */
+export interface MatrixDeviceVerificationStatusDTO {
+    deviceId: string;
+    /** Refreshed SDK trust, never inferred merely from a completed SAS flow. */
+    verified: boolean;
+    crossSigningVerified: boolean;
+    localVerified: boolean;
+    signedByOwner: boolean;
+    crossSigningAvailable: boolean;
+    verification?: MatrixDeviceVerificationFlowDTO;
+}
+
+export interface MatrixDeviceVerificationEmojiDTO {
+    emoji: string;
+    name: string;
+}
+
+/** Private, explicitly requested SAS payload; never included in snapshots/events. */
+export interface MatrixDeviceVerificationSasDTO {
+    verificationId: string;
+    emoji?: MatrixDeviceVerificationEmojiDTO[];
+    decimal?: [number, number, number];
+}
+
 export interface MatrixAccountDTO {
     userId: string;
 }
