@@ -202,6 +202,18 @@ function testAnchorRecovery(): void {
     ), false);
     assert.equal(matrixMessageOrderNeedsReindex(new Map([["last", "100"]]), ["prefix", "last"]), false);
     assert.equal(matrixMessageOrderNeedsReindex(new Map([["first", "100"]]), ["first", "suffix"]), false);
+    assert.equal(matrixMessageOrderNeedsReindex(
+        new Map([["first", "104"], ["last", "100"]]),
+        ["first", "last"]
+    ), true, "already-visible anchors must be replanned when canonical order changes");
+    assert.equal(matrixMessageOrderNeedsReindex(
+        new Map([["first", "100"], ["last", "100"]]),
+        ["first", "last"]
+    ), true, "two canonical rows cannot share one Discord snowflake");
+    assert.equal(matrixMessageOrderNeedsReindex(
+        new Map([["first", "100"], ["last", "101"]]),
+        ["first", "last"]
+    ), false);
 
     const bridge = readFileSync("src/plugins/matrixBridge/bridge.ts", "utf8");
     const reindexStart = bridge.indexOf("function reindexRoomMessageIds");

@@ -33,6 +33,7 @@ import {
 import { isDefinitiveCreateRoomRejection } from "./createSpaceChildError";
 import { matrixServerUnavailableHttpStatus } from "./errorCode";
 import {
+    advanceMatrixHistoryToken,
     createMatrixLiveDecryptionTracker,
     isCurrentMatrixTimelineGeneration,
     isMainMatrixTimelineReset
@@ -195,6 +196,7 @@ const MAX_RAW_EVENT_JSON_CHARS = 128 * 1024;
 const MAX_REACTION_TARGETS = 10_000;
 const CURSOR_TTL_MS = 5 * 60_000;
 const MAX_HISTORY_REQUESTS_PER_PAGE = 8;
+const MAX_HISTORY_TOKEN_TRAIL = 32;
 const MIN_HISTORY_EVENTS_PER_REQUEST = 25;
 const DEFAULT_TYPING_TIMEOUT = 30_000;
 const MAX_MEDIA_DOWNLOAD_BYTES = 25 * 1024 * 1024;
@@ -290,6 +292,8 @@ interface HistoryCursorState {
      */
     anchorEventId?: string;
     token: string | null;
+    /** Recent opaque tokens, oldest-first, used to reject pagination cycles. */
+    seenTokens: string[];
 }
 
 interface SearchCursorState {
@@ -668,17 +672,25 @@ function validateAttachmentSendRequest(value: unknown): MatrixAttachmentSendRequ
     };
 }
 
+function validateSessionCredentials(account: MatrixSessionCredentials): MatrixSessionCredentials {
+    if (!account || typeof account !== "object") fail("MATRIX_ACCOUNT_CORRUPT", "The Matrix session record is invalid.");
+    const validated: MatrixSessionCredentials = {
+        homeserver: validateHomeserver(account.homeserver),
+        userId: validateUserId(account.userId),
+        deviceId: validateString(account.deviceId, "deviceId", 512),
+        accessToken: validateString(account.accessToken, "accessToken", 65_536)
+    };
+    if (account.refreshToken != null) validated.refreshToken = validateString(account.refreshToken, "refreshToken", 65_536);
+    return validated;
+}
+
 function validateCredentials(account: MatrixStoredAccount): MatrixStoredAccount {
     if (!account || account.schema !== 1) fail("MATRIX_ACCOUNT_CORRUPT", "The Matrix account record is invalid.");
     const validated: MatrixStoredAccount = {
         schema: 1,
-        homeserver: validateHomeserver(account.homeserver),
-        userId: validateUserId(account.userId),
-        deviceId: validateString(account.deviceId, "deviceId", 512),
-        accessToken: validateString(account.accessToken, "accessToken", 65_536),
+        ...validateSessionCredentials(account),
         storageKey: validateString(account.storageKey, "storageKey", 128)
     };
-    if (account.refreshToken != null) validated.refreshToken = validateString(account.refreshToken, "refreshToken", 65_536);
     decodeStorageKey(validated.storageKey);
     return validated;
 }
@@ -6932,7 +6944,7 @@ async function openDirectMessage(
     return { roomId, created: true };
 }
 
-async function logout(): Promise<void> {
+async function endAuthenticatedSession(clearStores: boolean): Promise<void> {
     const client = matrixClient;
     if (!client) {
         await disposeClient(false);
@@ -6946,19 +6958,53 @@ async function logout(): Promise<void> {
     try {
         await client.logout(true);
     } catch {
-        // Remote revocation is best-effort. Local credentials and crypto stores
-        // must still be discarded so a failed homeserver request cannot wedge
-        // the bridge in an authenticated state.
+        // Remote revocation is best-effort. Native removes the locally usable
+        // tokens before issuing this command, and this worker is destroyed
+        // after it returns.
     }
 
     try {
-        await disposeClient(true);
+        await disposeClient(clearStores);
     } catch (error) {
         const safeError = publicError(error);
         setStatus("error", safeError);
         throw new PublicWorkerError(safeError.code, safeError.message);
     }
     setStatus("logged_out");
+}
+
+async function signOut(command: Extract<MatrixWorkerCommand, { type: "signOut"; }>): Promise<void> {
+    // Ordinary sign-out closes Rust crypto and sync handles but deliberately
+    // retains both IndexedDB stores for an exact-device relogin.
+    if (matrixClient) {
+        await endAuthenticatedSession(false);
+        return;
+    }
+    await disposeClient(false);
+    if (command.credentials) {
+        const credentials = validateSessionCredentials(command.credentials);
+        const revocationClient = createClient({
+            baseUrl: credentials.homeserver,
+            userId: credentials.userId,
+            deviceId: credentials.deviceId,
+            accessToken: credentials.accessToken,
+            logger: silentLogger,
+            localTimeoutMs: 30_000,
+            disableVoip: true
+        });
+        try {
+            await revocationClient.logout(true);
+        } catch {
+            // Local native state is already tokenless. A homeserver outage must
+            // not reopen the session or delete the preserved crypto store.
+        }
+    }
+    setStatus("logged_out");
+}
+
+async function logout(): Promise<void> {
+    // Explicit forget is the only account action allowed to delete crypto.
+    await endAuthenticatedSession(true);
 }
 
 function cachedMegolmDecryptionFailures(client: MatrixClient): MatrixEvent[] {
@@ -7838,6 +7884,7 @@ function storeHistoryCursor(
     existingCursor: string | undefined,
     roomId: string,
     token: string | null,
+    seenTokens: ReadonlySet<string>,
     anchorEventId?: string
 ): string {
     let cursor = existingCursor;
@@ -7850,6 +7897,7 @@ function storeHistoryCursor(
         expiresAt: Date.now() + CURSOR_TTL_MS,
         roomId,
         token,
+        seenTokens: [...seenTokens].slice(-MAX_HISTORY_TOKEN_TRAIL),
         ...(anchorEventId ? { anchorEventId } : {})
     });
     return cursor;
@@ -7892,16 +7940,20 @@ async function paginate(
     let token: string | null;
     let loadedAnchor: string | undefined;
     let inspectLoadedTimeline = false;
+    let seenTokens: Set<string>;
     if (command.cursor != null) {
         const stored = historyCursorState(command.cursor, room.roomId);
         cursor = stored.cursor;
         token = stored.state.token;
         loadedAnchor = stored.state.anchorEventId;
         inspectLoadedTimeline = loadedAnchor != null;
+        seenTokens = new Set(stored.state.seenTokens);
+        if (token != null) seenTokens.add(token);
     } else {
         loadedAnchor = fromEventId;
         inspectLoadedTimeline = true;
         token = room.getLiveTimeline().getPaginationToken(Direction.Backward);
+        seenTokens = new Set(token == null ? [] : [token]);
     }
 
     const loadedMessages: MatrixMessageDTO[] = [];
@@ -7919,6 +7971,7 @@ async function paginate(
                 cursor,
                 room.roomId,
                 token,
+                seenTokens,
                 loaded.exhausted ? undefined : loadedMessages[0].eventId
             );
             return finishPage({
@@ -7951,13 +8004,15 @@ async function paginate(
     let end = false;
     const networkLimit = limit - loadedMessages.length;
     while (renderableMessageCount < networkLimit && !end && requests++ < MAX_HISTORY_REQUESTS_PER_PAGE) {
+        const requestToken = token;
+        if (requestToken == null) break;
         const requestLimit = Math.max(
             1,
             Math.min(100, Math.max(MIN_HISTORY_EVENTS_PER_REQUEST, networkLimit - renderableMessageCount))
         );
         const response = await matrixClient!.createMessagesRequest(
             room.roomId,
-            token,
+            requestToken,
             requestLimit,
             Direction.Backward
         );
@@ -7996,11 +8051,12 @@ async function paginate(
             }
         }
         renderableMessageCount = renderableEventIds.size;
-        if (!nextToken || nextToken === token) {
+        const advancedToken = advanceMatrixHistoryToken(requestToken, nextToken, seenTokens);
+        if (advancedToken == null) {
             token = null;
             end = true;
         } else {
-            token = nextToken;
+            token = advancedToken;
         }
         // Empty-but-advancing chunks are legal with filtering/gaps. Continue
         // within this bounded call instead of treating them as end-of-history.
@@ -8048,7 +8104,7 @@ async function paginate(
         if (cursor) historyCursors.delete(cursor);
         return finishPage({ messages, end: true, progressed });
     }
-    cursor = storeHistoryCursor(cursor, room.roomId, token, bufferedAnchorEventId);
+    cursor = storeHistoryCursor(cursor, room.roomId, token, seenTokens, bufferedAnchorEventId);
     return finishPage({ messages, beforeCursor: cursor, end: false, progressed });
 }
 
@@ -9177,6 +9233,7 @@ async function handleCommand(
         case "register": return await registerAccount(command);
         case "start": return await startAuthenticated(command.account, progress);
         case "suspend": await suspend(); return undefined;
+        case "signOut": await signOut(command); return undefined;
         case "logout": await logout(); return undefined;
         case "importRoomKeys": return await importRoomKeys(command);
         case "snapshot": return snapshot();
@@ -9311,7 +9368,8 @@ function sessionChangedError(): PublicWorkerError {
 
 function lifecycleCommand(command: MatrixWorkerCommand): boolean {
     return command.type === "login" || command.type === "reauthenticate" || command.type === "register"
-        || command.type === "start" || command.type === "suspend" || command.type === "logout";
+        || command.type === "start" || command.type === "suspend" || command.type === "signOut"
+        || command.type === "logout";
 }
 
 function mutationSignalCommand(command: MatrixWorkerCommand): boolean {
@@ -9351,6 +9409,12 @@ function scrubCommand(command: MatrixWorkerCommand): void {
         case "reauthenticate":
             if (command.reauthentication.method === "password") command.reauthentication.password = "";
             else command.reauthentication.accessToken = "";
+            break;
+        case "signOut":
+            if (command.credentials) {
+                command.credentials.accessToken = "";
+                if (command.credentials.refreshToken != null) command.credentials.refreshToken = "";
+            }
             break;
         case "register":
             command.storageKey = "";

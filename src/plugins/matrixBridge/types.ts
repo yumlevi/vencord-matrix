@@ -26,6 +26,8 @@ export interface MatrixBridgeStatus {
 
 export interface MatrixBridgeConfig {
     configured: boolean;
+    /** A tokenless exact-device binding is retained for safe same-account login. */
+    preservedDevice?: boolean;
     homeserver?: string;
     userId?: string;
     deviceId?: string;

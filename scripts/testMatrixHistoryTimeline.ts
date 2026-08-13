@@ -10,12 +10,15 @@ import { readFileSync } from "node:fs";
 import { EventType, MatrixEvent, RelationType } from "matrix-js-sdk";
 
 import {
+    advanceMatrixHistoryToken,
+    createMatrixHistoryRequestRegistry,
     createMatrixLiveDecryptionTracker,
     isCurrentMatrixTimelineGeneration,
     isMainMatrixTimelineReset
 } from "../src/plugins/matrixBridge/historyTimeline";
 
 const backend = readFileSync("src/plugins/matrixBridge/matrixBackend.ts", "utf8");
+const bridge = readFileSync("src/plugins/matrixBridge/bridge.ts", "utf8");
 
 function functionSlice(source: string, name: string, nextName: string): string {
     const start = source.indexOf(`${name}(`);
@@ -53,6 +56,54 @@ assert.equal(generation, 8);
 assert.equal(cursors.size, 0);
 assert.equal(isCurrentMatrixTimelineGeneration(8, generation), true);
 assert.equal(isCurrentMatrixTimelineGeneration(7, generation), false);
+
+async function verifyHistoryRequestRegistry(): Promise<void> {
+    const requests = createMatrixHistoryRequestRegistry<string>();
+    const first = requests.acquire("room", 1);
+    const duplicate = requests.acquire("room", 1);
+    assert.equal(first.owner, true);
+    assert.equal(duplicate.owner, false);
+    assert.equal(duplicate.lease, first.lease, "duplicate renderer fetches must share one owner");
+
+    let completed = false;
+    void duplicate.lease.completion.then(() => { completed = true; });
+    await Promise.resolve();
+    assert.equal(completed, false);
+    first.lease.release();
+    await duplicate.lease.completion;
+    assert.equal(completed, true);
+
+    const stale = requests.acquire("room", 2);
+    const replacement = requests.acquire("room", 3);
+    assert.equal(replacement.owner, true, "a new bridge generation must replace stale in-flight work");
+    await stale.lease.completion;
+    assert.equal(stale.lease.isActive(), false);
+    assert.equal(replacement.lease.isActive(), true);
+    stale.lease.release();
+    assert.equal(requests.acquire("room", 3).owner, false, "stale cleanup must not clear its replacement");
+    requests.cancel("room");
+    await replacement.lease.completion;
+
+    const one = requests.acquire("one", 4);
+    const two = requests.acquire("two", 4);
+    requests.clear();
+    await Promise.all([one.lease.completion, two.lease.completion]);
+}
+
+const seenHistoryTokens = new Set(["token-a"]);
+assert.equal(advanceMatrixHistoryToken("token-a", "token-b", seenHistoryTokens), "token-b");
+assert.equal(advanceMatrixHistoryToken("token-b", "token-a", seenHistoryTokens), null, "token cycles must terminate");
+assert.equal(advanceMatrixHistoryToken("token-b", "token-b", seenHistoryTokens), null);
+assert.equal(advanceMatrixHistoryToken("token-b", null, seenHistoryTokens), null);
+
+const paginateStart = backend.indexOf("async function paginate(");
+const paginateEnd = backend.indexOf("interface ValidatedSearchRequest", paginateStart);
+assert.notEqual(paginateStart, -1);
+assert.notEqual(paginateEnd, -1);
+const paginate = backend.slice(paginateStart, paginateEnd);
+assert.match(paginate, /seenTokens[\s\S]*advanceMatrixHistoryToken[\s\S]*token = null;[\s\S]*end = true/u);
+assert.match(bridge, /paginationRequestsByRoom\.acquire[\s\S]*await paginationRequest\.lease\.completion/u);
+assert.match(bridge, /failedHistoryLoad[\s\S]*completeProjectionHistoryRequest/u);
 
 const tracker = createMatrixLiveDecryptionTracker<object>();
 const liveAndIsolated = {};
@@ -213,6 +264,7 @@ async function verifySdkFailureRecovery(
 }
 
 async function verifySdkDecryptionBehavior(): Promise<void> {
+    await verifyHistoryRequestRegistry();
     await verifySdkDecryptionOrder();
     await verifySdkFailureRecovery("$reaction", {
         type: EventType.Reaction,

@@ -139,6 +139,12 @@ function matrixServerName(identifier: unknown) {
         : undefined;
 }
 
+function matrixLocalpart(identifier: unknown) {
+    if (typeof identifier !== "string") return undefined;
+    const match = /^@([^\s:]+):[^\s]+$/u.exec(identifier);
+    return match?.[1];
+}
+
 function cleanJoinName(value: string) {
     return value.trim().toLowerCase().slice(0, JOIN_NAME_MAX_LENGTH);
 }
@@ -813,6 +819,7 @@ export function MatrixSettings() {
         && statusErrorCode != null
         && MATRIX_SESSION_RESET_CODES.has(statusErrorCode);
     const accountActionRequired = reauthenticationRequired || sessionResetRequired;
+    const preservedDevice = config?.preservedDevice === true;
 
     async function reload() {
         try {
@@ -823,6 +830,10 @@ export function MatrixSettings() {
             setStatus(nextStatus);
             setConfig(nextConfig);
             if (nextConfig?.homeserver) setHomeserver(nextConfig.homeserver);
+            if (nextConfig?.preservedDevice) {
+                const localpart = matrixLocalpart(nextConfig.userId);
+                if (localpart) setUsername(localpart);
+            }
             setRooms(snapshotRooms());
             return { config: nextConfig, status: nextStatus };
         } catch (caught) {
@@ -893,6 +904,10 @@ export function MatrixSettings() {
     useEffect(() => {
         if (accountActionRequired) setTab("account");
     }, [accountActionRequired]);
+
+    useEffect(() => {
+        if (preservedDevice && mode === "register") setMode("login");
+    }, [mode, preservedDevice]);
 
     useEffect(() => {
         if (!pendingAddressRoomId) return;
@@ -1035,7 +1050,9 @@ export function MatrixSettings() {
     }
 
     async function login() {
-        if (!homeserver.trim() || (!accessToken && (!username.trim() || !password))) {
+        const loginHomeserver = preservedDevice ? config?.homeserver ?? "" : homeserver;
+        const loginUsername = preservedDevice ? matrixLocalpart(config?.userId) ?? "" : username;
+        if (!loginHomeserver.trim() || (!accessToken && (!loginUsername.trim() || !password))) {
             setError(accessToken
                 ? "A homeserver is required."
                 : "Homeserver, username, and password are required.");
@@ -1044,14 +1061,14 @@ export function MatrixSettings() {
 
         await finishAuthentication(() => Native.login(accessToken
             ? {
-                homeserver: normalizedHomeserver(homeserver),
+                homeserver: normalizedHomeserver(loginHomeserver),
                 method: "access_token",
                 accessToken,
             }
             : {
-                homeserver: normalizedHomeserver(homeserver),
+                homeserver: normalizedHomeserver(loginHomeserver),
                 method: "password",
-                username: username.trim(),
+                username: loginUsername.trim(),
                 password,
             }));
     }
@@ -1104,6 +1121,31 @@ export function MatrixSettings() {
         setTab("account");
     }
 
+    async function signOut() {
+        await run(async () => {
+            let signOutError: unknown;
+            let routeError: unknown;
+            try {
+                await Native.signOut();
+            } catch (caught) {
+                signOutError = caught;
+            }
+            try {
+                await clearMatrixRoutePreference();
+            } catch (caught) {
+                routeError = caught;
+            } finally {
+                // Plaintext projections must disappear even if the remote
+                // revocation request failed. Native has already committed the
+                // tokenless preserved-device record.
+                await restartBridge();
+                resetAccountUi();
+            }
+            if (signOutError) throw signOutError;
+            if (routeError) throw routeError;
+        });
+    }
+
     async function logout() {
         await run(async () => {
             let logoutError: unknown;
@@ -1132,8 +1174,8 @@ export function MatrixSettings() {
         openModal(modalProps => (
             <ConfirmModal
                 {...modalProps}
-                title="Forget this Matrix device?"
-                confirmText="Forget device"
+                title="Forget this Matrix account and its local keys?"
+                confirmText="Forget account and keys"
                 cancelText="Cancel"
                 variant="danger"
                 onConfirm={() => void logout()}
@@ -1951,6 +1993,15 @@ export function MatrixSettings() {
 
                 {!config?.configured ? (
                     <div className="vc-matrix-card vc-matrix-auth-card">
+                        {preservedDevice && (
+                            <div>
+                                <Heading tag="h4">Signed out — local keys preserved</Heading>
+                                <Paragraph>
+                                    Sign back into {config.userId} on this homeserver to reuse the same Matrix device and encrypted history.
+                                    To use another account, explicitly forget these local keys first.
+                                </Paragraph>
+                            </div>
+                        )}
                         <TabBar
                             type="top"
                             look="brand"
@@ -1962,13 +2013,13 @@ export function MatrixSettings() {
                             }}
                         >
                             <TabBar.Item id="login">Sign in</TabBar.Item>
-                            <TabBar.Item id="register">Create account</TabBar.Item>
+                            {!preservedDevice && <TabBar.Item id="register">Create account</TabBar.Item>}
                         </TabBar>
 
                         <label>
                             <Heading tag="h5">Homeserver</Heading>
                             <TextInput
-                                disabled={busy}
+                                disabled={busy || preservedDevice}
                                 value={homeserver}
                                 placeholder="matrix.example.org"
                                 onChange={setHomeserver}
@@ -1977,7 +2028,7 @@ export function MatrixSettings() {
                         <label>
                             <Heading tag="h5">Username</Heading>
                             <TextInput
-                                disabled={busy || !!accessToken}
+                                disabled={busy || preservedDevice || !!accessToken}
                                 value={username}
                                 placeholder="alice"
                                 onChange={setUsername}
@@ -2023,7 +2074,9 @@ export function MatrixSettings() {
                             <details className="vc-matrix-advanced-auth">
                                 <summary>Advanced: use an access token</summary>
                                 <Paragraph>
-                                    Access-token login can start a session without the prior device&apos;s encryption state. Encrypted history may remain unavailable unless Matrix recovery or compatible device state is present.
+                                    {preservedDevice
+                                        ? "The token must belong to this exact account and preserved Matrix device. A token for another account or device is rejected."
+                                        : "Access-token login can start a session without the prior device's encryption state. Encrypted history may remain unavailable unless Matrix recovery or compatible device state is present."}
                                 </Paragraph>
                                 <label>
                                     <Heading tag="h5">Access token</Heading>
@@ -2052,7 +2105,7 @@ export function MatrixSettings() {
                             variant="secondary"
                             onClick={confirmLogout}
                         >
-                            Clear local Matrix data
+                            {preservedDevice ? "Forget account and keys" : "Clear local Matrix data"}
                         </Button>
                     </div>
                 ) : (
@@ -2063,9 +2116,14 @@ export function MatrixSettings() {
                                 <Paragraph>{config.userId}</Paragraph>
                                 <Paragraph>{config.homeserver}</Paragraph>
                             </div>
-                            <Button disabled={busy || addressBusy} variant="dangerSecondary" onClick={confirmLogout}>
-                                Disconnect
-                            </Button>
+                            <div className="vc-matrix-row-actions">
+                                <Button disabled={busy || addressBusy} variant="secondary" onClick={() => void signOut()}>
+                                    Sign out
+                                </Button>
+                                <Button disabled={busy || addressBusy} variant="dangerSecondary" onClick={confirmLogout}>
+                                    Forget account and keys
+                                </Button>
+                            </div>
                         </div>
 
                         {reauthenticationRequired && (
@@ -2124,7 +2182,7 @@ export function MatrixSettings() {
                                 <div>
                                     <Heading tag="h4">Matrix session ended</Heading>
                                     <Paragraph role="alert">
-                                        The homeserver did not authorize safe same-device repair. Disconnect this account above to clear its locally stored session and device data, then sign in again with a new session.
+                                        This session cannot be repaired in place. Sign out above, then sign back into the same account to retain this device&apos;s local encryption keys.
                                     </Paragraph>
                                 </div>
                             </div>

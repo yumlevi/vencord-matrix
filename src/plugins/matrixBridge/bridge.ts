@@ -12,6 +12,8 @@ import { findByCodeLazy, findByProps } from "@webpack";
 import { ChannelStore, closeModal, FluxDispatcher, GuildStore, MessageActions, MessageStore, NavigationRouter, PermissionsBits, ReadStateStore, RestAPI, SelectedChannelStore, SelectedGuildStore, showToast, Toasts, UserStore } from "@webpack/common";
 
 import { matrixErrorCode } from "./errorCode";
+import { createMatrixGuildReadStateInvalidator } from "./guildUnread";
+import { createMatrixHistoryRequestRegistry } from "./historyTimeline";
 import { projectInboundMatrixMentions, projectOutboundMatrixMentions } from "./messageMentions";
 import { matrixMessageOrderNeedsReindex } from "./roomMessageOrder";
 import type {
@@ -339,7 +341,7 @@ const reservedReplyEventIds = new Set<string>();
 const reservedReplyTargets = new Map<string, { roomId: string; eventId: string; }>();
 const eventIdsByTransaction = new Map<string, string>();
 const roomHistoryById = new Map<string, RoomHistoryState>();
-const paginationRequestsByRoom = new Map<string, number>();
+const paginationRequestsByRoom = createMatrixHistoryRequestRegistry<string>();
 interface MessageStoreConvergence {
     generation: number;
     roomId: string;
@@ -378,6 +380,10 @@ interface MatrixRoomUnreadFloor {
 }
 const matrixUnreadFloorByRoom = new Map<string, MatrixRoomUnreadFloor>();
 let matrixUnreadRevision = 0;
+const invalidateMatrixGuildReadState = createMatrixGuildReadStateInvalidator(
+    queueMicrotask,
+    () => FluxDispatcher.dispatch({ type: "RECOMPUTE_READ_STATES" }),
+);
 const mediaCache = new Map<string, MediaCacheEntry>();
 let wantedMediaKeys = new Set<string>();
 let mediaQueue: MediaJob[] = [];
@@ -2181,6 +2187,12 @@ function roomUnreadFloor(roomId: string) {
     return floor;
 }
 
+function publishMatrixUnreadChange(recomputeGuildReadState: boolean) {
+    matrixUnreadRevision++;
+    (ReadStateStore as any).emitChange?.();
+    if (recomputeGuildReadState) invalidateMatrixGuildReadState();
+}
+
 function syncProjectionUnread(channelId: string, room: MatrixRoomDto, guildId?: string) {
     const messages = roomMessages(room);
     const latest = projectedTimelineMessages(messages).at(-1);
@@ -2204,12 +2216,12 @@ function syncProjectionUnread(channelId: string, room: MatrixRoomDto, guildId?: 
         && previous.highlightCount === next.highlightCount
         && previous.lastMessageId === next.lastMessageId) return;
     matrixUnreadByChannel.set(channelId, next);
-    matrixUnreadRevision++;
-    (ReadStateStore as any).emitChange?.();
+    publishMatrixUnreadChange(Boolean(guildId));
 }
 
 function removeInjectedChannel(channelId: string) {
-    const removedRoomId = roomsByChannel.get(channelId)?.room.roomId;
+    const removedProjection = roomsByChannel.get(channelId);
+    const removedRoomId = removedProjection?.room.roomId;
     const convergence = messageStoreConvergenceByChannel.get(channelId);
     if (convergence?.timer) clearTimeout(convergence.timer);
     messageStoreConvergenceByChannel.delete(channelId);
@@ -2234,8 +2246,7 @@ function removeInjectedChannel(channelId: string) {
         }
     }
     if (matrixUnreadByChannel.delete(channelId)) {
-        matrixUnreadRevision++;
-        (ReadStateStore as any).emitChange?.();
+        publishMatrixUnreadChange(Boolean(removedProjection?.guildId));
     }
     if (removedRoomId && ![...roomsByChannel.values()].some(projection => projection.room.roomId === removedRoomId)) {
         clearRoomMessageOrder(removedRoomId);
@@ -2772,7 +2783,7 @@ export function applySnapshot(
             if (pendingReceipt) clearTimeout(pendingReceipt.timer);
             pendingReceiptsByRoom.delete(roomId);
             lastReceiptEventByRoom.delete(roomId);
-            paginationRequestsByRoom.delete(roomId);
+            paginationRequestsByRoom.cancel(roomId);
         }
     }
     const spaceGraph = matrixSpaceGraph(joined);
@@ -3035,6 +3046,23 @@ function loadProjectionMessages(
         scheduleMessageStoreConvergence(injected, rawMessages[0].id);
     }
     return accepted;
+}
+
+/** Complete Discord's scroll request without rebuilding a projection. */
+function completeProjectionHistoryRequest(injected: InjectedRoom) {
+    FluxDispatcher.dispatch({
+        type: "LOAD_MESSAGES_SUCCESS",
+        channelId: injected.channelId,
+        messages: [],
+        isBefore: true,
+        isAfter: false,
+        jump: null,
+        hasMoreBefore: !roomHistoryById.get(injected.room.roomId)?.end,
+        hasMoreAfter: false,
+        isStale: false,
+        truncate: false,
+        avoidInitialScroll: true,
+    });
 }
 
 function projectionHasMessage(channelId: string, messageId: string) {
@@ -3976,8 +4004,9 @@ export function removeReadStateProjection() {
     originalReadStateMethods.clear();
     matrixUnreadByChannel.clear();
     matrixUnreadFloorByRoom.clear();
-    matrixUnreadRevision++;
-    store.emitChange?.();
+    // Teardown is rare and must clear a cached guild badge even when its
+    // projection was removed immediately before these method wrappers.
+    publishMatrixUnreadChange(true);
 }
 
 function localSyntheticRestBody(method: string, request: unknown): unknown | undefined {
@@ -6161,6 +6190,7 @@ async function flushMatrixReceipt(roomId: string) {
         floor.highlightCount = 0;
         floor.acknowledgedMessageId = pending.messageId;
         let changed = false;
+        let guildReadStateChanged = false;
         for (const injected of roomsByChannel.values()) {
             if (injected.room.roomId !== roomId) continue;
             const current = matrixUnreadByChannel.get(injected.channelId);
@@ -6172,12 +6202,12 @@ async function flushMatrixReceipt(roomId: string) {
             });
             injected.room = { ...injected.room, unreadCount: 0, highlightCount: 0 };
             changed = true;
+            guildReadStateChanged ||= Boolean(injected.guildId);
         }
         const room = snapshotRoom(roomId);
         if (room) updateLatestSnapshotRoom({ ...room, unreadCount: 0, highlightCount: 0 });
         if (changed) {
-            matrixUnreadRevision++;
-            (ReadStateStore as any).emitChange?.();
+            publishMatrixUnreadChange(guildReadStateChanged);
         }
     } catch (error) {
         logger.warn("Read receipt failed", error);
@@ -6355,9 +6385,16 @@ export async function fetchMatrixMessages(channelId: string, request: any) {
     const history = roomHistoryById.get(roomId);
     if (history?.end) return;
     const generation = pollGeneration;
-    if (paginationRequestsByRoom.has(roomId)) return;
-    paginationRequestsByRoom.set(roomId, generation);
+    const paginationRequest = paginationRequestsByRoom.acquire(roomId, generation);
+    if (!paginationRequest.owner) {
+        // Discord can enter through both patched fetch paths for one scroll.
+        // Keep both callers tied to the owner instead of resolving a duplicate
+        // immediately while its store request is still marked as loading.
+        await paginationRequest.lease.completion;
+        return;
+    }
     let discardedHistoryLoad = false;
+    let failedHistoryLoad = false;
     const requestedBeforeEventId = request?.before ? injected.eventIds.get(request.before) : undefined;
     const oldestRemoteEventId = history?.messages.find(message => message.eventId.startsWith("$"))?.eventId;
     const limit = request?.limit ?? 50;
@@ -6384,7 +6421,8 @@ export async function fetchMatrixMessages(channelId: string, request: any) {
         // page is valid only for the exact renderer cut that requested it and
         // the exact room cut still current after it returns. A later snapshot
         // clears the old cursor; never splice this detached page into it.
-        if (page.timelineGeneration !== requestedGeneration
+        if (!paginationRequest.lease.isActive()
+            || page.timelineGeneration !== requestedGeneration
             || currentTimelineGeneration() !== requestedGeneration) {
             discardedHistoryLoad = true;
             return undefined;
@@ -6526,16 +6564,30 @@ export async function fetchMatrixMessages(channelId: string, request: any) {
             completeProjectedEchoRows(new Map([[roomId, completedRemoteEchoEventIds]]));
         }
     } catch (error) {
-        if (generation === pollGeneration) reportFailure("history load", error);
+        if (generation === pollGeneration) {
+            failedHistoryLoad = true;
+            reportFailure("history load", error);
+        }
     } finally {
-        if (paginationRequestsByRoom.get(roomId) === generation) paginationRequestsByRoom.delete(roomId);
-        if (discardedHistoryLoad && generation === pollGeneration) {
-            // A live delta or timeline reset won the race. Complete Discord's
-            // pending history request against that newer state without merging
-            // the detached page, otherwise its scroll loader can remain stuck.
+        paginationRequest.lease.release();
+        if ((discardedHistoryLoad || failedHistoryLoad) && generation === pollGeneration) {
+            // A live delta/reset or a bounded native failure won the race.
+            // Complete Discord's pending request; otherwise its scroll loader
+            // remains stuck and repeatedly re-enters this path.
             for (const projection of [...roomsByChannel.values()].filter(candidate =>
                 candidate.room.roomId === roomId && !candidate.isolatedContext)) {
-                loadProjectionMessages(projection, [], { isBefore: true });
+                if (discardedHistoryLoad && !failedHistoryLoad) {
+                    try {
+                        // Preserve the newer projection state when it is safe.
+                        loadProjectionMessages(projection, [], { isBefore: true });
+                        continue;
+                    } catch (completionError) {
+                        logger.warn("Matrix history completion projection failed", completionError);
+                    }
+                }
+                // A projection error may be the original failure. Dispatch the
+                // empty completion directly so recovery cannot throw again.
+                completeProjectionHistoryRequest(projection);
             }
         }
     }

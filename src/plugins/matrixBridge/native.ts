@@ -26,6 +26,11 @@ import {
 } from "electron";
 
 import {
+    matrixUserLocalpart,
+    preserveSignedOutDevice,
+    restorePreservedDevice
+} from "./accountState";
+import {
     MAX_MEGOLM_KEY_EXPORT_BYTES,
     MAX_MEGOLM_KEY_EXPORT_SESSIONS,
     MAX_MEGOLM_KEY_PASSPHRASE_BYTES
@@ -145,6 +150,8 @@ import {
     type MatrixRoomKeyImportWorkerResult,
     type MatrixSessionCredentials,
     type MatrixStoredAccount,
+    type MatrixStoredAccountRecord,
+    type MatrixStoredSignedOutAccount,
     type MatrixWorkerCommand,
     type MatrixWorkerEvent,
     type MatrixWorkerMessage,
@@ -312,6 +319,7 @@ interface SecureViewState {
     destroyed: boolean;
     userGestureUntil: number;
     boundAccount: MatrixAccountBinding | null | undefined;
+    boundStoredAccount: MatrixAccountBinding | null | undefined;
     preloadBootstrapRequested: boolean;
     preloadBootstrapGranted: boolean;
     preloadError: boolean;
@@ -2253,6 +2261,18 @@ function isStoredAccount(value: unknown): value is MatrixStoredAccount {
         && typeof account.storageKey === "string";
 }
 
+function isStoredSignedOutAccount(value: unknown): value is MatrixStoredSignedOutAccount {
+    if (!value || typeof value !== "object") return false;
+    const account = value as Partial<MatrixStoredSignedOutAccount>;
+    return account.schema === 2
+        && typeof account.homeserver === "string"
+        && typeof account.userId === "string"
+        && typeof account.deviceId === "string"
+        && typeof account.storageKey === "string"
+        && !("accessToken" in account)
+        && !("refreshToken" in account);
+}
+
 function validateStoredAccount(value: unknown): MatrixStoredAccount {
     if (!isStoredAccount(value)) {
         throw bridgeError("MATRIX_ACCOUNT_CORRUPT", "The encrypted Matrix account record is invalid.");
@@ -2275,7 +2295,30 @@ function validateStoredAccount(value: unknown): MatrixStoredAccount {
     return account;
 }
 
-async function readStoredAccount(): Promise<MatrixStoredAccount | null> {
+function validateStoredSignedOutAccount(value: unknown): MatrixStoredSignedOutAccount {
+    if (!isStoredSignedOutAccount(value)) {
+        throw bridgeError("MATRIX_ACCOUNT_CORRUPT", "The encrypted Matrix signed-out device record is invalid.");
+    }
+    const account: MatrixStoredSignedOutAccount = {
+        schema: 2,
+        homeserver: validateHomeserver(value.homeserver),
+        userId: validateUserId(value.userId),
+        deviceId: validateString(value.deviceId, "deviceId", 512),
+        storageKey: validateString(value.storageKey, "storageKey", 128)
+    };
+    if (Buffer.from(account.storageKey, "base64").byteLength !== 32) {
+        throw bridgeError("MATRIX_ACCOUNT_CORRUPT", "The Matrix crypto storage key is invalid.");
+    }
+    return account;
+}
+
+function validateStoredAccountRecord(value: unknown): MatrixStoredAccountRecord {
+    return isStoredSignedOutAccount(value)
+        ? validateStoredSignedOutAccount(value)
+        : validateStoredAccount(value);
+}
+
+async function readStoredAccountRecord(): Promise<MatrixStoredAccountRecord | null> {
     let encrypted: Buffer;
     try {
         encrypted = await readFile(ACCOUNT_FILE);
@@ -2286,14 +2329,28 @@ async function readStoredAccount(): Promise<MatrixStoredAccount | null> {
 
     assertSecureStorage();
     try {
-        return validateStoredAccount(JSON.parse(safeStorage.decryptString(encrypted)));
+        return validateStoredAccountRecord(JSON.parse(safeStorage.decryptString(encrypted)));
     } catch (error) {
         if (error instanceof Error && error.name.startsWith("MATRIX_")) throw error;
         throw bridgeError("MATRIX_ACCOUNT_DECRYPT_FAILED", "The Matrix account record could not be decrypted.");
     }
 }
 
+async function readStoredAccount(): Promise<MatrixStoredAccount | null> {
+    const record = await readStoredAccountRecord();
+    return record?.schema === 1 ? record : null;
+}
+
 function accountBinding(account: MatrixStoredAccount | null): MatrixAccountBinding | null {
+    return account && {
+        homeserver: account.homeserver,
+        userId: account.userId,
+        deviceId: account.deviceId,
+        storageKey: account.storageKey
+    };
+}
+
+function storedAccountBinding(account: MatrixStoredAccountRecord | null): MatrixAccountBinding | null {
     return account && {
         homeserver: account.homeserver,
         userId: account.userId,
@@ -2645,8 +2702,8 @@ async function runAccountLifecycleTransition<T>(operation: () => Promise<T>): Pr
     }
 }
 
-async function writeStoredAccount(account: MatrixStoredAccount): Promise<void> {
-    const validated = validateStoredAccount(account);
+async function writeStoredAccount(account: MatrixStoredAccountRecord): Promise<void> {
+    const validated = validateStoredAccountRecord(account);
     assertSecureStorage();
 
     let encrypted: Buffer;
@@ -2962,7 +3019,10 @@ async function refreshConvergenceSnapshot(
         (value, binding) => {
             // refresh is authorized only for the view's existing exact
             // binding; reaffirm that same cut without rebinding stale views.
-            if (reaffirmViewBinding) state.boundAccount = binding ? { ...binding } : null;
+            if (reaffirmViewBinding) {
+                state.boundAccount = binding ? { ...binding } : null;
+                state.boundStoredAccount = binding ? { ...binding } : null;
+            }
             return publishConvergenceSnapshot(value);
         },
         () => {
@@ -3465,6 +3525,7 @@ async function createSecureView(owner: BrowserWindow, route: MatrixSecureViewRou
         destroyed: false,
         userGestureUntil: 0,
         boundAccount: undefined,
+        boundStoredAccount: undefined,
         preloadBootstrapRequested: false,
         preloadBootstrapGranted: false,
         preloadError: false,
@@ -3641,32 +3702,47 @@ async function secureViewBootstrap(event: IpcMainInvokeEvent, state: SecureViewS
         async () => ({
             matrixSnapshot: await snapshot(event),
             status: await getStatus(event),
-            rawConfig: await getConfig(event)
+            rawConfig: await getConfig(event),
+            storedBinding: storedAccountBinding(await readStoredAccountRecord())
         }),
-        ({ matrixSnapshot, status, rawConfig }, binding) => {
+        ({ matrixSnapshot, status, rawConfig, storedBinding }, binding) => {
             if (!snapshotMatchesAccountBinding(matrixSnapshot, binding)) return false;
             if (!binding) {
-                return !rawConfig.configured && rawConfig.homeserver == null
-                    && rawConfig.userId == null && rawConfig.deviceId == null
-                    && status.account == null;
+                if (status.account != null || rawConfig.configured) return false;
+                if (rawConfig.preservedDevice === true) {
+                    return storedBinding != null
+                        && rawConfig.homeserver === storedBinding.homeserver
+                        && rawConfig.userId === storedBinding.userId
+                        && rawConfig.deviceId === storedBinding.deviceId;
+                }
+                return storedBinding == null && rawConfig.preservedDevice == null
+                    && rawConfig.homeserver == null && rawConfig.userId == null
+                    && rawConfig.deviceId == null;
             }
             return rawConfig.configured
+                && rawConfig.preservedDevice == null
+                && sameAccountBinding(binding, storedBinding)
                 && rawConfig.homeserver === binding.homeserver
                 && rawConfig.userId === binding.userId
                 && rawConfig.deviceId === binding.deviceId
                 && status.account?.userId === binding.userId;
         },
-        ({ matrixSnapshot, status, rawConfig }, binding) => {
+        ({ matrixSnapshot, status, rawConfig, storedBinding }, binding) => {
             const config: MatrixSecureViewAccountConfig = {
                 configured: rawConfig.configured,
+                ...(rawConfig.preservedDevice === true ? { preservedDevice: true } : {}),
                 ...(rawConfig.homeserver ? { homeserver: rawConfig.homeserver } : {}),
                 ...(rawConfig.userId ? { userId: rawConfig.userId } : {}),
+                ...(rawConfig.deviceId ? { deviceId: rawConfig.deviceId } : {}),
                 persistentE2EE: true
             };
-            if (state.boundAccount !== undefined && !sameAccountBinding(state.boundAccount, binding)) {
+            if ((state.boundAccount !== undefined && !sameAccountBinding(state.boundAccount, binding))
+                || (state.boundStoredAccount !== undefined
+                    && !sameAccountBinding(state.boundStoredAccount, storedBinding))) {
                 state.route = { kind: "home" };
             }
             state.boundAccount = binding ? { ...binding } : null;
+            state.boundStoredAccount = storedBinding ? { ...storedBinding } : null;
             return {
                 snapshot: matrixSnapshot,
                 status,
@@ -4576,10 +4652,13 @@ async function startInternal(
 }
 
 async function getStatus(_: IpcMainInvokeEvent): Promise<MatrixBridgeStatus> {
-    const account = await readStoredAccount();
+    const record = await readStoredAccountRecord();
+    const account = record?.schema === 1 ? record : null;
     if (account && currentStatus.state === "logged_out") {
         currentStatus = { seq: sequence, state: "stopped", account: { userId: account.userId } };
-    } else if (!account && !authenticationInProgress
+    } else if (record?.schema === 2 && !authenticationInProgress) {
+        currentStatus = { seq: sequence, state: "logged_out" };
+    } else if (!record && !authenticationInProgress
         && ["starting", "syncing", "ready", "stopped"].includes(currentStatus.state)) {
         currentStatus = { seq: sequence, state: "logged_out" };
     }
@@ -4587,10 +4666,11 @@ async function getStatus(_: IpcMainInvokeEvent): Promise<MatrixBridgeStatus> {
 }
 
 async function getConfig(_: IpcMainInvokeEvent): Promise<MatrixBridgeConfig> {
-    const account = await readStoredAccount();
+    const account = await readStoredAccountRecord();
     if (!account) return { configured: false, persistentE2EE: true };
     return {
-        configured: true,
+        configured: account.schema === 1,
+        ...(account.schema === 2 ? { preservedDevice: true } : {}),
         homeserver: account.homeserver,
         userId: account.userId,
         deviceId: account.deviceId,
@@ -4604,7 +4684,14 @@ async function authenticate(
     accountWasCreated: boolean
 ): Promise<MatrixSnapshot> {
     assertSecureStorage();
-    if (await readStoredAccount()) {
+    const existing = await readStoredAccountRecord();
+    if (existing?.schema === 2) {
+        throw bridgeError(
+            "MATRIX_PRESERVED_DEVICE_EXISTS",
+            "Sign back into the preserved Matrix account, or explicitly forget its local keys before using another account."
+        );
+    }
+    if (existing) {
         throw bridgeError("MATRIX_ALREADY_CONFIGURED", "Log out of the current Matrix account before adding another one.");
     }
     // Retry privacy cleanup after an interrupted logout before persisting a
@@ -4673,6 +4760,99 @@ async function authenticate(
     }
 }
 
+async function authenticatePreservedDevice(
+    preserved: MatrixStoredSignedOutAccount,
+    loginDetails: MatrixLoginRequest
+): Promise<MatrixSnapshot> {
+    if (loginDetails.homeserver !== preserved.homeserver) {
+        throw bridgeError(
+            "MATRIX_PRESERVED_ACCOUNT_MISMATCH",
+            "This sign-in does not match the Matrix account whose local encryption keys are preserved."
+        );
+    }
+    const localpart = matrixUserLocalpart(preserved.userId);
+    if (!localpart) {
+        throw bridgeError("MATRIX_ACCOUNT_CORRUPT", "The preserved Matrix account identity is invalid.");
+    }
+    if (loginDetails.method === "password" && loginDetails.username !== localpart) {
+        throw bridgeError(
+            "MATRIX_PRESERVED_ACCOUNT_MISMATCH",
+            "This sign-in does not match the Matrix account whose local encryption keys are preserved."
+        );
+    }
+
+    const preservedBinding = storedAccountBinding(preserved)!;
+    const reauthentication: MatrixReauthenticationRequest = loginDetails.method === "password"
+        ? {
+            homeserver: preserved.homeserver,
+            userId: preserved.userId,
+            deviceId: preserved.deviceId,
+            method: "password",
+            password: loginDetails.password
+        }
+        : {
+            homeserver: preserved.homeserver,
+            userId: preserved.userId,
+            deviceId: preserved.deviceId,
+            method: "access_token",
+            accessToken: loginDetails.accessToken
+        };
+
+    // A preserved record is tokenless. Use a fresh auth-only worker and never
+    // open crypto until its returned session matches the exact stored binding.
+    if (hasLiveWorker()) {
+        terminateWorker(bridgeError("MATRIX_SESSION_CHANGED", "The signed-out Matrix worker was replaced."));
+    }
+    clearEventStream();
+    updateStatus("starting");
+    let result: MatrixWorkerResult;
+    try {
+        result = await callWorker({ type: "reauthenticate", reauthentication });
+    } finally {
+        terminateWorker(bridgeError("MATRIX_SESSION_CHANGED", "The restored Matrix session is being committed."));
+    }
+    if (!isAuthenticationResult(result)) {
+        updateStatus("logged_out");
+        throw bridgeError("MATRIX_PROTOCOL_ERROR", "The isolated Matrix backend returned invalid authentication data.");
+    }
+
+    const replacement = restorePreservedDevice(preserved, result.credentials);
+    result.credentials.accessToken = "";
+    if (result.credentials.refreshToken != null) result.credentials.refreshToken = "";
+    if (!replacement) {
+        updateStatus("logged_out");
+        throw bridgeError(
+            "MATRIX_REAUTH_IDENTITY_MISMATCH",
+            "The new Matrix session did not match the preserved encrypted device."
+        );
+    }
+    const validatedReplacement = validateStoredAccount(replacement);
+    try {
+        await runAccountMutation(async () => {
+            const current = await readStoredAccountRecord();
+            if (current?.schema !== 2
+                || !sameAccountBinding(preservedBinding, storedAccountBinding(current))) {
+                throw bridgeError("MATRIX_SESSION_CHANGED", "The preserved Matrix account changed during sign-in.");
+            }
+            await writeStoredAccount(validatedReplacement);
+        });
+    } catch (error) {
+        updateStatus("logged_out");
+        throw error;
+    }
+
+    clearStartupFailure(preservedBinding);
+    try {
+        return await startInternal(validatedReplacement);
+    } catch (error) {
+        const startupError = errorDTO(error);
+        throw bridgeError(
+            "MATRIX_STARTUP_FAILED",
+            `Signed in and restored the preserved device, but sync or encryption could not start: ${startupError.message}`
+        );
+    }
+}
+
 async function login(_: IpcMainInvokeEvent, input: MatrixLoginRequest): Promise<MatrixSnapshot> {
     try {
         return await runLifecycle(() => runAccountLifecycleTransition(async () => {
@@ -4680,6 +4860,10 @@ async function login(_: IpcMainInvokeEvent, input: MatrixLoginRequest): Promise<
             authenticationInProgress = true;
             try {
                 const loginDetails = validateLogin(input);
+                const record = await runAccountMutation(readStoredAccountRecord);
+                if (record?.schema === 2) {
+                    return await authenticatePreservedDevice(record, loginDetails);
+                }
                 return await authenticate(
                     storageKey => ({ type: "login", login: loginDetails, storageKey }),
                     loginDetails.homeserver,
@@ -4834,6 +5018,57 @@ async function register(_: IpcMainInvokeEvent, input: MatrixRegistrationRequest)
     }
 }
 
+async function signOut(_: IpcMainInvokeEvent): Promise<void> {
+    return runLifecycle(() => runAccountLifecycleTransition(async () => {
+        logoutInProgress = true;
+        clearStartupFailure();
+        let credentialsToRevoke: MatrixSessionCredentials | undefined;
+        try {
+            await runAccountMutation(async () => {
+                const current = await readStoredAccountRecord();
+                if (current?.schema === 1) {
+                    credentialsToRevoke = {
+                        homeserver: current.homeserver,
+                        userId: current.userId,
+                        deviceId: current.deviceId,
+                        accessToken: current.accessToken,
+                        ...(current.refreshToken == null ? {} : { refreshToken: current.refreshToken })
+                    };
+                    // Commit the tokenless crash-recovery state before any
+                    // remote or worker teardown can be interrupted.
+                    const preserved = preserveSignedOutDevice(current);
+                    await writeStoredAccount(preserved);
+                }
+            });
+
+            if (hasLiveWorker() || credentialsToRevoke) {
+                try {
+                    await callWorker(credentialsToRevoke
+                        ? { type: "signOut", credentials: credentialsToRevoke }
+                        : { type: "signOut" });
+                } catch (error) {
+                    // Local sign-out is already durable and the worker is
+                    // destroyed below. Report only a sanitized code locally;
+                    // a network failure cannot put session tokens back on disk.
+                    console.warn(`[MatrixBridge] Remote Matrix sign-out did not complete (${errorDTO(error).code}).`);
+                }
+            }
+            if (workerWindow && !workerWindow.isDestroyed()) {
+                terminateWorker(bridgeError("MATRIX_SIGNED_OUT", "The Matrix session was signed out."));
+            }
+
+            clearEventStream();
+            updateStatus("logged_out");
+        } finally {
+            if (credentialsToRevoke) {
+                credentialsToRevoke.accessToken = "";
+                if (credentialsToRevoke.refreshToken != null) credentialsToRevoke.refreshToken = "";
+            }
+            logoutInProgress = false;
+        }
+    }));
+}
+
 async function logout(_: IpcMainInvokeEvent): Promise<void> {
     return runLifecycle(() => runAccountLifecycleTransition(async () => {
         logoutInProgress = true;
@@ -4890,8 +5125,20 @@ async function start(_: IpcMainInvokeEvent, afterSeq = 0): Promise<MatrixSnapsho
     }
     return runLifecycle(async () => {
         pluginSuspended = false;
-        const account = await readStoredAccount();
+        const record = await readStoredAccountRecord();
+        const account = record?.schema === 1 ? record : null;
         if (!account) {
+            if (record?.schema === 2) {
+                // Crash recovery for ordinary sign-out: the tokenless record is
+                // authoritative. Never mistake its retained crypto partition
+                // for an orphan left by destructive forget.
+                if (workerWindow && !workerWindow.isDestroyed()) {
+                    terminateWorker(bridgeError("MATRIX_SIGNED_OUT", "The Matrix session is signed out."));
+                }
+                clearEventStream();
+                if (currentStatus.state !== "logged_out" || currentStatus.error) updateStatus("logged_out");
+                return emptySnapshot();
+            }
             // A crash after deleting account.enc but before normal logout
             // cleanup can leave an orphaned sync/crypto partition. With no
             // credentials left, purge it before reporting an empty account.
@@ -7918,6 +8165,7 @@ function validatePrivateRequest(value: unknown): MatrixSecureViewRequest {
     switch (request.type) {
         case "bootstrap":
         case "refresh":
+        case "signOut":
         case "logout":
         case "publicRooms":
         case "reconcileGroupChatCreate":
@@ -8251,9 +8499,12 @@ function requireVerifiedSignedOutView(state: SecureViewState): void {
 }
 
 async function requireStoredSecureViewAccount(state: SecureViewState): Promise<void> {
-    const storedBinding = accountBinding(await readStoredAccount());
+    const record = await readStoredAccountRecord();
+    const activeBinding = accountBinding(record?.schema === 1 ? record : null);
+    const storedBinding = storedAccountBinding(record);
     requireCurrentSecureViewAccount(state);
-    if (!sameAccountBinding(state.boundAccount ?? null, storedBinding)) {
+    if (!sameAccountBinding(state.boundAccount ?? null, activeBinding)
+        || !sameAccountBinding(state.boundStoredAccount ?? null, storedBinding)) {
         throw bridgeError(
             "MATRIX_SECURE_VIEW_ACCOUNT_STALE",
             "The configured Matrix account changed. Reopen the isolated account view."
@@ -8262,13 +8513,27 @@ async function requireStoredSecureViewAccount(state: SecureViewState): Promise<v
 }
 
 async function requireStoredSignedOutView(state: SecureViewState): Promise<void> {
-    const storedBinding = accountBinding(await readStoredAccount());
+    const record = await readStoredAccountRecord();
+    const activeBinding = accountBinding(record?.schema === 1 ? record : null);
+    const storedBinding = storedAccountBinding(record);
     requireVerifiedSignedOutView(state);
-    if (storedBinding !== null) {
+    if (activeBinding !== null
+        || !sameAccountBinding(state.boundStoredAccount ?? null, storedBinding)) {
         throw bridgeError(
             "MATRIX_SECURE_VIEW_ACCOUNT_STALE",
             "A Matrix account is already configured. Reopen the isolated account view."
         );
+    }
+}
+
+async function requireStoredForgettableView(state: SecureViewState): Promise<void> {
+    if (state.boundAccount) {
+        await requireStoredSecureViewAccount(state);
+        return;
+    }
+    await requireStoredSignedOutView(state);
+    if (!state.boundStoredAccount) {
+        throw bridgeError("MATRIX_ACCOUNT_MISSING", "No Matrix account or preserved device is configured.");
     }
 }
 
@@ -8422,6 +8687,11 @@ async function handlePrivateRequest(
         case "register":
             await register(event, request.registration);
             return await refreshConvergenceSnapshot(event, state, false);
+        case "signOut": {
+            await signOut(event);
+            await refreshConvergenceSnapshot(event, state, false);
+            return;
+        }
         case "logout": {
             await logout(event);
             await refreshConvergenceSnapshot(event, state, false);
@@ -8623,12 +8893,13 @@ async function handleAuthorizedPrivateRequest(
             return await handlePrivateRequest(event, state, request);
         });
     }
-    if (request.type === "logout") {
+    if (request.type === "signOut" || request.type === "logout") {
         return await runPrivateIdentityTransition(async () => {
             if (secureViewStateForSender(event, state.generation) !== state) {
                 throw bridgeError("MATRIX_SECURE_VIEW_UNTRUSTED", "The secure Matrix view request was rejected.");
             }
-            await requireStoredSecureViewAccount(state);
+            if (request.type === "signOut") await requireStoredSecureViewAccount(state);
+            else await requireStoredForgettableView(state);
             if (secureViewStateForSender(event, state.generation) !== state) {
                 throw bridgeError("MATRIX_SECURE_VIEW_UNTRUSTED", "The secure Matrix view request was rejected.");
             }
@@ -9008,6 +9279,7 @@ export {
     sendSticker,
     sendText,
     setEncryptedRoomProviderPreviews,
+    signOut,
     snapshot,
     spaceChildren,
     start,

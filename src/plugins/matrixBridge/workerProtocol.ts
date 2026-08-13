@@ -80,6 +80,21 @@ export interface MatrixStoredAccount extends MatrixSessionCredentials {
     storageKey: string;
 }
 
+/**
+ * Tokenless durable binding retained by ordinary sign-out. It is sufficient to
+ * reopen the exact Rust crypto database after a same-device login, but cannot
+ * authenticate any request by itself.
+ */
+export interface MatrixStoredSignedOutAccount {
+    schema: 2;
+    homeserver: string;
+    userId: string;
+    deviceId: string;
+    storageKey: string;
+}
+
+export type MatrixStoredAccountRecord = MatrixStoredAccount | MatrixStoredSignedOutAccount;
+
 /** Exact /joined_rooms response used only to retire unreachable local receipts. */
 export interface MatrixJoinedRoomIdsResult {
     roomIds: string[];
@@ -97,6 +112,7 @@ export type MatrixWorkerCommand =
     | { type: "register"; registration: MatrixRegistrationRequest; storageKey: string; }
     | { type: "start"; account: MatrixStoredAccount; }
     | { type: "suspend"; }
+    | { type: "signOut"; credentials?: MatrixSessionCredentials; }
     | { type: "logout"; }
     | { type: "importRoomKeys"; bytes: Uint8Array; passphrase: string; }
     | { type: "snapshot"; }

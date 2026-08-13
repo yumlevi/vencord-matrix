@@ -5,13 +5,23 @@
  */
 
 /**
- * Detects a newly-visible run which no longer fits between immutable synthetic
- * Discord snowflake anchors. Prefix/suffix runs remain expandable.
+ * Detects anchors which are no longer in canonical order, or a newly-visible
+ * run which no longer fits between immutable synthetic Discord snowflakes.
+ * Prefix/suffix runs remain expandable.
  */
 export function matrixMessageOrderNeedsReindex(
     ordered: ReadonlyMap<string, string>,
     eventIds: readonly string[]
 ): boolean {
+    let previousAnchor: bigint | undefined;
+    for (const eventId of eventIds) {
+        const id = ordered.get(eventId);
+        if (id == null) continue;
+        const anchor = BigInt(id);
+        if (previousAnchor != null && anchor <= previousAnchor) return true;
+        previousAnchor = anchor;
+    }
+
     for (let cursor = 0; cursor < eventIds.length;) {
         if (ordered.has(eventIds[cursor])) {
             cursor++;

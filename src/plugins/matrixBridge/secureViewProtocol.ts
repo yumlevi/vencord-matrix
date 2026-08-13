@@ -194,8 +194,10 @@ export interface MatrixSecureViewRoomKeyImportResult {
 /** Account metadata safe to show in the isolated account UI. Tokens are excluded. */
 export interface MatrixSecureViewAccountConfig {
     configured: boolean;
+    preservedDevice?: boolean;
     homeserver?: string;
     userId?: string;
+    deviceId?: string;
     persistentE2EE: true;
 }
 
@@ -231,6 +233,7 @@ export interface MatrixSecureViewRequestMap {
     refresh: { input: {}; output: MatrixSnapshot; };
     login: { input: { login: MatrixLoginRequest; }; output: MatrixSnapshot; };
     register: { input: { registration: MatrixRegistrationRequest; }; output: MatrixSnapshot; };
+    signOut: { input: {}; output: void; };
     logout: { input: {}; output: void; };
     importRoomKeys: {
         input: { passphrase: string; };

@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { createMatrixGuildReadStateInvalidator } from "../src/plugins/matrixBridge/guildUnread";
 import { parseFxTwitterStatus, validXPreviewMediaCache } from "../src/plugins/matrixBridge/xPreview";
 
 const bridge = readFileSync("src/plugins/matrixBridge/bridge.ts", "utf8");
@@ -243,6 +244,42 @@ class EffectiveUnreadProjection {
         };
     }
 }
+
+const scheduledGuildUnreadTasks: Array<() => void> = [];
+let guildReadStateRecomputes = 0;
+const invalidateGuildReadState = createMatrixGuildReadStateInvalidator(
+    task => scheduledGuildUnreadTasks.push(task),
+    () => guildReadStateRecomputes++,
+);
+invalidateGuildReadState();
+invalidateGuildReadState();
+assert.equal(scheduledGuildUnreadTasks.length, 1,
+    "multiple authoritative unread changes in one Matrix batch must coalesce");
+assert.equal(guildReadStateRecomputes, 0,
+    "guild read state must not dispatch recursively inside the current Flux action");
+scheduledGuildUnreadTasks.shift()!();
+assert.equal(guildReadStateRecomputes, 1);
+invalidateGuildReadState();
+assert.equal(scheduledGuildUnreadTasks.length, 1,
+    "a completed native recomputation must allow the next unread transition through");
+scheduledGuildUnreadTasks.shift()!();
+assert.equal(guildReadStateRecomputes, 2);
+
+const recursivelyScheduledGuildUnreadTasks: Array<() => void> = [];
+let recursiveGuildReadStateRecomputes = 0;
+let invalidateGuildReadStateRecursively!: () => void;
+invalidateGuildReadStateRecursively = createMatrixGuildReadStateInvalidator(
+    task => recursivelyScheduledGuildUnreadTasks.push(task),
+    () => {
+        recursiveGuildReadStateRecomputes++;
+        invalidateGuildReadStateRecursively();
+    },
+);
+invalidateGuildReadStateRecursively();
+recursivelyScheduledGuildUnreadTasks.shift()!();
+assert.equal(recursiveGuildReadStateRecomputes, 1);
+assert.equal(recursivelyScheduledGuildUnreadTasks.length, 0,
+    "native guild-state recomputation must not recursively enqueue itself");
 
 const oldest = { id: "100", content: "oldest" };
 const middle = { id: "200", content: "middle" };
@@ -586,6 +623,12 @@ assert.match(unreadSync, /Math\.max\(floor\.unreadCount, safeUnreadCount\(room\.
     "snapshots may raise but never roll back the live unread floor");
 assert.match(unreadSync, /highlightCount: guildId \? floor\.highlightCount : floor\.unreadCount/u,
     "DM and GROUP_DM unread rows must badge Discord Home like native private messages");
+assert.match(unreadSync, /publishMatrixUnreadChange\(Boolean\(guildId\)\)/u,
+    "authoritative Matrix unread publication must invalidate Discord's native guild-read cache");
+const unreadPublisher = section(bridge, "function publishMatrixUnreadChange(", "function syncProjectionUnread(");
+assert.match(unreadPublisher, /ReadStateStore as any\)\.emitChange\?\.\(\)/u);
+assert.match(unreadPublisher, /if \(recomputeGuildReadState\) invalidateMatrixGuildReadState\(\)/u,
+    "ReadStateStore and GuildReadStateStore must be invalidated together");
 const deltaUnread = section(bridge, "function applyDeltaUnread(", "function applyMessageDelta(");
 assert.match(deltaUnread, /projectionHasMessage\(current\.channelId, lastMessageId\)/u,
     "unread publication must wait until the exact Discord row exists");
@@ -629,6 +672,8 @@ const receiptFlush = section(bridge, "async function flushMatrixReceipt(", "func
 assert.ok(receiptFlush.indexOf("await Native.read") < receiptFlush.indexOf("floor.unreadCount = 0"),
     "the monotonic unread floor may clear only after Matrix accepts the exact receipt");
 assert.match(receiptFlush, /currentPosition\.index !== currentPosition\.latestIndex/u);
+assert.match(receiptFlush, /publishMatrixUnreadChange\(guildReadStateChanged\)/u,
+    "a successful newest-event Matrix receipt must clear the native server-rail badge");
 const receiptVisibility = section(bridge, "function canAcknowledgeProjectedMessage(", "function requestedJumpMessageId(");
 assert.match(receiptVisibility, /SelectedChannelStore\.getChannelId\(\) === channelId/u);
 assert.match(receiptVisibility, /document\.visibilityState === "visible"/u);

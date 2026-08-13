@@ -624,6 +624,11 @@ function normalizeHomeserver(value: string) {
     return /^https?:\/\//iu.test(clean) ? clean : `https://${clean}`;
 }
 
+function matrixLocalpart(value: string | undefined) {
+    const match = /^@([^\s:]+):[^\s]+$/u.exec(value ?? "");
+    return match?.[1] ?? "";
+}
+
 function route() {
     return localRoute ?? hostRoute;
 }
@@ -1018,11 +1023,22 @@ function validateBootstrap(next: MatrixSecureViewBootstrap, expectedAccount?: st
     if (configured !== Boolean(accountId)) {
         throw new Error("The Matrix bootstrap has inconsistent account configuration.");
     }
+    const preservedDevice = next.config.preservedDevice === true;
+    if (configured && preservedDevice) {
+        throw new Error("The Matrix bootstrap cannot be connected and signed out at once.");
+    }
     if (configured && (!next.config.userId || next.config.userId !== accountId)) {
         throw new Error("The Matrix bootstrap configuration belongs to a different account.");
     }
-    if (!configured && (next.config.userId || next.snapshot.rooms.length)) {
-        throw new Error("The signed-out Matrix bootstrap contains account data.");
+    if (!configured) {
+        if (next.snapshot.rooms.length) throw new Error("The signed-out Matrix bootstrap contains room data.");
+        if (preservedDevice) {
+            if (!next.config.homeserver || !next.config.userId || !next.config.deviceId) {
+                throw new Error("The preserved Matrix device bootstrap is incomplete.");
+            }
+        } else if (next.config.homeserver || next.config.userId || next.config.deviceId) {
+            throw new Error("The signed-out Matrix bootstrap contains unexpected account metadata.");
+        }
     }
     for (const statusValue of [next.status, next.snapshot.status]) {
         if (statusValue.account && statusValue.account.userId !== accountId) {
@@ -4270,6 +4286,26 @@ function renderDiscoverMain() {
     return main;
 }
 
+async function signOut() {
+    if (!host || accountTransition) return;
+    const current = route();
+    void stopTyping("roomId" in current ? current.roomId : undefined);
+    const transition = beginAccountTransition("logout", "Signing out of Matrix...");
+    try {
+        await host.request({ type: "signOut" });
+        if (!isCurrentAccountTransition(transition)) return;
+        await requestTransitionBootstrap(transition, null);
+        setRoute({ kind: "home" });
+    } catch (error) {
+        if (accountTransition !== transition) return;
+        try {
+            if (await requestTransitionBootstrap(transition)) showToast(errorText(error), "error");
+        } catch {
+            failClosed("Matrix sign-out could not be verified safely.");
+        }
+    }
+}
+
 async function logout() {
     if (!host || accountTransition || !window.confirm(
         "This permanently deletes this device's local encryption keys. Old encrypted history may become unreadable unless another "
@@ -4279,7 +4315,7 @@ async function logout() {
     )) return;
     const current = route();
     void stopTyping("roomId" in current ? current.roomId : undefined);
-    const transition = beginAccountTransition("logout", "Signing out of Matrix...");
+    const transition = beginAccountTransition("logout", "Forgetting Matrix account and keys...");
     try {
         await host.request({ type: "logout" });
         if (!isCurrentAccountTransition(transition)) return;
@@ -4290,7 +4326,7 @@ async function logout() {
         try {
             if (await requestTransitionBootstrap(transition)) showToast(errorText(error), "error");
         } catch {
-            failClosed("Matrix sign-out could not be verified safely.");
+            failClosed("Matrix account deletion could not be verified safely.");
         }
     }
 }
@@ -4382,6 +4418,7 @@ function renderAccountMain() {
         labelledField("Encryption storage", textElement("div", "", "Persistent, isolated Matrix storage")),
         element("div", "matrix-card-actions",
             makeButton("Refresh", "matrix-button", () => void refresh(true)),
+            makeButton("Sign out", "matrix-button", () => void signOut()),
             makeButton("Forget account and keys", "matrix-button matrix-button-danger", () => void logout()),
         ),
     );
@@ -4428,14 +4465,27 @@ function renderSettingsTabs(selected: "discover" | "account") {
 }
 
 function renderAuth() {
+    const preservedDevice = config?.preservedDevice === true;
+    if (preservedDevice && authMode === "register") authMode = "login";
+    const preservedHomeserver = preservedDevice ? config?.homeserver ?? "" : "";
+    const preservedUsername = preservedDevice ? matrixLocalpart(config?.userId) : "";
     const shell = element("div", "matrix-fatal");
     const card = element("section", "matrix-fatal-card matrix-auth-card");
     card.append(
-        textElement("h1", "", "Connect Matrix"),
-        textElement("p", "matrix-subtle", "Sign in here. Credentials remain inside the isolated Matrix view and private native boundary."),
+        textElement("h1", "", preservedDevice ? "Sign back into Matrix" : "Connect Matrix"),
+        textElement(
+            "p",
+            "matrix-subtle",
+            preservedDevice
+                ? `Local encryption keys for ${config?.userId} are preserved. Sign into this exact account to restore the same device and encrypted history.`
+                : "Sign in here. Credentials remain inside the isolated Matrix view and private native boundary."
+        ),
     );
     const tabs = element("div", "matrix-tabs");
-    for (const [mode, label] of [["login", "Sign in"], ["register", "Register"], ["token", "Access token"]] as const) {
+    const authModes = preservedDevice
+        ? [["login", "Sign in"], ["token", "Access token"]] as const
+        : [["login", "Sign in"], ["register", "Register"], ["token", "Access token"]] as const;
+    for (const [mode, label] of authModes) {
         const tab = makeButton(label, "matrix-tab", () => {
             authMode = mode;
             scheduleRender();
@@ -4446,19 +4496,19 @@ function renderAuth() {
     }
     card.append(tabs);
     const form = element("form", "matrix-form");
-    const homeserver = input("text", "homeserver", "matrix.example.org", authForm.homeserver);
+    const homeserver = input("text", "homeserver", "matrix.example.org", preservedDevice ? preservedHomeserver : authForm.homeserver);
     homeserver.required = true;
     homeserver.autocomplete = "off";
     homeserver.dataset.focusKey = "matrix-auth-homeserver";
-    homeserver.disabled = authBusy;
+    homeserver.disabled = authBusy || preservedDevice;
     homeserver.addEventListener("input", () => { authForm.homeserver = homeserver.value.slice(0, 2_048); });
     form.append(labelledField("Homeserver", homeserver));
     if (authMode !== "token") {
-        const username = input("text", "username", "username", authForm.username);
+        const username = input("text", "username", "username", preservedDevice ? preservedUsername : authForm.username);
         username.required = true;
         username.autocomplete = "username";
         username.dataset.focusKey = "matrix-auth-username";
-        username.disabled = authBusy;
+        username.disabled = authBusy || preservedDevice;
         username.addEventListener("input", () => { authForm.username = username.value.slice(0, 512); });
         const password = input("password", "password", "Password", authForm.password);
         password.required = true;
@@ -4498,8 +4548,8 @@ function renderAuth() {
         event.preventDefault();
         if (!host || authBusy || accountTransition) return;
         const mode = authMode;
-        const server = normalizeHomeserver(authForm.homeserver);
-        const username = authForm.username.trim();
+        const server = preservedDevice ? preservedHomeserver : normalizeHomeserver(authForm.homeserver);
+        const username = preservedDevice ? preservedUsername : authForm.username.trim();
         const { password, confirmPassword, registrationToken, accessToken } = authForm;
         if (mode === "register" && password !== confirmPassword) {
             showToast("Passwords do not match.", "error");
@@ -4537,7 +4587,19 @@ function renderAuth() {
             scheduleRender();
         });
     });
-    card.append(form, textElement("p", "matrix-subtle", "You can use a local username; the full @user:server ID is not required."));
+    card.append(
+        form,
+        textElement(
+            "p",
+            "matrix-subtle",
+            preservedDevice
+                ? "To use a different account, explicitly forget this account and its local encryption keys first."
+                : "You can use a local username; the full @user:server ID is not required."
+        ),
+    );
+    if (preservedDevice) {
+        card.append(makeButton("Forget account and keys", "matrix-button matrix-button-danger", () => void logout()));
+    }
     shell.append(card);
     return shell;
 }
