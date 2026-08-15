@@ -43,9 +43,10 @@ app.setAppPath(asarPath);
 if (!IS_VANILLA) {
     const settings = RendererSettings.store;
 
-    // Repatch after host updates on Windows and Linux
-    if (process.platform === "win32" || process.platform === "linux") {
-        require("./persistAfterDiscordUpdates");
+    // Squirrel stages complete Windows app-* directories before switching to
+    // them, so the next version can be repaired safely without elevation.
+    if (process.platform === "win32") {
+        require("./persistAfterDiscordUpdates").startDiscordUpdatePersistence(injectorPath);
     }
 
     if (process.platform === "win32" && settings.winCtrlQ) {

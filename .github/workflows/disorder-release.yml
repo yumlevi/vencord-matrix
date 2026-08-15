@@ -35,6 +35,35 @@ jobs:
             - name: Reject tracked private or diagnostic artifacts
               run: node scripts/release/checkPublicTree.mjs
 
+    discord-update-persistence-audit:
+        needs: privacy-audit
+        strategy:
+            fail-fast: false
+            matrix:
+                os:
+                    - windows-latest
+                    - ubuntu-latest
+                    - macos-latest
+        runs-on: ${{ matrix.os }}
+        steps:
+            - name: Check out the exact source revision
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            - name: Set up pnpm
+              uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+            - name: Use Node.js 24
+              uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install locked dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Test Discord host-update persistence
+              run: pnpm test:persistence
+
     portable-bootstrap-audit:
         needs: privacy-audit
         strategy:
@@ -75,7 +104,9 @@ jobs:
             || (vars.DISORDER_PUBLIC_RELEASES_ENABLED == 'true'
                 && github.ref == 'refs/heads/main'
                 && (github.event_name == 'push' || inputs.confirm_public_release == true))
-        needs: privacy-audit
+        needs:
+            - privacy-audit
+            - discord-update-persistence-audit
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -113,6 +144,7 @@ jobs:
                   pnpm lint
                   pnpm lint-styles
                   pnpm test:matrix
+                  pnpm test:persistence
                   pnpm exec tsx scripts/testReleaseUpdater.ts
 
             - name: Build updater-enabled standalone runtime

@@ -104,11 +104,17 @@ Release notes are static and privacy-safe: no generated changelog, commit author
 
 Linux support is x86_64 only. The shell verifies the exact pinned v1.4.0 Linux CLI before starting its interactive Discord selection. This non-elevating bootstrap supports only user-writable Discord installs and user Flatpak; root-owned system or `.deb` installs, system Flatpak, and Snap are unsupported.
 
+On Windows, the injected main process proactively scans its own Stable/PTB/Canary root for newer Squirrel `app-*` directories at startup, on filesystem changes, periodically, and once more before quit. A candidate must remain byte-for-byte and identity-stable for at least one second before a bounded, journalled repair installs the canonical loader. Lock publication, backup creation, and loader replacement are crash-recoverable and preserve `%APPDATA%\Vencord`, including Matrix state. This remains best-effort because Discord's updater does not participate in the repair lock; if a stock update wins the final handoff or Vencord is already absent, fully quit Discord and rerun the verified Setup for that exact branch.
+
+Linux package and Flatpak deployment updates are not automatically reinjected. The old process cannot safely modify a new Flatpak deployment, and this release does not install a systemd user service or other background persistence helper. Rerun the verified Setup after a host update if Vencord is absent.
+
 macOS support is experimental on arm64 and x86_64. The shell offers only official Discord, PTB, Canary, or Development apps in `/Applications` or `~/Applications`, and refuses a bundle whose `Contents/Resources` directory is not writable. After checking the original Apple signature and sealed `app.asar`, it explains the change and requires exactly `MODIFY DISCORD` for a per-user app or `MODIFY SHARED DISCORD` for an app under `/Applications`. It retains the original as `_app.asar` and writes a deterministic, upstream-compatible loader ASAR to `Discord.app/Contents/Resources/app.asar`.
 
 The generated loader embeds the installing account's private Vencord data path. Modifying a shared `/Applications` bundle therefore binds that machine-wide app to this local account and may make it unusable to other local accounts. Prefer a per-user copy under `~/Applications` on a multi-user Mac.
 
 This deliberate macOS modification invalidates Discord's sealed code signature. macOS may report the app as modified or damaged, and the changed identity may affect privacy prompts or Keychain access. Setup does not use `sudo`, re-sign Discord, remove quarantine attributes, invoke `xattr` or `spctl`, or disable Gatekeeper. Rerun the same verified setup after Discord replaces or updates its app bundle. Reinstall Discord to restore the stock bundle and signature.
+
+macOS host updates are not automatically reinjected. A reliable automatic path requires a separately Developer-ID-signed, hardened, notarized and stapled Disorder launcher that can survive Squirrel.Mac's post-exit bundle replacement; the current RSA-signed JavaScript runtime is not a substitute for that Apple trust chain. No unsigned launcher, LaunchAgent, or hidden watcher is installed.
 
 Platform data roots are `%APPDATA%\Vencord` on Windows, `~/Library/Application Support/Vencord` on macOS, and `${XDG_CONFIG_HOME:-$HOME/.config}/Vencord` on Linux. Matrix account storage and settings remain outside immutable release directories and are not cleared by updates.
 

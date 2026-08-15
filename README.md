@@ -17,6 +17,15 @@ and is not supported by the Vencord project.
      user. Never run it with `sudo` and never pipe it from the network.
 5. Reopen Discord and enable/configure MatrixBridge in Vencord settings.
 
+On Windows, Disorder now watches the current Discord branch for a fully staged
+newer `app-*` directory and repairs its injector before Discord switches to it.
+The repair uses two stable physical-file observations, bounded hashing, an
+exclusive lock, and a recoverable journal; it never clears Vencord settings or
+Matrix account data. This is a best-effort safeguard for Discord's Squirrel
+staging model, not an absolute guarantee against a racing updater. If Discord
+already opened without Vencord, fully quit it and rerun the same verified Setup
+for that Stable/PTB/Canary branch.
+
 Linux support is limited to x86_64, user-writable Discord installs, and user
 Flatpak. This non-elevating bootstrap does not support root-owned system or
 `.deb` installs, system Flatpak, or Snap. It downloads the pinned, exact-hash
@@ -24,7 +33,9 @@ Vencord Installer v1.4.0 CLI and lets you select the Discord install
 interactively. That verified CLI performs its normal GitHub version check, with
 a `vencord.dev` fallback, which exposes your IP address and its User-Agent to
 those services. In this development-install mode it does not self-update or
-download the upstream Vencord runtime.
+download the upstream Vencord runtime. Linux package and Flatpak deployment
+updates are not automatically reinjected; rerun the same verified Setup if
+Vencord disappears after a host update.
 
 macOS support is experimental on both Apple silicon and Intel. Setup supports
 official Discord apps in `/Applications` or `~/Applications`, verifies the
@@ -41,7 +52,9 @@ Discord's sealed Apple code signature and may affect macOS security prompts or
 Keychain access. Setup never uses `sudo`, `xattr`, `spctl`, or a Gatekeeper
 override and stops if the app is not writable. Rerun the verified setup after
 Discord updates its application bundle; reinstalling Discord restores its stock
-bundle and signature.
+bundle and signature. Automatic macOS reinjection would require a separately
+Developer-ID-signed and notarized launcher; this release does not install a
+background agent or unsigned persistence helper.
 
 Future signed releases are checked automatically. A completed update asks you to
 restart Discord; the previous verified version is retained for automatic rollback.
