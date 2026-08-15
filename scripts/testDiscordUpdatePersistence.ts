@@ -12,6 +12,7 @@ import {
     mkdirSync,
     mkdtempSync,
     readFileSync,
+    realpathSync,
     readdirSync,
     rmSync,
     symlinkSync,
@@ -512,9 +513,10 @@ function main() {
     testStrictVersions();
     testExplicitInjectorPathIntegration();
 
-    const temporaryRoot = mkdtempSync(join(tmpdir(), "disorder-persistence-test-"));
+    const temporaryParent = realpathSync(resolve(tmpdir()));
+    const temporaryRoot = realpathSync(mkdtempSync(join(temporaryParent, "disorder-persistence-test-")));
     assert.equal(isAbsolute(temporaryRoot), true);
-    assert.ok(temporaryRoot.startsWith(`${resolve(tmpdir())}${sep}`));
+    assert.ok(temporaryRoot.startsWith(`${temporaryParent}${sep}`));
     try {
         testStagedWindowsRepair(temporaryRoot);
         testAmbiguousStatesRefuse(temporaryRoot);
@@ -525,7 +527,7 @@ function main() {
         testInstalledJournalWithStockRefuses(temporaryRoot);
         testFaultRecoveryAndSettings(temporaryRoot);
     } finally {
-        assert.ok(temporaryRoot.startsWith(`${resolve(tmpdir())}${sep}`));
+        assert.ok(temporaryRoot.startsWith(`${temporaryParent}${sep}`));
         rmSync(temporaryRoot, { force: true, recursive: true });
     }
 
